@@ -28,7 +28,9 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入単価（税抜） | 仕入金額（税抜） | 仕入税込金額
-  | 販売予定単価（税抜） | 販売予定金額（税込） | 実売単価（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL
+  | 販売予定単価（税抜） | 販売予定金額（税込） | 実売単価（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID
+  ※在庫は **1点につき1行** で統一します。登録時は数量と写真枚数の大きい方の件数で行を分割し、各行の数量は **1** です。
+  ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※仕入金額（税抜）は「数量×仕入単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
   ※新規登録画面では仕入税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
@@ -100,6 +102,7 @@ COL_GROSS_PROFIT = "粗利"
 COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
 COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
+COL_MANAGEMENT_ID = "管理ID"
 
 STATUS_IN_STOCK = "在庫中"
 STATUS_SOLD = "販売済"
@@ -129,6 +132,7 @@ EXPECTED_HEADERS: list[str] = [
     COL_STOCK_STATUS,
     COL_MEMO,
     COL_IMAGE_URL,
+    COL_MANAGEMENT_ID,
 ]
 
 SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
@@ -867,15 +871,58 @@ def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _parse_max_management_serial(rows: list[Any], col_idx: int) -> int:
+    """管理ID列の最大連番（G######## または数字のみ）を返す。ヘッダー行は含めない。"""
+    mx = 0
+    for r in rows[1:]:
+        row = [("" if c is None else str(c)) for c in list(r)]
+        if col_idx >= len(row):
+            continue
+        s = str(row[col_idx]).strip()
+        if not s:
+            continue
+        m = re.fullmatch(r"(?i)G(\d+)", s)
+        if m:
+            mx = max(mx, int(m.group(1)))
+            continue
+        if s.isdigit():
+            mx = max(mx, int(s))
+    return mx
+
+
+def allocate_management_ids(ws: Any, count: int) -> list[str]:
+    """管理ID（G########）を count 件、シート現状から連番で採番する。"""
+    if count <= 0:
+        return []
+    try:
+        raw = ws.get_all_values()
+    except Exception:
+        raw = []
+    if not raw:
+        raw = [EXPECTED_HEADERS]
+    idx = EXPECTED_HEADERS.index(COL_MANAGEMENT_ID)
+    mx = _parse_max_management_serial(raw, idx)
+    return [f"G{mx + i + 1:08d}" for i in range(count)]
+
+
+def _coerce_uploaded_files(uploaded_u: Any) -> list[Any]:
+    """st.file_uploader の戻り（単一 or 複数）を常にリスト化する。"""
+    if uploaded_u is None:
+        return []
+    if isinstance(uploaded_u, (list, tuple)):
+        return [x for x in uploaded_u if x is not None]
+    return [uploaded_u]
+
+
 def append_sheet_row(
     movement: str,
     product_name: str,
     supplier: str,
-    quantity: int,
     unit_price_excl_yen: int,
     line_price_excl_yen: int,
     line_price_incl_yen: int,
     image_url: str,
+    management_id: str,
     memo: str = "",
     record_datetime: str | None = None,
     *,
@@ -884,13 +931,14 @@ def append_sheet_row(
     stock_status: str = STATUS_IN_STOCK,
     consumption_tax_rate: float | None = None,
 ):
+    """1点1行で台帳に追記する（数量列は常に 1）。"""
     ws = ensure_worksheet_header()
     if ws is None:
         st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
         return
     now = (record_datetime or "").strip() or jst_now_str()
     cogs = _finite_int(line_price_excl_yen, 0)
-    qty_i = max(1, _finite_int(quantity, 1))
+    qty_i = 1
     pl_u = _finite_int(planned_sale_unit_excl_yen, 0)
     ac_u = _finite_int(actual_sale_unit_excl_yen, 0)
     stt = _normalize_stock_status(str(stock_status))
@@ -928,7 +976,7 @@ def append_sheet_row(
                 movement,
                 product_name,
                 supplier,
-                quantity,
+                1,
                 unit_price_excl_yen,
                 line_price_excl_yen,
                 line_price_incl_yen,
@@ -940,6 +988,7 @@ def append_sheet_row(
                 stt,
                 memo,
                 image_url,
+                management_id,
             ],
             value_input_option="USER_ENTERED",
         )
@@ -948,7 +997,7 @@ def append_sheet_row(
         except Exception:
             pass
     except Exception as e:
-        st.warning(f"スプレッドシート更新をスキップしました: {e}")
+        raise RuntimeError(f"スプレッドシート追記に失敗しました: {e}") from e
 
 
 def load_inventory_dataframe() -> pd.DataFrame | None:
@@ -1574,6 +1623,12 @@ def render_inventory_manager() -> None:
     )
 
     _ledger_col_cfg: dict[str, Any] = {}
+    if COL_MANAGEMENT_ID in df_sorted.columns:
+        _ledger_col_cfg[COL_MANAGEMENT_ID] = st.column_config.TextColumn(
+            COL_MANAGEMENT_ID,
+            disabled=True,
+            help="1点1行の自動採番（シリアル）。通常は手入力しません。",
+        )
     if COL_STOCK_STATUS in df_sorted.columns:
         _ledger_col_cfg[COL_STOCK_STATUS] = st.column_config.SelectboxColumn(
             COL_STOCK_STATUS,
@@ -1653,13 +1708,16 @@ def main():
     _init_registration_form_session_state()
 
     uploaded = st.file_uploader(
-        "商品写真（任意・カメラやギャラリーからアップロード）",
+        "商品写真（任意・複数枚可・カメラやギャラリーから）",
         type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
     )
+    upload_files = _coerce_uploaded_files(uploaded)
     st.caption(
+        f"複数枚選ぶと **1枚につき1行** で台帳に分割して保存します（各行の数量は1）。"
         f"写真がある場合のみ、EXIF向き補正のうえ長辺最大{UPLOAD_JPEG_MAX_LONG_EDGE}px・"
         f"JPEG品質{UPLOAD_JPEG_QUALITY}％へ変換してから AI 解析・ドライブ保存します。"
-        "台帳の日時は写真があるとき EXIF の撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
+        "台帳の日時は先頭の写真で EXIF の撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
         "必須項目だけでも確定して台帳記録できます（画像URLは空欄になります）。"
     )
 
@@ -1671,7 +1729,11 @@ def main():
 
     col_a, col_b = st.columns(2)
     with col_a:
-        analyze = st.button("AIで画像を解析", type="primary", disabled=uploaded is None)
+        analyze = st.button(
+            "AIで画像を解析",
+            type="primary",
+            disabled=len(upload_files) == 0,
+        )
     with col_b:
         if st.button("候補の自動入力をクリア"):
             st.session_state.field_product_name = ""
@@ -1691,10 +1753,10 @@ def main():
             st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
             st.rerun()
 
-    if analyze and uploaded is not None:
+    if analyze and upload_files:
         with st.spinner("画像を解析しています…"):
             try:
-                img = _gemini_input_image_from_upload(uploaded)
+                img = _gemini_input_image_from_upload(upload_files[0])
                 raw_text = analyze_image_with_gemini(img)
                 result = _parse_json_from_model(raw_text or "")
                 _apply_gemini_json_to_session(result)
@@ -1776,14 +1838,20 @@ def main():
     st.markdown("##### 必須入力項目")
     product_name = st.text_input("商品名（必須）", key="field_product_name")
     supplier = st.text_input("仕入先・取引先（必須）", key="field_supplier")
-    quantity = st.number_input("数量", min_value=1, step=1, key="field_qty")
+    quantity = st.number_input(
+        "数量（点数）",
+        min_value=1,
+        step=1,
+        key="field_qty",
+        help="台帳は **1点1行** で保存します。写真を複数枚選んだときは「写真枚数」と「数量」の大きい方の件数だけ行を作成し、先頭から写真を対応付けます（不足分は画像URLなし）。",
+    )
 
     unit_price_excl = st.number_input(
         "仕入単価（税抜・必須）",
         min_value=1,
         step=1,
         key="field_unit_price_excl",
-        help="1点あたりの税抜単価（円）。仕入金額は数量×仕入単価で自動計算します。",
+        help="1点あたりの税抜単価（円）。台帳の各行は数量1・税抜行計＝この単価です。",
     )
 
     st.radio(
@@ -1799,15 +1867,18 @@ def main():
 
     _q = int(quantity)
     _u = int(unit_price_excl)
-    _line_ex = _q * _u
-    _line_in = price_incl_tax(_line_ex, _tax_r)
+    _n_save = max(_q, len(upload_files)) if upload_files else _q
+    _line_ex_one = _u
+    _line_in_one = price_incl_tax(_line_ex_one, _tax_r)
 
     price_row = st.columns([1, 1, 1])
     with price_row[0]:
-        st.metric("仕入金額（税抜・自動）", f"¥{_line_ex:,}")
-        st.caption(f"数量 {_q} × 仕入単価 ¥{_u:,}")
+        st.metric("仕入金額（税抜・1点）", f"¥{_line_ex_one:,}")
+        st.caption(
+            f"確定時は **{_n_save} 行**（各行 数量1）。税抜合計（参考） ¥{_line_ex_one * _n_save:,}"
+        )
     with price_row[1]:
-        st.metric("仕入税込金額（行・自動）", f"¥{_line_in:,}")
+        st.metric("仕入税込金額（1点・自動）", f"¥{_line_in_one:,}")
         _tl = st.session_state.get("field_consumption_tax_choice", "10%")
         if _tl == "非課税":
             st.caption("非課税のため税込＝税抜行合計")
@@ -1815,7 +1886,7 @@ def main():
             st.caption(f"消費税{_tl}を行合計に四捨五入")
     with price_row[2]:
         st.caption(
-            "原価は上記の仕入金額（税抜・行計）です。販売予定・実売は **1点あたり税抜単価** を入力し、台帳には税抜行計と税込総額も自動で記録します。"
+            "原価は各行の仕入金額（税抜）です。販売予定・実売は **1点あたり税抜単価** を入力し、台帳では各行数量1として税抜行計と税込総額を記録します。"
         )
 
     st.markdown("##### 価格管理（任意）")
@@ -1829,7 +1900,7 @@ def main():
         min_value=0,
         step=1,
         key="field_planned_sale_excl",
-        help="1点あたり。0 のとき台帳では空欄。税抜行計・税込総額は数量を掛じて自動計算します。",
+        help="1点あたり。0 のとき台帳では空欄。税抜行計・税込総額は各行数量1として自動計算します。",
     )
     st.selectbox(
         "ステータス（在庫中／販売済）",
@@ -1847,9 +1918,9 @@ def main():
     )
     _pl_u = int(planned_sale_excl)
     _act_u = int(actual_sale_excl)
-    _cogs_preview = _q * _u
+    _cogs_preview = _u
     _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
-        _q, _pl_u, _act_u, _st, _tax_r
+        1, _pl_u, _act_u, _st, _tax_r
     )
     _gp_preview = _compute_gross_profit_row(
         _cogs_preview,
@@ -1859,7 +1930,7 @@ def main():
     )
     pm1, pm2, pm3, pm4, pm5 = st.columns(5)
     with pm1:
-        st.metric("原価（税抜・行計）", f"¥{_cogs_preview:,}")
+        st.metric("原価（税抜・1点）", f"¥{_cogs_preview:,}")
     with pm2:
         st.metric(
             "販売予定（税抜・行計）",
@@ -1913,13 +1984,12 @@ def main():
             validation_ok = False
 
         if validation_ok:
-            _q2 = int(quantity)
             _u2 = int(unit_price_excl)
-            _lex = _q2 * _u2
+            _lex_one = _u2
             _tax_r2 = _consumption_tax_rate_from_choice_label(
                 str(st.session_state.get("field_consumption_tax_choice", "10%"))
             )
-            _lin = price_incl_tax(_lex, _tax_r2)
+            _lin_one = price_incl_tax(_lex_one, _tax_r2)
             _plan2 = int(st.session_state.get("field_planned_sale_excl", 0))
             _act_ex2 = int(st.session_state.get("field_actual_sale_excl", 0))
             _stat2 = str(
@@ -1929,59 +1999,81 @@ def main():
                 _stat2 = STATUS_IN_STOCK
             memo_s = (memo or "").strip()
 
-            url = ""
+            reg_files = _coerce_uploaded_files(uploaded)
+            _q2 = int(quantity)
+            n_save = max(_q2, len(reg_files)) if reg_files else _q2
+            urls: list[str] = [""] * n_save
             _record_dt = jst_now_str()
             ready_for_sheet = True
 
-            if uploaded is not None:
-                safe_base = re.sub(r"[^\w\-_.]", "_", uploaded.name.rsplit(".", 1)[0])[
-                    :80
-                ]
-                raw_bytes = uploaded.getvalue()
-                _record_dt = capture_datetime_jst_from_bytes(raw_bytes) or jst_now_str()
-                try:
-                    with st.spinner("画像をリサイズ・圧縮しています…"):
-                        data, mime = prepare_upload_image_jpeg(raw_bytes)
-                except Exception as e:
-                    st.error(f"画像の処理に失敗しました: {e}")
-                    ready_for_sheet = False
-                else:
-                    fname = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
-                    with st.spinner("Googleドライブに保存しています…"):
+            if reg_files:
+                with st.spinner("画像をリサイズ・圧縮してドライブに保存しています…"):
+                    for i in range(n_save):
+                        if i >= len(reg_files):
+                            continue
+                        uf = reg_files[i]
+                        raw_bytes = uf.getvalue()
+                        if i == 0:
+                            _record_dt = (
+                                capture_datetime_jst_from_bytes(raw_bytes)
+                                or _record_dt
+                            )
                         try:
-                            url = upload_image_to_drive(fname, mime, data)
+                            data, mime = prepare_upload_image_jpeg(raw_bytes)
                         except Exception as e:
-                            st.error(f"ドライブ保存に失敗しました: {e}")
+                            st.error(f"画像の処理に失敗しました（{i + 1} 枚目）: {e}")
                             ready_for_sheet = False
+                            break
+                        safe_base = re.sub(
+                            r"[^\w\-_.]", "_", uf.name.rsplit(".", 1)[0]
+                        )[:80]
+                        fname = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
+                        try:
+                            urls[i] = upload_image_to_drive(fname, mime, data)
+                        except Exception as e:
+                            st.error(f"ドライブ保存に失敗しました（{i + 1} 枚目）: {e}")
+                            ready_for_sheet = False
+                            break
 
             if ready_for_sheet:
-                with st.spinner("スプレッドシートに記録しています…"):
+                ws0 = ensure_worksheet_header()
+                if ws0 is None:
+                    st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
+                else:
                     try:
-                        append_sheet_row(
-                            movement,
-                            product_name.strip(),
-                            supplier.strip(),
-                            _q2,
-                            _u2,
-                            _lex,
-                            _lin,
-                            url,
-                            memo_s,
-                            record_datetime=_record_dt,
-                            planned_sale_unit_excl_yen=_plan2,
-                            actual_sale_unit_excl_yen=_act_ex2,
-                            stock_status=_stat2,
-                            consumption_tax_rate=_tax_r2,
-                        )
+                        ids = allocate_management_ids(ws0, n_save)
+                        with st.spinner("スプレッドシートに記録しています…"):
+                            for i in range(n_save):
+                                append_sheet_row(
+                                    movement,
+                                    product_name.strip(),
+                                    supplier.strip(),
+                                    _u2,
+                                    _lex_one,
+                                    _lin_one,
+                                    urls[i],
+                                    ids[i],
+                                    memo_s,
+                                    record_datetime=_record_dt,
+                                    planned_sale_unit_excl_yen=_plan2,
+                                    actual_sale_unit_excl_yen=_act_ex2,
+                                    stock_status=_stat2,
+                                    consumption_tax_rate=_tax_r2,
+                                )
                     except Exception as e:
                         st.error(f"スプレッドシート更新に失敗しました: {e}")
-                        if url:
-                            st.warning(f"画像は保存済みです: {url}")
+                        if any(urls):
+                            st.warning(
+                                "一部の画像はドライブに保存済みの可能性があります。台帳の内容を確認してください。"
+                            )
                     else:
                         st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-                        st.success("記録しました。")
-                        if url:
-                            st.markdown(f"[保存した画像を開く]({url})")
+                        st.success(f"記録しました（{n_save} 行・1点1行）。管理IDを自動付与しています。")
+                        _link_urls = [u for u in urls if u]
+                        for _uurl in _link_urls[:8]:
+                            st.markdown(f"[保存した画像を開く]({_uurl})")
+                        if len(_link_urls) > 8:
+                            st.caption(f"ほか {len(_link_urls) - 8} 件の画像URLは台帳の「{COL_IMAGE_URL}」列を参照してください。")
                         st.balloons()
 
     render_inventory_manager()
