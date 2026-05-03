@@ -294,8 +294,9 @@ def analyze_image_with_gemini(image_data):
 
     prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
 
+    # 429 Resource Exhausted 回避のため一時的に 1.5-flash（元: gemini-2.0-flash）
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-1.5-flash",
         contents=[prompt, image_data],
     )
     return response.text
