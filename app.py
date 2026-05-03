@@ -42,12 +42,14 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import re
 import uuid
 from datetime import datetime
 from typing import Any
 
 import altair as alt
+import numpy as np
 import google.generativeai as genai
 import gspread
 import pandas as pd
@@ -523,6 +525,24 @@ def _consumption_tax_rate_from_choice_label(label: str) -> float:
     return CONSUMPTION_TAX_CHOICE_TO_RATE.get(label, CONSUMPTION_TAX_RATE)
 
 
+def _finite_int(val: Any, default: int = 0) -> int:
+    """NaN / inf / 非数値を default に落とし、有限な int にする（金額・数量用）。"""
+    try:
+        if val is None:
+            return default
+        if isinstance(val, (float, np.floating)):
+            if not math.isfinite(float(val)) or pd.isna(val):
+                return default
+        if isinstance(val, str) and not str(val).strip():
+            return default
+        n = float(pd.to_numeric(val, errors="coerce"))
+        if not math.isfinite(n) or pd.isna(n):
+            return default
+        return int(round(n))
+    except (OverflowError, ValueError, TypeError):
+        return default
+
+
 def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
     """税抜き行金額から税込円金額（四捨五入）。
 
@@ -530,14 +550,18 @@ def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
         price_excl_yen: 税抜き金額（円）
         tax_rate: 消費税率（例: 0.1）。None のときは :data:`CONSUMPTION_TAX_RATE`（10%）
     """
-    r = CONSUMPTION_TAX_RATE if tax_rate is None else float(tax_rate)
-    return int(round(int(price_excl_yen) * (1 + r)))
+    ex = _finite_int(price_excl_yen, 0)
+    r_raw = CONSUMPTION_TAX_RATE if tax_rate is None else tax_rate
+    r = float(pd.to_numeric(r_raw, errors="coerce"))
+    if not math.isfinite(r) or pd.isna(r):
+        r = float(CONSUMPTION_TAX_RATE)
+    return int(round(ex * (1 + r)))
 
 
 def _infer_tax_rate_from_main_line(line_excl_yen: int, line_incl_yen: int) -> float:
     """商品金額（税抜）と税込金額から、登録時と同じ消費税区分を推定する。"""
-    excl = int(line_excl_yen)
-    incl = int(line_incl_yen)
+    excl = _finite_int(line_excl_yen, 0)
+    incl = _finite_int(line_incl_yen, 0)
     if excl <= 0:
         return float(CONSUMPTION_TAX_RATE)
     if incl <= excl:
@@ -556,13 +580,16 @@ def _planned_actual_line_amounts(
     tax_rate: float,
 ) -> tuple[int, int, int, int]:
     """販売予定・実売の税抜行計と税込行計（単価×数量を税抜合計にしてから税込）。"""
-    q = max(1, int(qty))
-    pu, au = int(planned_unit_excl), int(actual_unit_excl)
+    q = max(1, _finite_int(qty, 1))
+    pu, au = _finite_int(planned_unit_excl, 0), _finite_int(actual_unit_excl, 0)
     st = _normalize_stock_status(status)
+    tr = float(pd.to_numeric(tax_rate, errors="coerce"))
+    if not math.isfinite(tr) or pd.isna(tr):
+        tr = float(CONSUMPTION_TAX_RATE)
     plex = pu * q if pu > 0 else 0
-    pincl = price_incl_tax(plex, tax_rate) if plex > 0 else 0
+    pincl = price_incl_tax(plex, tr) if plex > 0 else 0
     aex = (au * q) if (st == STATUS_SOLD and au > 0) else 0
-    aincl = price_incl_tax(aex, tax_rate) if aex > 0 else 0
+    aincl = price_incl_tax(aex, tr) if aex > 0 else 0
     return plex, pincl, aex, aincl
 
 
@@ -687,23 +714,41 @@ def upload_image_to_drive(filename: str, mime: str, data: bytes) -> str:
     return str(url)
 
 
-def _optional_amount_cell(yen: int) -> int | str:
-    """0 以下はシート上では空欄。"""
-    if yen <= 0:
-        return ""
-    return int(yen)
+def _optional_amount_cell(yen: int) -> int:
+    """0 以下は 0（数値列・スプレッドシートともに空欄相当）。"""
+    v = _finite_int(yen, 0)
+    return max(0, v)
 
 
 def _int_from_cell(v: Any) -> int:
-    try:
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return 0
-        s = str(v).strip().replace(",", "")
-        if not s or s.lower() in ("nan", "none"):
-            return 0
-        return int(float(s))
-    except Exception:
-        return 0
+    """セル値を有限な int に（計算前の正規化用）。"""
+    return _finite_int(v, 0)
+
+
+def _coerce_money_columns_for_recalc(df: pd.DataFrame) -> pd.DataFrame:
+    """数値列を ``pd.to_numeric`` で揃え、inf/NaN を 0 にして int 化する。"""
+    out = df.copy()
+    money_cols = (
+        COL_PRICE_UNIT,
+        COL_PRICE_EXCL,
+        COL_PRICE_INCL,
+        COL_PLANNED_SALE,
+        COL_PLANNED_SALE_INCL,
+        COL_ACTUAL_SALE,
+        COL_ACTUAL_SALE_INCL,
+        COL_GROSS_PROFIT,
+        COL_QTY,
+    )
+    for c in money_cols:
+        if c not in out.columns:
+            continue
+        s = (
+            pd.to_numeric(out[c], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+        )
+        out[c] = s.map(lambda x: _finite_int(x, 0))
+    return out
 
 
 def _normalize_stock_status(status: str) -> str:
@@ -716,23 +761,25 @@ def _compute_gross_profit_row(
     planned_line_excl: int,
     actual_line_excl: int,
     status: str,
-) -> int | str:
-    """税抜ベース（行計）。販売済は実売行計−原価、在庫中は販売予定行計−原価。"""
+) -> int | None:
+    """税抜ベース（行計）。販売済は実売行計−原価、在庫中は販売予定行計−原価。算出不可時は None。"""
     st = _normalize_stock_status(status)
+    cg = _finite_int(cogs_line_excl, 0)
+    plex = _finite_int(planned_line_excl, 0)
+    aex = _finite_int(actual_line_excl, 0)
     if st == STATUS_SOLD:
-        if actual_line_excl > 0:
-            return int(actual_line_excl - cogs_line_excl)
-        return ""
+        if aex > 0:
+            return int(aex - cg)
+        return None
     if st == STATUS_IN_STOCK:
-        if planned_line_excl > 0:
-            return int(planned_line_excl - cogs_line_excl)
-        return ""
-    return ""
+        if plex > 0:
+            return int(plex - cg)
+        return None
+    return None
 
 
 def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """販売予定/実売の税込総額列と粗利を再計算する。"""
-    out = df.copy()
+    """販売予定/実売の税込総額列と粗利を再計算する（数値列は int で統一）。"""
     need = (
         COL_GROSS_PROFIT,
         COL_STOCK_STATUS,
@@ -744,24 +791,27 @@ def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         COL_PLANNED_SALE_INCL,
         COL_ACTUAL_SALE_INCL,
     )
-    if not all(c in out.columns for c in need):
-        return out
+    if not all(c in df.columns for c in need):
+        return df.copy()
+    out = _coerce_money_columns_for_recalc(df)
     for i in out.index:
-        cogs = _int_from_cell(out.at[i, COL_PRICE_EXCL])
-        line_in = _int_from_cell(out.at[i, COL_PRICE_INCL])
-        qty = max(1, _int_from_cell(out.at[i, COL_QTY]))
-        pl_u = _int_from_cell(out.at[i, COL_PLANNED_SALE])
-        ac_u = _int_from_cell(out.at[i, COL_ACTUAL_SALE])
+        cogs = _finite_int(out.at[i, COL_PRICE_EXCL], 0)
+        line_in = _finite_int(out.at[i, COL_PRICE_INCL], 0)
+        qty = max(1, _finite_int(out.at[i, COL_QTY], 1))
+        pl_u = _finite_int(out.at[i, COL_PLANNED_SALE], 0)
+        ac_u = _finite_int(out.at[i, COL_ACTUAL_SALE], 0)
         stt = _normalize_stock_status(str(out.at[i, COL_STOCK_STATUS]))
         out.at[i, COL_STOCK_STATUS] = stt
         tax_r = _infer_tax_rate_from_main_line(cogs, line_in)
         plex, pincl, aex, aincl = _planned_actual_line_amounts(
             qty, pl_u, ac_u, stt, tax_r
         )
-        out.at[i, COL_PLANNED_SALE_INCL] = "" if pincl <= 0 else int(pincl)
-        out.at[i, COL_ACTUAL_SALE_INCL] = "" if aincl <= 0 else int(aincl)
+        pincl_i = _finite_int(pincl, 0)
+        aincl_i = _finite_int(aincl, 0)
+        out.at[i, COL_PLANNED_SALE_INCL] = pincl_i if pincl_i > 0 else 0
+        out.at[i, COL_ACTUAL_SALE_INCL] = aincl_i if aincl_i > 0 else 0
         gp = _compute_gross_profit_row(cogs, plex, aex, stt)
-        out.at[i, COL_GROSS_PROFIT] = "" if gp == "" else int(gp)
+        out.at[i, COL_GROSS_PROFIT] = 0 if gp is None else _finite_int(gp, 0)
     return out
 
 
@@ -787,16 +837,18 @@ def append_sheet_row(
         st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
         return
     now = (record_datetime or "").strip() or jst_now_str()
-    cogs = int(line_price_excl_yen)
-    qty_i = max(1, int(quantity))
-    pl_u = int(planned_sale_unit_excl_yen)
-    ac_u = int(actual_sale_unit_excl_yen)
+    cogs = _finite_int(line_price_excl_yen, 0)
+    qty_i = max(1, _finite_int(quantity, 1))
+    pl_u = _finite_int(planned_sale_unit_excl_yen, 0)
+    ac_u = _finite_int(actual_sale_unit_excl_yen, 0)
     stt = _normalize_stock_status(str(stock_status))
     tax_r = (
         float(consumption_tax_rate)
         if consumption_tax_rate is not None
+        and math.isfinite(float(consumption_tax_rate))
         else _infer_tax_rate_from_main_line(
-            int(line_price_excl_yen), int(line_price_incl_yen)
+            _finite_int(line_price_excl_yen, 0),
+            _finite_int(line_price_incl_yen, 0),
         )
     )
     plex, pincl, aex, aincl = _planned_actual_line_amounts(
@@ -804,15 +856,19 @@ def append_sheet_row(
     )
     planned_unit_cell = _optional_amount_cell(pl_u)
     planned_incl_cell = _optional_amount_cell(pincl)
-    actual_unit_cell = _optional_amount_cell(ac_u) if stt == STATUS_SOLD else ""
-    actual_incl_cell = _optional_amount_cell(aincl) if stt == STATUS_SOLD else ""
+    actual_unit_cell = (
+        _optional_amount_cell(ac_u) if stt == STATUS_SOLD else 0
+    )
+    actual_incl_cell = (
+        _optional_amount_cell(aincl) if stt == STATUS_SOLD else 0
+    )
     gp = _compute_gross_profit_row(
         cogs,
         plex,
         aex if stt == STATUS_SOLD else 0,
         stt,
     )
-    gross_cell = "" if gp == "" else int(gp)
+    gross_cell = 0 if gp is None else _finite_int(gp, 0)
     try:
         ws.append_row(
             [
@@ -893,7 +949,11 @@ def _on_ledger_pick_supplier() -> None:
 def _cell_value_for_sheet(v: Any) -> Any:
     try:
         if pd.api.types.is_scalar(v) and pd.isna(v):
-            return ""
+            return 0
+        if isinstance(v, (float, np.floating)) and (
+            not math.isfinite(float(v)) or pd.isna(v)
+        ):
+            return 0
     except Exception:
         pass
     return v
@@ -1438,8 +1498,8 @@ def _init_registration_form_session_state() -> None:
 
 
 def main():
-    st.set_page_config(page_title="商品 在庫・販売", layout="wide")
-    st.title("商品 在庫・販売管理")
+    st.set_page_config(page_title="商品在庫・販売", layout="wide")
+    st.title("商品在庫・販売管理")
     st.caption("写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・スプレッドシート記録ができます。")
 
     _init_registration_form_session_state()
@@ -1676,7 +1736,7 @@ def main():
     with pm6:
         st.metric(
             "粗利（税抜・プレビュー）",
-            "—" if _gp_preview == "" else f"¥{int(_gp_preview):,}",
+            "—" if _gp_preview is None else f"¥{int(_gp_preview):,}",
         )
 
     st.subheader("任意入力")
