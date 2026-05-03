@@ -32,11 +32,13 @@ import streamlit as st
 
 
 def check_password() -> bool:
-    """APP_PASSWORD が一致するまで在庫アプリ本体を起動しない。未認証時は st.stop() で打ち切る。"""
-    if st.session_state.get("_auth_ok"):
+    """認証済みになるまで在庫アプリ本体を起動しない。未認証時は認証UIのみ表示し st.stop() する。"""
+    if st.session_state.get("authenticated"):
         return True
-    st.set_page_config(page_title="ログイン", layout="centered")
-    st.title("呉服 在庫・販売管理")
+
+    st.set_page_config(page_title="認証", layout="centered")
+    st.header("認証")
+
     try:
         expected = str(st.secrets["APP_PASSWORD"]).strip()
     except Exception:
@@ -45,17 +47,21 @@ def check_password() -> bool:
             "（ローカルで `secrets.toml` が無い場合は作成してください）"
         )
         st.stop()
+
     if not expected:
         st.error("APP_PASSWORD が空です。secrets.toml を確認してください。")
         st.stop()
-    st.text_input("パスワード", type="password", key="app_login_password")
-    if st.button("ログイン"):
-        entered = (st.session_state.get("app_login_password") or "").strip()
-        if entered == expected:
-            st.session_state._auth_ok = True
+
+    with st.form("auth_screen_form"):
+        password = st.text_input("パスワード", type="password")
+        submitted = st.form_submit_button("ログイン（パスワード入力後は Enter でも送信できます）")
+
+    if submitted:
+        if (password or "").strip() == expected:
+            st.session_state["authenticated"] = True
             st.rerun()
-        else:
-            st.error("パスワードが正しくありません。")
+        st.error("パスワードが正しくありません。")
+
     st.stop()
 
 
