@@ -1375,6 +1375,22 @@ def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
         raise RuntimeError(f"スプレッドシートの上書きに失敗しました: {e}") from e
 
 
+def _ledger_df_loosen_numeric_columns_for_assignment(df: pd.DataFrame) -> None:
+    """StringDtype 等の厳格な列に int を代入すると失敗するため、金額・数量列を object に揃える（原地変更）。"""
+    for _c in (
+        COL_QTY,
+        COL_PRICE_EXCL,
+        COL_PRICE_INCL,
+        COL_PLANNED_SALE,
+        COL_PLANNED_SALE_INCL,
+        COL_ACTUAL_SALE,
+        COL_ACTUAL_SALE_INCL,
+        COL_GROSS_PROFIT,
+    ):
+        if _c in df.columns:
+            df[_c] = df[_c].astype(object)
+
+
 def _update_inventory_row_to_sold_by_source_id(
     source_management_id: str,
     *,
@@ -1388,6 +1404,7 @@ def _update_inventory_row_to_sold_by_source_id(
     if df_src is None or df_src.empty:
         raise RuntimeError("台帳を読み込めませんでした。")
     df_src = df_src.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
+    _ledger_df_loosen_numeric_columns_for_assignment(df_src)
     msk = df_src[COL_MANAGEMENT_ID].astype(str).str.strip() == sid
     if not msk.any():
         raise RuntimeError(f"管理ID {sid} の行が台帳に見つかりません。")
