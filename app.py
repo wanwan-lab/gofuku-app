@@ -14,6 +14,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 任意:
   GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
+  APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
 ※ 画像の Gemini 解析はパッケージ `google-genai`（`from google import genai`）のみを使用します。`google-generativeai` は使いません。
 
@@ -26,6 +27,37 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 """
 
 from __future__ import annotations
+
+import streamlit as st
+
+
+def check_password() -> bool:
+    """APP_PASSWORD が一致するまで在庫アプリ本体を起動しない。未認証時は st.stop() で打ち切る。"""
+    if st.session_state.get("_auth_ok"):
+        return True
+    st.set_page_config(page_title="ログイン", layout="centered")
+    st.title("呉服 在庫・販売管理")
+    try:
+        expected = str(st.secrets["APP_PASSWORD"]).strip()
+    except Exception:
+        st.error(
+            "`.streamlit/secrets.toml` に **APP_PASSWORD** を設定してください。"
+            "（ローカルで `secrets.toml` が無い場合は作成してください）"
+        )
+        st.stop()
+    if not expected:
+        st.error("APP_PASSWORD が空です。secrets.toml を確認してください。")
+        st.stop()
+    st.text_input("パスワード", type="password", key="app_login_password")
+    if st.button("ログイン"):
+        entered = (st.session_state.get("app_login_password") or "").strip()
+        if entered == expected:
+            st.session_state._auth_ok = True
+            st.rerun()
+        else:
+            st.error("パスワードが正しくありません。")
+    st.stop()
+
 
 import base64
 import io
@@ -40,7 +72,6 @@ import pandas as pd
 from google import genai
 import gspread
 import requests
-import streamlit as st
 from google.oauth2 import service_account
 from PIL import Image
 
@@ -954,4 +985,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if check_password():
+        main()
