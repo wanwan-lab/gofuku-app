@@ -29,6 +29,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
   ※新規登録画面では税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
+  ※シートの金額列（商品単価・商品金額税抜・税込金額）は、書き込み時に表示形式 **#,##0** を適用します。
 """
 
 from __future__ import annotations
@@ -123,6 +124,43 @@ EXPECTED_HEADERS = [
     COL_MEMO,
     COL_IMAGE_URL,
 ]
+
+# スプレッドシート金額列の表示形式（Google Sheets API repeatCell）
+_SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
+
+
+def _apply_inventory_amount_number_formats(ws) -> None:
+    """商品単価・商品金額（税抜）・税込金額の列に、2行目以降で #,##0 を適用する。"""
+    idx_unit = EXPECTED_HEADERS.index(COL_PRICE_UNIT)
+    idx_incl = EXPECTED_HEADERS.index(COL_PRICE_INCL)
+    end_row = max(int(ws.row_count), 2)
+    ws.spreadsheet.batch_update(
+        {
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": end_row,
+                            "startColumnIndex": idx_unit,
+                            "endColumnIndex": idx_incl + 1,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {
+                                    "type": "NUMBER",
+                                    "pattern": _SHEET_AMOUNT_NUMBER_PATTERN,
+                                }
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                }
+            ]
+        }
+    )
+
 
 # 一時的: secrets.toml が無い／空でもアプリを落とさない（AI 解析テスト用）
 _PLACEHOLDER_DRIVE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
@@ -473,6 +511,10 @@ def ensure_worksheet_header():
         first = ws.row_values(1)
         if not first or first[: len(EXPECTED_HEADERS)] != EXPECTED_HEADERS:
             ws.update("A1", [EXPECTED_HEADERS], value_input_option="USER_ENTERED")
+            try:
+                _apply_inventory_amount_number_formats(ws)
+            except Exception:
+                pass
         return ws
     except Exception:
         return None
@@ -557,6 +599,10 @@ def append_sheet_row(
             ],
             value_input_option="USER_ENTERED",
         )
+        try:
+            _apply_inventory_amount_number_formats(ws)
+        except Exception:
+            pass
     except Exception as e:
         st.warning(f"スプレッドシート更新をスキップしました: {e}")
 
@@ -632,6 +678,10 @@ def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
     try:
         ws.clear()
         ws.update("A1", values, value_input_option="USER_ENTERED")
+        try:
+            _apply_inventory_amount_number_formats(ws)
+        except Exception:
+            pass
     except Exception as e:
         raise RuntimeError(f"スプレッドシートの上書きに失敗しました: {e}") from e
 
