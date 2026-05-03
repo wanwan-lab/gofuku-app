@@ -73,8 +73,8 @@ import re
 import uuid
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
-import pytz
 import altair as alt
 import pandas as pd
 from google import genai
@@ -116,7 +116,7 @@ EXPECTED_HEADERS = [
 _PLACEHOLDER_DRIVE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
 
 # アプリ全体の基準タイムゾーン（台帳の「日時」・ファイル名など）
-TZ_JP = pytz.timezone("Asia/Tokyo")
+TZ_JP = ZoneInfo("Asia/Tokyo")
 
 
 def jst_now() -> datetime:
@@ -170,7 +170,7 @@ def capture_datetime_jst_from_bytes(raw: bytes) -> str | None:
                 continue
         if naive is None:
             return None
-        aware = TZ_JP.localize(naive)
+        aware = naive.replace(tzinfo=TZ_JP)
         return aware.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
