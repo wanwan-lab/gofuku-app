@@ -16,7 +16,9 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
   APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
-※ 画像の Gemini 解析は **google-generativeai** の ``GenerativeModel('gemini-1.5-flash')``（プレフィックスなし）を使用します。
+※ 画像の Gemini 解析は **google-generativeai** の ``GenerativeModel(GEMINI_VISION_MODEL)``（既定は
+  ``gemini-1.5-flash``。ソースに ``models/`` プレフィックスは書きません）を使用します。
+  エラー文に ``models/gemini-1.5-flash`` と出るのは API 側のリソース表記です。
 ※ アップロード画像は Pillow で長辺最大1280px・JPEG品質80に変換したうえで解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
@@ -101,6 +103,9 @@ COL_MEMO = "メモ"
 
 # 消費税の自動計算（標準税率）。軽減税率の品目は手入力・メモで補足してください。
 CONSUMPTION_TAX_RATE = 0.10
+
+# Gemini 画像解析: プレフィックスなし（google-generativeai が内部で ``models/`` を付けて v1beta を呼びます）
+GEMINI_VISION_MODEL = "gemini-1.5-flash"
 
 EXPECTED_HEADERS = [
     COL_DATETIME,
@@ -295,7 +300,7 @@ def price_incl_tax(price_excl_yen: int) -> int:
 
 def analyze_image_with_gemini(image_data):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel(GEMINI_VISION_MODEL)
     prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
     response = model.generate_content([prompt, image_data])
     return response.text or ""
