@@ -461,9 +461,9 @@ def _apply_gemini_json_to_session(
     if isinstance(m, dict) and df_ledger is not None and not df_ledger.empty:
         mid_hit = str(m.get("management_id") or m.get("管理ID") or "").strip()
         if mid_hit and COL_MANAGEMENT_ID in df_ledger.columns:
-            sub_hit = df_ledger.loc[
-                df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid_hit
-            ]
+            mask_id = df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid_hit
+            mask_in = _mask_ledger_in_stock(df_ledger)
+            sub_hit = df_ledger.loc[mask_id & mask_in]
             if len(sub_hit) == 1:
                 row_hit = sub_hit.iloc[0]
                 st.session_state["_gemini_match_management_id"] = mid_hit
@@ -584,24 +584,35 @@ def _apply_gemini_sale_link_to_session(
         and not df_ledger.empty
         and COL_MANAGEMENT_ID in df_ledger.columns
     ):
-        hits = df_ledger.loc[
-            df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid
-        ]
-        if len(hits) == 1:
-            row_hit = hits.iloc[0]
+        mask_mid = df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid
+        hits_in = df_ledger.loc[mask_mid & _mask_ledger_in_stock(df_ledger)]
+        if len(hits_in) == 1:
+            row_hit = hits_in.iloc[0]
     if not mid:
         return
     if row_hit is None:
+        if (
+            df_ledger is not None
+            and not df_ledger.empty
+            and COL_MANAGEMENT_ID in df_ledger.columns
+        ):
+            hits_any = df_ledger.loc[
+                df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid
+            ]
+            if len(hits_any) == 1:
+                stt_bad = _normalize_stock_status(
+                    str(hits_any.iloc[0].get(COL_STOCK_STATUS, ""))
+                )
+                st.session_state["_sale_link_warn"] = (
+                    f"管理ID {mid} は「{stt_bad}」のため販売元に使えません。"
+                    "照合対象は **在庫中** の行のみです。"
+                )
+                return
         st.session_state.field_sale_source_mgmt_id = mid
         st.session_state["_sale_link_warn"] = (
             f"管理ID {mid} が台帳に見つかりません。表記を確認するか手入力してください。"
         )
         return
-    stt_row = _normalize_stock_status(str(row_hit.get(COL_STOCK_STATUS, "")))
-    if stt_row != STATUS_IN_STOCK:
-        st.session_state["_sale_link_warn"] = (
-            f"管理ID {mid} はステータス「{stt_row}」です。通常は在庫中の行を紐付けます。"
-        )
     st.session_state.field_sale_source_mgmt_id = mid
     st.session_state["_sale_link_management_id"] = mid
     if conf >= 0.72:
@@ -757,11 +768,11 @@ def analyze_image_with_gemini(
     inv_block = ""
     if inventory_context and inventory_context.strip():
         inv_block = f"""
-次のリストは、すでに台帳にある **在庫中** の行の抜粋です（最大約90件。写真と同一・類似の商品がありそうなら必ず照合してください）。
+次のリストは、すでに台帳にある **在庫中** の行の抜粋です（**販売済は含みません**。最大約90件。写真と同一・類似の商品がありそうなら必ず照合してください）。
 {inventory_context.strip()}
 
 照合するときは必ず "match" オブジェクトを付け、少なくとも次を含めてください:
-- "management_id" (string): 上のリストの **管理ID** と完全一致する値（該当がなければ ""）
+- "management_id" (string): 上のリストにある **在庫中** 行の **管理ID** と完全一致する値（該当がなければ ""）
 - "product_name" (string): 台帳の商品名に合わせた確定案（推測でも可）
 - "supplier" (string): 台帳の仕入先に合わせた確定案（推測でも可）
 - "line_price_excl" (integer or null): 台帳の仕入金額（税抜）と一致する整数。不明なら null
@@ -775,7 +786,8 @@ def analyze_image_with_gemini(
                 "販売元の写真照合には、台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
             )
         prompt = f"""この画像は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（呉服店の在庫）。
-次のリストは台帳の **在庫中** の行だけです。写真と **同一の在庫1行** を選び、JSON だけを返してください（説明文・コードフェンス禁止）。
+次のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。必ずこのリストの中からだけ management_id を選べ。
+写真と **同一の在庫1行** を選び、JSON だけを返してください（説明文・コードフェンス禁止）。
 
 {inventory_context.strip()}
 
@@ -1361,6 +1373,37 @@ def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
             pass
     except Exception as e:
         raise RuntimeError(f"スプレッドシートの上書きに失敗しました: {e}") from e
+
+
+def _update_inventory_row_to_sold_by_source_id(
+    source_management_id: str,
+    *,
+    actual_sale_unit_excl_yen: int,
+) -> None:
+    """販売元管理IDの在庫行を販売済にし、実売（税抜）が入力されていれば反映してから台帳を再保存する。"""
+    sid = (source_management_id or "").strip()
+    if not sid:
+        return
+    df_src = load_inventory_dataframe()
+    if df_src is None or df_src.empty:
+        raise RuntimeError("台帳を読み込めませんでした。")
+    df_src = df_src.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
+    msk = df_src[COL_MANAGEMENT_ID].astype(str).str.strip() == sid
+    if not msk.any():
+        raise RuntimeError(f"管理ID {sid} の行が台帳に見つかりません。")
+    cur_st = _normalize_stock_status(
+        str(df_src.loc[msk, COL_STOCK_STATUS].iloc[0])
+    )
+    if cur_st != STATUS_IN_STOCK:
+        raise RuntimeError(
+            f"管理ID {sid} は「{cur_st}」のため、販売済への自動更新の対象外です（在庫中のみ更新します）。"
+        )
+    df_src.loc[msk, COL_STOCK_STATUS] = STATUS_SOLD
+    av = _finite_int(actual_sale_unit_excl_yen, 0)
+    if av > 0:
+        df_src.loc[msk, COL_ACTUAL_SALE] = av
+    df_src = _recalc_gross_profit_dataframe(df_src)
+    overwrite_inventory_worksheet_from_dataframe(df_src)
 
 
 def _apply_ledger_sort(
@@ -2192,8 +2235,9 @@ def main():
 
     st.markdown("##### クイック検索（写真から検索）")
     st.caption(
-        "写真をアップロードして **AIで画像を解析** すると、商品名・柄色などを推定しつつ、"
-        "台帳の **在庫中** 行一覧と照合して管理IDが一致したときは、商品名・仕入先・仕入金額（税抜）を台帳に合わせて自動入力します。"
+        "この **1枚の写真** だけを使います（登録・販売元照合の共通）。"
+        "**AIで画像を解析** で商品名・柄色などを推定しつつ在庫中と照合、"
+        "**販売元を写真で照合** で売れた在庫の管理IDを推定します（出庫（販売）の前後でどちらでも実行可）。"
         "解析後は下の「在庫中の近い候補」も併せて確認してください。"
     )
     uploaded = st.file_uploader(
@@ -2215,7 +2259,7 @@ def main():
         horizontal=True,
     )
 
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns([1, 1, 1])
     with col_a:
         analyze = st.button(
             "AIで画像を解析",
@@ -2223,6 +2267,14 @@ def main():
             disabled=uploaded is None,
         )
     with col_b:
+        sale_link_from_photo = st.button(
+            "販売元を写真で照合",
+            type="secondary",
+            disabled=uploaded is None,
+            key="sale_link_from_shared_photo",
+            help="上の1枚の写真から、在庫中のどの管理IDが販売元かを AI で推定し、販売管理の「販売元管理ID」に反映します。",
+        )
+    with col_c:
         if st.button("候補の自動入力をクリア"):
             st.session_state.field_product_name = ""
             st.session_state.field_supplier = ""
@@ -2270,6 +2322,25 @@ def main():
                     "1分ほど待ってから再試行してください。"
                 )
                 st.caption(f"詳細: {e}")
+
+    if sale_link_from_photo and uploaded is not None:
+        with st.spinner("販売元を照合しています…"):
+            try:
+                img_sl = _gemini_input_image_from_upload(uploaded)
+                inv_sl = ""
+                if df_ledger_hint is not None and not df_ledger_hint.empty:
+                    inv_sl = _build_gemini_inventory_context(df_ledger_hint)
+                raw_sl = analyze_image_with_gemini(
+                    img_sl,
+                    inventory_context=inv_sl or None,
+                    prompt_mode="sale_link",
+                )
+                res_sl = _parse_json_from_model(raw_sl or "")
+                _apply_gemini_sale_link_to_session(res_sl, df_ledger_hint)
+                _refresh_ledger_quick_search_candidates(df_ledger_hint)
+                st.success("販売元の候補を反映しました。下の販売管理で内容を確認してください。")
+            except Exception as e:
+                st.warning(str(e))
 
     if st.session_state.get("ai_parse_ran"):
         st.subheader("AI解析結果（参考）")
@@ -2433,45 +2504,11 @@ def main():
     st.markdown("##### 販売管理（任意）")
     st.caption(
         "実売・ステータス・**販売元管理ID**（売れた在庫の入庫時の管理ID）をまとめて扱います。"
-        "区分が **出庫（販売）** のとき、下の写真で **販売元を写真から照合** すると在庫中の行と照らし合わせ、"
-        f"台帳の「{COL_SALE_SOURCE_MGMT_ID}」列に記録できるようにします（フォーム上部の写真とは別枠です）。"
+        "販売元の写真照合は、上の **クイック検索（写真から検索）** の **販売元を写真で照合** ボタンを使います（同じ1枚の写真）。"
+        "区分が **出庫（販売）** で確定すると、販売元管理IDの行は台帳上 **販売済** に更新されます（実売金額（税抜）を入力済みならその行にも反映します）。"
     )
-    sale_q_upload = st.file_uploader(
-        "販売照合用の写真（任意・1枚）",
-        type=["jpg", "jpeg", "png", "webp"],
-        key="sale_quick_search_upload",
-        help="販売した商品の写真から、在庫中のどの管理IDに相当するかを AI で推定します。",
-    )
-    sq_a, sq_b = st.columns([1, 2])
-    with sq_a:
-        sale_photo_analyze = st.button(
-            "販売元を写真から照合",
-            type="secondary",
-            key="sale_quick_analyze_btn",
-            disabled=sale_q_upload is None,
-        )
-    with sq_b:
-        if movement == "出庫（販売）":
-            st.caption("出庫（販売）のときは、販売元管理IDの入力を推奨します。")
-
-    if sale_photo_analyze and sale_q_upload is not None:
-        with st.spinner("販売元を照合しています…"):
-            try:
-                img_sq = _gemini_input_image_from_upload(sale_q_upload)
-                inv_sq = ""
-                if df_ledger_hint is not None and not df_ledger_hint.empty:
-                    inv_sq = _build_gemini_inventory_context(df_ledger_hint)
-                raw_sq = analyze_image_with_gemini(
-                    img_sq,
-                    inventory_context=inv_sq or None,
-                    prompt_mode="sale_link",
-                )
-                res_sq = _parse_json_from_model(raw_sq or "")
-                _apply_gemini_sale_link_to_session(res_sq, df_ledger_hint)
-                _refresh_ledger_quick_search_candidates(df_ledger_hint)
-                st.success("販売元の候補を反映しました。内容を確認し、必要なら修正してください。")
-            except Exception as e:
-                st.warning(str(e))
+    if movement == "出庫（販売）":
+        st.caption("出庫（販売）: 販売元管理IDの入力を推奨します。")
 
     _swarn = st.session_state.pop("_sale_link_warn", None)
     if _swarn:
@@ -2666,12 +2703,33 @@ def main():
                                 "一部の画像はドライブに保存済みの可能性があります。台帳の内容を確認してください。"
                             )
                     else:
+                        _linked_row_updated = False
+                        if movement == "出庫（販売）" and _sale_src_save:
+                            try:
+                                with st.spinner(
+                                    "販売元の在庫行を販売済に更新しています…"
+                                ):
+                                    _update_inventory_row_to_sold_by_source_id(
+                                        _sale_src_save,
+                                        actual_sale_unit_excl_yen=_act_ex2,
+                                    )
+                                    _linked_row_updated = True
+                            except Exception as e3:
+                                st.warning(
+                                    "出庫（販売）の行は記録しましたが、販売元在庫行の販売済更新に失敗しました: "
+                                    f"{e3}"
+                                )
                         st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
                         _msg_ok = (
                             f"記録しました（{n_save} 行・1点1行）。管理IDを自動付与しています。"
                         )
                         if _sale_src_save:
                             _msg_ok += f" 販売元管理ID: {_sale_src_save}"
+                            if movement == "出庫（販売）":
+                                if _linked_row_updated:
+                                    _msg_ok += "（紐付け元の在庫行は販売済に更新済み）"
+                                else:
+                                    _msg_ok += "（紐付け元の販売済更新は未完了の可能性があります）"
                         st.success(_msg_ok)
                         _link_urls = list(dict.fromkeys(u for u in urls if u))
                         for _uurl in _link_urls[:8]:
