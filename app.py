@@ -1,5 +1,5 @@
 """
-呉服在庫・販売管理 (Streamlit)
+商品在庫・販売管理 (Streamlit)
 
 st.secrets に以下を設定してください（例は .streamlit/secrets.toml）。
 
@@ -28,6 +28,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額 | 画像URL | メモ（任意）
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
+  ※新規登録画面では税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
 """
 
 from __future__ import annotations
@@ -100,8 +101,15 @@ COL_PRICE_INCL = "税込金額"
 COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
 
-# 消費税の自動計算（標準税率）。軽減税率の品目は手入力・メモで補足してください。
+# 消費税（税込計算の既定・ダッシュボード等で参照する標準税率）
 CONSUMPTION_TAX_RATE = 0.10
+
+# 登録画面ラジオの表示ラベル → 税率（小数）。非課税は税込＝税抜。
+_CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
+    "10%": 0.10,
+    "8%": 0.08,
+    "非課税": 0.0,
+}
 
 EXPECTED_HEADERS = [
     COL_DATETIME,
@@ -411,9 +419,19 @@ def _gemini_input_image_from_upload(uploaded) -> Image.Image:
     return Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
 
 
-def price_incl_tax(price_excl_yen: int) -> int:
-    """税抜き円金額から、標準税率を乗じた税込円金額（四捨五入）。"""
-    return int(round(int(price_excl_yen) * (1 + CONSUMPTION_TAX_RATE)))
+def _consumption_tax_rate_from_choice_label(label: str) -> float:
+    return _CONSUMPTION_TAX_CHOICE_TO_RATE.get(label, CONSUMPTION_TAX_RATE)
+
+
+def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
+    """税抜き行金額から税込円金額（四捨五入）。
+
+    Args:
+        price_excl_yen: 税抜き金額（円）
+        tax_rate: 消費税率（例: 0.1）。None のときは :data:`CONSUMPTION_TAX_RATE`（10%）
+    """
+    r = CONSUMPTION_TAX_RATE if tax_rate is None else float(tax_rate)
+    return int(round(int(price_excl_yen) * (1 + r)))
 
 
 def analyze_image_with_gemini(image_data):
@@ -1042,8 +1060,8 @@ def render_inventory_manager() -> None:
 
 
 def main():
-    st.set_page_config(page_title="呉服 在庫・販売", layout="wide")
-    st.title("呉服 在庫・販売管理")
+    st.set_page_config(page_title="商品 在庫・販売", layout="wide")
+    st.title("商品 在庫・販売管理")
     st.caption("写真アップロード・AI解析・Googleドライブ保存・スプレッドシート記録")
 
     # --- session 初期化（フォームは key で状態管理） ---
@@ -1063,6 +1081,8 @@ def main():
         st.session_state.field_memo = ""
     if "field_unit_price_excl" not in st.session_state:
         st.session_state.field_unit_price_excl = 1
+    if "field_consumption_tax_choice" not in st.session_state:
+        st.session_state.field_consumption_tax_choice = "10%"
     st.session_state.pop("field_price_excl", None)
 
     # --- 一時緩和: secrets 一括チェックを無効化（No secrets found 回避・Gemini 動作確認優先） ---
@@ -1151,10 +1171,21 @@ def main():
         help="1点あたりの税抜単価（円）。商品金額は数量×単価で自動計算します。",
     )
 
+    st.radio(
+        "消費税（税込金額の計算）",
+        options=list(_CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
+        horizontal=True,
+        key="field_consumption_tax_choice",
+        help="税込金額＝税抜行合計×（1＋税率）を四捨五入。非課税のときは税込＝税抜です。",
+    )
+    _tax_r = _consumption_tax_rate_from_choice_label(
+        str(st.session_state.get("field_consumption_tax_choice", "10%"))
+    )
+
     _q = int(quantity)
     _u = int(unit_price_excl)
     _line_ex = _q * _u
-    _line_in = price_incl_tax(_line_ex)
+    _line_in = price_incl_tax(_line_ex, _tax_r)
 
     price_row = st.columns([1, 1, 1])
     with price_row[0]:
@@ -1162,7 +1193,11 @@ def main():
         st.caption(f"数量 {_q} × 単価 ¥{_u:,}")
     with price_row[1]:
         st.metric("税込金額（行・自動）", f"¥{_line_in:,}")
-        st.caption("標準税率10%を行合計に四捨五入")
+        _tl = st.session_state.get("field_consumption_tax_choice", "10%")
+        if _tl == "非課税":
+            st.caption("非課税のため税込＝税抜行合計")
+        else:
+            st.caption(f"消費税{_tl}を行合計に四捨五入")
     with price_row[2]:
         st.caption("スプレッドシートには単価・税抜行計・税込行計の3値を記録します。")
 
@@ -1213,7 +1248,14 @@ def main():
                         _q2 = int(quantity)
                         _u2 = int(unit_price_excl)
                         _lex = _q2 * _u2
-                        _lin = price_incl_tax(_lex)
+                        _tax_r2 = _consumption_tax_rate_from_choice_label(
+                            str(
+                                st.session_state.get(
+                                    "field_consumption_tax_choice", "10%"
+                                )
+                            )
+                        )
+                        _lin = price_incl_tax(_lex, _tax_r2)
 
                         with st.spinner("スプレッドシートに記録しています…"):
                             try:
