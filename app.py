@@ -27,7 +27,8 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
-  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額 | メモ（任意） | 画像URL
+  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額
+  | 希望小売価格（税抜） | 希望小売価格（税込） | 実売価格（税抜） | 実売価格（税込） | メモ（任意） | 画像URL
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
   ※新規登録画面では税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
@@ -87,6 +88,10 @@ COL_QTY = "数量"
 COL_PRICE_UNIT = "商品単価（税抜）"
 COL_PRICE_EXCL = "商品金額（税抜）"
 COL_PRICE_INCL = "税込金額"
+COL_MSRP_EXCL = "希望小売価格（税抜）"
+COL_MSRP_INCL = "希望小売価格（税込）"
+COL_ACTUAL_EXCL = "実売価格（税抜）"
+COL_ACTUAL_INCL = "実売価格（税込）"
 COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
 
@@ -106,6 +111,10 @@ EXPECTED_HEADERS: list[str] = [
     COL_PRICE_UNIT,
     COL_PRICE_EXCL,
     COL_PRICE_INCL,
+    COL_MSRP_EXCL,
+    COL_MSRP_INCL,
+    COL_ACTUAL_EXCL,
+    COL_ACTUAL_INCL,
     COL_MEMO,
     COL_IMAGE_URL,
 ]
@@ -153,9 +162,9 @@ def check_password() -> bool:
 
 
 def _apply_inventory_amount_number_formats(ws) -> None:
-    """商品単価・商品金額（税抜）・税込金額の列に、2行目以降で #,##0 を適用する。"""
-    idx_unit = EXPECTED_HEADERS.index(COL_PRICE_UNIT)
-    idx_incl = EXPECTED_HEADERS.index(COL_PRICE_INCL)
+    """金額系の列（単価〜実売税込まで）に、2行目以降で #,##0 を適用する。"""
+    idx_start = EXPECTED_HEADERS.index(COL_PRICE_UNIT)
+    idx_end = EXPECTED_HEADERS.index(COL_ACTUAL_INCL)
     end_row = max(int(ws.row_count), 2)
     ws.spreadsheet.batch_update(
         {
@@ -166,8 +175,8 @@ def _apply_inventory_amount_number_formats(ws) -> None:
                             "sheetId": ws.id,
                             "startRowIndex": 1,
                             "endRowIndex": end_row,
-                            "startColumnIndex": idx_unit,
-                            "endColumnIndex": idx_incl + 1,
+                            "startColumnIndex": idx_start,
+                            "endColumnIndex": idx_end + 1,
                         },
                         "cell": {
                             "userEnteredFormat": {
@@ -636,6 +645,15 @@ def upload_image_to_drive(filename: str, mime: str, data: bytes) -> str:
     return str(url)
 
 
+def _optional_price_cells(
+    excl_yen: int, incl_yen: int
+) -> tuple[int | str, int | str]:
+    """任意価格: 税抜が 0 以下ならシートには空文字を書く。"""
+    if excl_yen <= 0:
+        return "", ""
+    return int(excl_yen), int(incl_yen)
+
+
 def append_sheet_row(
     movement: str,
     product_name: str,
@@ -647,12 +665,21 @@ def append_sheet_row(
     image_url: str,
     memo: str = "",
     record_datetime: str | None = None,
+    *,
+    msrp_excl_yen: int = 0,
+    msrp_incl_yen: int = 0,
+    actual_sale_excl_yen: int = 0,
+    actual_sale_incl_yen: int = 0,
 ):
     ws = ensure_worksheet_header()
     if ws is None:
         st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
         return
     now = (record_datetime or "").strip() or jst_now_str()
+    c_msrp_ex, c_msrp_in = _optional_price_cells(msrp_excl_yen, msrp_incl_yen)
+    c_act_ex, c_act_in = _optional_price_cells(
+        actual_sale_excl_yen, actual_sale_incl_yen
+    )
     try:
         ws.append_row(
             [
@@ -664,6 +691,10 @@ def append_sheet_row(
                 unit_price_excl_yen,
                 line_price_excl_yen,
                 line_price_incl_yen,
+                c_msrp_ex,
+                c_msrp_in,
+                c_act_ex,
+                c_act_in,
                 memo,
                 image_url,
             ],
@@ -1208,6 +1239,10 @@ def _init_registration_form_session_state() -> None:
         st.session_state.field_unit_price_excl = 1
     if "field_consumption_tax_choice" not in st.session_state:
         st.session_state.field_consumption_tax_choice = "10%"
+    if "field_msrp_excl" not in st.session_state:
+        st.session_state.field_msrp_excl = 0
+    if "field_actual_sale_excl" not in st.session_state:
+        st.session_state.field_actual_sale_excl = 0
     if "hint_filter_product_name" not in st.session_state:
         st.session_state.hint_filter_product_name = ""
     if "hint_filter_supplier" not in st.session_state:
@@ -1256,6 +1291,8 @@ def main():
             st.session_state.ai_parse_ran = False
             st.session_state.field_memo = ""
             st.session_state.field_unit_price_excl = 1
+            st.session_state.field_msrp_excl = 0
+            st.session_state.field_actual_sale_excl = 0
             st.session_state.hint_filter_product_name = ""
             st.session_state.hint_filter_supplier = ""
             st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
@@ -1362,7 +1399,7 @@ def main():
         options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
         horizontal=True,
         key="field_consumption_tax_choice",
-        help="税込金額＝税抜行合計×（1＋税率）を四捨五入。非課税のときは税込＝税抜です。",
+        help="商品の税込行計に加え、下の希望小売・実売の税込も同じ税率で四捨五入します。非課税のときは税込＝税抜です。",
     )
     _tax_r = _consumption_tax_rate_from_choice_label(
         str(st.session_state.get("field_consumption_tax_choice", "10%"))
@@ -1385,7 +1422,57 @@ def main():
         else:
             st.caption(f"消費税{_tl}を行合計に四捨五入")
     with price_row[2]:
-        st.caption("スプレッドシートには単価・税抜行計・税込行計の3値を記録します。")
+        st.caption(
+            "スプレッドシートには単価・税抜行計・税込行計に加え、任意で希望小売・実売の税抜・税込も記録できます。"
+        )
+
+    st.markdown("##### 任意：希望小売・実売価格（税抜）")
+    st.caption(
+        "上の「消費税」と同じ税率で税込を自動計算します。"
+        "0円のままにした項目は台帳では空欄として保存されます。"
+    )
+    orow_a, orow_b = st.columns(2)
+    with orow_a:
+        msrp_excl = st.number_input(
+            "希望小売価格／販売予定価格（税抜・任意）",
+            min_value=0,
+            step=1,
+            key="field_msrp_excl",
+            help="0 のときは記録しません。",
+        )
+    with orow_b:
+        actual_sale_excl = st.number_input(
+            "実売価格（税抜・任意）",
+            min_value=0,
+            step=1,
+            key="field_actual_sale_excl",
+            help="売れたときの税抜価格。0 のときは記録しません。",
+        )
+    _msrp_ex_i = int(msrp_excl)
+    _act_ex_i = int(actual_sale_excl)
+    _msrp_in_i = price_incl_tax(_msrp_ex_i, _tax_r) if _msrp_ex_i > 0 else 0
+    _act_in_i = price_incl_tax(_act_ex_i, _tax_r) if _act_ex_i > 0 else 0
+    om1, om2, oa1, oa2 = st.columns(4)
+    with om1:
+        st.metric(
+            "希望小売（税抜）",
+            "—" if _msrp_ex_i <= 0 else f"¥{_msrp_ex_i:,}",
+        )
+    with om2:
+        st.metric(
+            "希望小売（税込・自動）",
+            "—" if _msrp_ex_i <= 0 else f"¥{_msrp_in_i:,}",
+        )
+    with oa1:
+        st.metric(
+            "実売（税抜）",
+            "—" if _act_ex_i <= 0 else f"¥{_act_ex_i:,}",
+        )
+    with oa2:
+        st.metric(
+            "実売（税込・自動）",
+            "—" if _act_ex_i <= 0 else f"¥{_act_in_i:,}",
+        )
 
     st.subheader("任意入力")
     memo = st.text_area(
@@ -1420,6 +1507,14 @@ def main():
                 str(st.session_state.get("field_consumption_tax_choice", "10%"))
             )
             _lin = price_incl_tax(_lex, _tax_r2)
+            _msrp_ex2 = int(st.session_state.get("field_msrp_excl", 0))
+            _act_ex2 = int(st.session_state.get("field_actual_sale_excl", 0))
+            _msrp_in2 = (
+                price_incl_tax(_msrp_ex2, _tax_r2) if _msrp_ex2 > 0 else 0
+            )
+            _act_in2 = (
+                price_incl_tax(_act_ex2, _tax_r2) if _act_ex2 > 0 else 0
+            )
             memo_s = (memo or "").strip()
 
             url = ""
@@ -1461,6 +1556,10 @@ def main():
                             url,
                             memo_s,
                             record_datetime=_record_dt,
+                            msrp_excl_yen=_msrp_ex2,
+                            msrp_incl_yen=_msrp_in2,
+                            actual_sale_excl_yen=_act_ex2,
+                            actual_sale_incl_yen=_act_in2,
                         )
                     except Exception as e:
                         st.error(f"スプレッドシート更新に失敗しました: {e}")
