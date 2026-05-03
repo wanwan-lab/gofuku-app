@@ -23,16 +23,16 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 ※ アップロード画像は任意。ある場合のみ Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
-画面下部の「在庫一覧マネージャー」で、同一スプレッドシートを表形式で読み書きし、
+画面下部の「在庫一覧」で、同一スプレッドシートを表形式で読み書きし、
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
-  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額
+  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入単価（税抜） | 仕入金額（税抜） | 仕入税込金額
   | 販売予定単価（税抜） | 販売予定金額（税込） | 実売単価（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
-  ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
-  ※新規登録画面では税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
-  ※販売予定・実売は **1点あたり税抜単価** を保存し、税込総額列は「単価×数量」を税抜行合計にしたうえで商品行と同じ税率で四捨五入します。
+  ※仕入金額（税抜）は「数量×仕入単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
+  ※新規登録画面では仕入税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
+  ※販売予定・実売は **1点あたり税抜単価** を保存し、税込総額列は「単価×数量」を税抜行合計にしたうえで仕入行と同じ税率で四捨五入します。
   ※金額列（単価〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
   ※粗利は税抜ベースで「販売済」なら（実売単価×数量）−原価、「在庫中」なら（販売予定単価×数量）−原価。台帳保存時に再計算します。
 """
@@ -89,9 +89,9 @@ COL_TYPE = "入出庫種別"
 COL_NAME = "商品名"
 COL_SUPPLIER = "仕入先・取引先"
 COL_QTY = "数量"
-COL_PRICE_UNIT = "商品単価（税抜）"
-COL_PRICE_EXCL = "商品金額（税抜）"
-COL_PRICE_INCL = "税込金額"
+COL_PRICE_UNIT = "仕入単価（税抜）"
+COL_PRICE_EXCL = "仕入金額（税抜）"
+COL_PRICE_INCL = "仕入税込金額"
 COL_PLANNED_SALE = "販売予定単価（税抜）"
 COL_PLANNED_SALE_INCL = "販売予定金額（税込）"
 COL_ACTUAL_SALE = "実売単価（税抜）"
@@ -469,6 +469,8 @@ def _apply_gemini_json_to_session(result: dict[str, Any]) -> None:
         r.get("unit_price_excl")
         or r.get("unit_price")
         or r.get("product_unit_price_excl")
+        or r.get("仕入単価")
+        or r.get("仕入単価（税抜）")
         or r.get("商品単価")
         or r.get("商品単価（税抜）")
         or r.get("単価")
@@ -476,7 +478,10 @@ def _apply_gemini_json_to_session(result: dict[str, Any]) -> None:
     )
     if unit_yen is None and match_conf_ok:
         unit_yen = _coerce_unit_price_yen(
-            m.get("unit_price_excl") or m.get("unit_price") or m.get("商品単価")
+            m.get("unit_price_excl")
+            or m.get("unit_price")
+            or m.get("仕入単価")
+            or m.get("商品単価")
         )
     if unit_yen is not None:
         st.session_state.field_unit_price_excl = unit_yen
@@ -587,7 +592,7 @@ def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
 
 
 def _infer_tax_rate_from_main_line(line_excl_yen: int, line_incl_yen: int) -> float:
-    """商品金額（税抜）と税込金額から、登録時と同じ消費税区分を推定する。"""
+    """仕入金額（税抜）と仕入税込金額から、登録時と同じ消費税区分を推定する。"""
     excl = _finite_int(line_excl_yen, 0)
     incl = _finite_int(line_incl_yen, 0)
     if excl <= 0:
@@ -1135,10 +1140,10 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     st.subheader("集計・ダッシュボード")
     st.caption(
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
-        "金額はシートの「商品金額（税抜）」「税込金額」列を行合計として集計します。"
-        "（単価列が空の旧行は、金額列を単価として数量倍します。"
-        "単価があるのに税抜行金額が空の行は、数量×単価で補います。"
-        "税抜が空で税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
+        f"金額はシートの「{COL_PRICE_EXCL}」「{COL_PRICE_INCL}」列を行合計として集計します。"
+        "（仕入単価列が空の旧行は、仕入金額列を単価相当として数量倍します。"
+        "仕入単価があるのに税抜の仕入金額が空の行は、数量×仕入単価で補います。"
+        "税抜の仕入金額が空で仕入税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
         "カンマ区切り・円記号付きの数値も読み取ります。）"
     )
     if df.empty:
@@ -1478,7 +1483,7 @@ def _render_inventory_price_summary(df: pd.DataFrame) -> None:
     st.markdown("##### 価格管理サマリー（在庫中）")
     st.caption(
         "上の表のうち、ステータスが「在庫中」の行だけを合算しています（未保存の編集を含みます）。"
-        "販売予定は単価×数量の税抜行計、税込列は商品行と同じ税率で算出した値の合計です。"
+        "販売予定は単価×数量の税抜行計、税込列は仕入行と同じ税率で算出した値の合計です。"
     )
     if df is None or df.empty:
         return
@@ -1509,7 +1514,7 @@ def _render_inventory_price_summary(df: pd.DataFrame) -> None:
 
 def render_inventory_manager() -> None:
     st.divider()
-    st.subheader("在庫一覧マネージャー")
+    st.subheader("在庫一覧")
     st.caption(
         "スプレッドシートの全データを編集できます。行の追加・削除は表から操作し、"
         "表の直下の「台帳を更新する」でシートを上書き保存します。"
@@ -1685,7 +1690,7 @@ def main():
                 result = _parse_json_from_model(raw_text or "")
                 _apply_gemini_json_to_session(result)
                 st.success(
-                    "解析が完了しました。必要に応じて商品名・仕入先・取引先・数量・単価を修正してください。"
+                    "解析が完了しました。必要に応じて商品名・仕入先・取引先・数量・仕入単価を修正してください。"
                 )
             except Exception as e:
                 st.warning(
@@ -1699,7 +1704,7 @@ def main():
         st.write(f"**推定種類:** {st.session_state.ai_kind or '—'}")
         st.write(f"**推定数量:** {int(st.session_state.field_qty)}")
         st.write(
-            f"**推定単価（税抜）:** ¥{int(st.session_state.field_unit_price_excl):,}"
+            f"**推定仕入単価（税抜）:** ¥{int(st.session_state.field_unit_price_excl):,}"
         )
         st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
 
@@ -1765,19 +1770,19 @@ def main():
     quantity = st.number_input("数量", min_value=1, step=1, key="field_qty")
 
     unit_price_excl = st.number_input(
-        "商品単価（税抜・必須）",
+        "仕入単価（税抜・必須）",
         min_value=1,
         step=1,
         key="field_unit_price_excl",
-        help="1点あたりの税抜単価（円）。商品金額は数量×単価で自動計算します。",
+        help="1点あたりの税抜単価（円）。仕入金額は数量×仕入単価で自動計算します。",
     )
 
     st.radio(
-        "消費税（税込金額の計算）",
+        "消費税（仕入税込金額の計算）",
         options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
         horizontal=True,
         key="field_consumption_tax_choice",
-        help="商品金額（税抜）の税込行計に使用します。非課税のときは税込＝税抜です。",
+        help="仕入金額（税抜）の税込行計に使用します。非課税のときは税込＝税抜です。",
     )
     _tax_r = _consumption_tax_rate_from_choice_label(
         str(st.session_state.get("field_consumption_tax_choice", "10%"))
@@ -1790,10 +1795,10 @@ def main():
 
     price_row = st.columns([1, 1, 1])
     with price_row[0]:
-        st.metric("商品金額（税抜・自動）", f"¥{_line_ex:,}")
-        st.caption(f"数量 {_q} × 単価 ¥{_u:,}")
+        st.metric("仕入金額（税抜・自動）", f"¥{_line_ex:,}")
+        st.caption(f"数量 {_q} × 仕入単価 ¥{_u:,}")
     with price_row[1]:
-        st.metric("税込金額（行・自動）", f"¥{_line_in:,}")
+        st.metric("仕入税込金額（行・自動）", f"¥{_line_in:,}")
         _tl = st.session_state.get("field_consumption_tax_choice", "10%")
         if _tl == "非課税":
             st.caption("非課税のため税込＝税抜行合計")
@@ -1801,7 +1806,7 @@ def main():
             st.caption(f"消費税{_tl}を行合計に四捨五入")
     with price_row[2]:
         st.caption(
-            "原価は上記の税抜行計です。販売予定・実売は **1点あたり税抜単価** を入力し、台帳には税抜行計と税込総額も自動で記録します。"
+            "原価は上記の仕入金額（税抜・行計）です。販売予定・実売は **1点あたり税抜単価** を入力し、台帳には税抜行計と税込総額も自動で記録します。"
         )
 
     st.markdown("##### 価格管理（任意）")
@@ -1873,7 +1878,7 @@ def main():
             "—" if _gp_preview is None else f"¥{int(_gp_preview):,}",
         )
 
-    st.subheader("任意入力")
+    st.subheader("補足情報（任意）")
     memo = st.text_area(
         "メモ（任意）",
         key="field_memo",
@@ -1895,7 +1900,7 @@ def main():
             st.error("仕入先・取引先を入力してください。")
             validation_ok = False
         elif int(unit_price_excl) < 1:
-            st.error("商品単価（税抜）を1円以上で入力してください。")
+            st.error("仕入単価（税抜）を1円以上で入力してください。")
             validation_ok = False
 
         if validation_ok:
