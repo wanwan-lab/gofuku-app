@@ -16,8 +16,8 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
   APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
-※ 画像の Gemini 解析は **google-generativeai** で、まず ``genai.GenerativeModel('gemini-1.5-flash-8b')`` を試し、
-  404 等でモデルが無い場合のみ ``gemini-1.5-pro`` に切り替えます（``models/``・api_version は指定しません）。
+※ 画像の Gemini 解析は **google-generativeai** で ``genai.GenerativeModel('gemini-3-flash-preview')`` を使用します
+  （``models/`` プレフィックス・api_version は指定しません）。
 ※ アップロード画像は Pillow で長辺最大1280px・JPEG品質80に変換したうえで解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
@@ -81,7 +81,6 @@ import pytz
 
 import altair as alt
 import pandas as pd
-import google.api_core.exceptions as google_api_exceptions
 import google.generativeai as genai
 import gspread
 import requests
@@ -103,10 +102,6 @@ COL_MEMO = "メモ"
 
 # 消費税の自動計算（標準税率）。軽減税率の品目は手入力・メモで補足してください。
 CONSUMPTION_TAX_RATE = 0.10
-
-# Gemini 画像解析（プレフィックスなし。404 時はフォールバック）
-_GEMINI_VISION_PRIMARY = "gemini-1.5-flash-8b"
-_GEMINI_VISION_FALLBACK = "gemini-1.5-pro"
 
 EXPECTED_HEADERS = [
     COL_DATETIME,
@@ -299,31 +294,12 @@ def price_incl_tax(price_excl_yen: int) -> int:
     return int(round(int(price_excl_yen) * (1 + CONSUMPTION_TAX_RATE)))
 
 
-def _gemini_model_unavailable(exc: BaseException) -> bool:
-    """404 / モデル廃止など、別モデルへの切り替えが妥当なエラーか。"""
-    if isinstance(exc, google_api_exceptions.NotFound):
-        return True
-    msg = str(exc).lower()
-    return any(
-        x in msg
-        for x in ("404", "not found", "no longer available", "not_found", "is not found")
-    )
-
-
 def analyze_image_with_gemini(image_data):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model = genai.GenerativeModel('gemini-3-flash-preview')
     prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
-    contents = [prompt, image_data]
-    models = (_GEMINI_VISION_PRIMARY, _GEMINI_VISION_FALLBACK)
-    for i, model_id in enumerate(models):
-        try:
-            model = genai.GenerativeModel(model_id)
-            response = model.generate_content(contents)
-            return response.text or ""
-        except Exception as e:
-            if i < len(models) - 1 and _gemini_model_unavailable(e):
-                continue
-            raise
+    response = model.generate_content([prompt, image_data])
+    return response.text or ""
 
 
 def ensure_worksheet_header():
