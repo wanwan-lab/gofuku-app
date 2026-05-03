@@ -1255,8 +1255,6 @@ def main():
         )
         st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
 
-    st.subheader("必須入力")
-
     df_ledger_hint: pd.DataFrame | None = None
     if _safe_secret("GOOGLE_SPREADSHEET_ID"):
         try:
@@ -1313,6 +1311,7 @@ def main():
     elif _safe_secret("GOOGLE_SPREADSHEET_ID"):
         st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
 
+    st.markdown("##### 必須入力項目")
     product_name = st.text_input("商品名（必須）", key="field_product_name")
     supplier = st.text_input("仕入先・取引先（必須）", key="field_supplier")
     quantity = st.number_input("数量", min_value=1, step=1, key="field_qty")
