@@ -28,12 +28,13 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額
-  | 販売予定価格 | 実売価格 | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL
+  | 販売予定単価（税抜） | 販売予定金額（税込） | 実売単価（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
   ※新規登録画面では税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
+  ※販売予定・実売は **1点あたり税抜単価** を保存し、税込総額列は「単価×数量」を税抜行合計にしたうえで商品行と同じ税率で四捨五入します。
   ※金額列（単価〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
-  ※粗利は「販売済」なら実売−原価、「在庫中」なら販売予定−原価で自動計算し、台帳保存時に再計算します（税抜ベース）。
+  ※粗利は税抜ベースで「販売済」なら（実売単価×数量）−原価、「在庫中」なら（販売予定単価×数量）−原価。台帳保存時に再計算します。
 """
 
 from __future__ import annotations
@@ -89,8 +90,10 @@ COL_QTY = "数量"
 COL_PRICE_UNIT = "商品単価（税抜）"
 COL_PRICE_EXCL = "商品金額（税抜）"
 COL_PRICE_INCL = "税込金額"
-COL_PLANNED_SALE = "販売予定価格"
-COL_ACTUAL_SALE = "実売価格"
+COL_PLANNED_SALE = "販売予定単価（税抜）"
+COL_PLANNED_SALE_INCL = "販売予定金額（税込）"
+COL_ACTUAL_SALE = "実売単価（税抜）"
+COL_ACTUAL_SALE_INCL = "実売金額（税込）"
 COL_GROSS_PROFIT = "粗利"
 COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
 COL_IMAGE_URL = "画像URL"
@@ -117,7 +120,9 @@ EXPECTED_HEADERS: list[str] = [
     COL_PRICE_EXCL,
     COL_PRICE_INCL,
     COL_PLANNED_SALE,
+    COL_PLANNED_SALE_INCL,
     COL_ACTUAL_SALE,
+    COL_ACTUAL_SALE_INCL,
     COL_GROSS_PROFIT,
     COL_STOCK_STATUS,
     COL_MEMO,
@@ -529,6 +534,38 @@ def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
     return int(round(int(price_excl_yen) * (1 + r)))
 
 
+def _infer_tax_rate_from_main_line(line_excl_yen: int, line_incl_yen: int) -> float:
+    """商品金額（税抜）と税込金額から、登録時と同じ消費税区分を推定する。"""
+    excl = int(line_excl_yen)
+    incl = int(line_incl_yen)
+    if excl <= 0:
+        return float(CONSUMPTION_TAX_RATE)
+    if incl <= excl:
+        return 0.0
+    for _label, rate in CONSUMPTION_TAX_CHOICE_TO_RATE.items():
+        if price_incl_tax(excl, float(rate)) == incl:
+            return float(rate)
+    return float(CONSUMPTION_TAX_RATE)
+
+
+def _planned_actual_line_amounts(
+    qty: int,
+    planned_unit_excl: int,
+    actual_unit_excl: int,
+    status: str,
+    tax_rate: float,
+) -> tuple[int, int, int, int]:
+    """販売予定・実売の税抜行計と税込行計（単価×数量を税抜合計にしてから税込）。"""
+    q = max(1, int(qty))
+    pu, au = int(planned_unit_excl), int(actual_unit_excl)
+    st = _normalize_stock_status(status)
+    plex = pu * q if pu > 0 else 0
+    pincl = price_incl_tax(plex, tax_rate) if plex > 0 else 0
+    aex = (au * q) if (st == STATUS_SOLD and au > 0) else 0
+    aincl = price_incl_tax(aex, tax_rate) if aex > 0 else 0
+    return plex, pincl, aex, aincl
+
+
 def analyze_image_with_gemini(image_data):
     api_key = _secret_str(SECRET_GEMINI_API_KEY)
     if not api_key:
@@ -675,43 +712,55 @@ def _normalize_stock_status(status: str) -> str:
 
 
 def _compute_gross_profit_row(
-    cogs_excl: int,
-    planned_excl: int,
-    actual_excl: int,
+    cogs_line_excl: int,
+    planned_line_excl: int,
+    actual_line_excl: int,
     status: str,
 ) -> int | str:
-    """税抜ベース。販売済は実売−原価、在庫中は販売予定−原価。"""
+    """税抜ベース（行計）。販売済は実売行計−原価、在庫中は販売予定行計−原価。"""
     st = _normalize_stock_status(status)
     if st == STATUS_SOLD:
-        if actual_excl > 0:
-            return int(actual_excl - cogs_excl)
+        if actual_line_excl > 0:
+            return int(actual_line_excl - cogs_line_excl)
         return ""
     if st == STATUS_IN_STOCK:
-        if planned_excl > 0:
-            return int(planned_excl - cogs_excl)
+        if planned_line_excl > 0:
+            return int(planned_line_excl - cogs_line_excl)
         return ""
     return ""
 
 
 def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """粗利列をステータス・原価・予定/実売から再計算する。"""
+    """販売予定/実売の税込総額列と粗利を再計算する。"""
     out = df.copy()
     need = (
         COL_GROSS_PROFIT,
         COL_STOCK_STATUS,
         COL_PRICE_EXCL,
+        COL_PRICE_INCL,
+        COL_QTY,
         COL_PLANNED_SALE,
         COL_ACTUAL_SALE,
+        COL_PLANNED_SALE_INCL,
+        COL_ACTUAL_SALE_INCL,
     )
     if not all(c in out.columns for c in need):
         return out
     for i in out.index:
         cogs = _int_from_cell(out.at[i, COL_PRICE_EXCL])
-        pl = _int_from_cell(out.at[i, COL_PLANNED_SALE])
-        ac = _int_from_cell(out.at[i, COL_ACTUAL_SALE])
+        line_in = _int_from_cell(out.at[i, COL_PRICE_INCL])
+        qty = max(1, _int_from_cell(out.at[i, COL_QTY]))
+        pl_u = _int_from_cell(out.at[i, COL_PLANNED_SALE])
+        ac_u = _int_from_cell(out.at[i, COL_ACTUAL_SALE])
         stt = _normalize_stock_status(str(out.at[i, COL_STOCK_STATUS]))
         out.at[i, COL_STOCK_STATUS] = stt
-        gp = _compute_gross_profit_row(cogs, pl, ac, stt)
+        tax_r = _infer_tax_rate_from_main_line(cogs, line_in)
+        plex, pincl, aex, aincl = _planned_actual_line_amounts(
+            qty, pl_u, ac_u, stt, tax_r
+        )
+        out.at[i, COL_PLANNED_SALE_INCL] = "" if pincl <= 0 else int(pincl)
+        out.at[i, COL_ACTUAL_SALE_INCL] = "" if aincl <= 0 else int(aincl)
+        gp = _compute_gross_profit_row(cogs, plex, aex, stt)
         out.at[i, COL_GROSS_PROFIT] = "" if gp == "" else int(gp)
     return out
 
@@ -728,9 +777,10 @@ def append_sheet_row(
     memo: str = "",
     record_datetime: str | None = None,
     *,
-    planned_sale_excl_yen: int = 0,
-    actual_sale_excl_yen: int = 0,
+    planned_sale_unit_excl_yen: int = 0,
+    actual_sale_unit_excl_yen: int = 0,
     stock_status: str = STATUS_IN_STOCK,
+    consumption_tax_rate: float | None = None,
 ):
     ws = ensure_worksheet_header()
     if ws is None:
@@ -738,17 +788,28 @@ def append_sheet_row(
         return
     now = (record_datetime or "").strip() or jst_now_str()
     cogs = int(line_price_excl_yen)
-    pl = int(planned_sale_excl_yen)
-    ac = int(actual_sale_excl_yen)
+    qty_i = max(1, int(quantity))
+    pl_u = int(planned_sale_unit_excl_yen)
+    ac_u = int(actual_sale_unit_excl_yen)
     stt = _normalize_stock_status(str(stock_status))
-    planned_cell = _optional_amount_cell(pl)
-    actual_cell = (
-        _optional_amount_cell(ac) if stt == STATUS_SOLD else ""
+    tax_r = (
+        float(consumption_tax_rate)
+        if consumption_tax_rate is not None
+        else _infer_tax_rate_from_main_line(
+            int(line_price_excl_yen), int(line_price_incl_yen)
+        )
     )
+    plex, pincl, aex, aincl = _planned_actual_line_amounts(
+        qty_i, pl_u, ac_u, stt, tax_r
+    )
+    planned_unit_cell = _optional_amount_cell(pl_u)
+    planned_incl_cell = _optional_amount_cell(pincl)
+    actual_unit_cell = _optional_amount_cell(ac_u) if stt == STATUS_SOLD else ""
+    actual_incl_cell = _optional_amount_cell(aincl) if stt == STATUS_SOLD else ""
     gp = _compute_gross_profit_row(
         cogs,
-        pl,
-        ac if stt == STATUS_SOLD else 0,
+        plex,
+        aex if stt == STATUS_SOLD else 0,
         stt,
     )
     gross_cell = "" if gp == "" else int(gp)
@@ -763,8 +824,10 @@ def append_sheet_row(
                 unit_price_excl_yen,
                 line_price_excl_yen,
                 line_price_incl_yen,
-                planned_cell,
-                actual_cell,
+                planned_unit_cell,
+                planned_incl_cell,
+                actual_unit_cell,
+                actual_incl_cell,
                 gross_cell,
                 stt,
                 memo,
@@ -1217,11 +1280,11 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
 
 
 def _render_inventory_price_summary(df: pd.DataFrame) -> None:
-    """在庫中の行について、合計原価・合計販売予定・想定粗利（税抜）を表示する。"""
+    """在庫中の行について、合計原価・販売予定（税抜行計・税込総額）・想定粗利を表示する。"""
     st.markdown("##### 価格管理サマリー（在庫中）")
     st.caption(
         "上の表のうち、ステータスが「在庫中」の行だけを合算しています（未保存の編集を含みます）。"
-        "想定粗利は、販売予定が入っている行について（販売予定−原価）を足した合計です。"
+        "販売予定は単価×数量の税抜行計、税込列は商品行と同じ税率で算出した値の合計です。"
     )
     if df is None or df.empty:
         return
@@ -1234,15 +1297,20 @@ def _render_inventory_price_summary(df: pd.DataFrame) -> None:
         st.info("「在庫中」の行がありません。")
         return
     cg = sub[COL_PRICE_EXCL].map(_int_from_cell)
-    pl = sub[COL_PLANNED_SALE].map(_int_from_cell)
+    pl_u = sub[COL_PLANNED_SALE].map(_int_from_cell)
+    qv = sub[COL_QTY].map(lambda x: max(1, _int_from_cell(x)))
+    pl_line_ex = pl_u * qv
+    pl_in = sub[COL_PLANNED_SALE_INCL].map(_int_from_cell)
     total_cogs = int(cg.sum())
-    total_planned = int(pl.sum())
-    m = pl > 0
-    total_margin = int((pl.loc[m] - cg.loc[m]).sum())
-    m1, m2, m3 = st.columns(3)
+    total_planned_excl = int(pl_line_ex.sum())
+    total_planned_incl = int(pl_in.sum())
+    m = pl_line_ex > 0
+    total_margin = int((pl_line_ex.loc[m] - cg.loc[m]).sum())
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("合計原価（税抜）", f"¥{total_cogs:,}")
-    m2.metric("合計販売予定価格（税抜）", f"¥{total_planned:,}")
-    m3.metric("想定粗利（税抜・合計）", f"¥{total_margin:,}")
+    m2.metric("合計販売予定（税抜・行計）", f"¥{total_planned_excl:,}")
+    m3.metric("合計販売予定（税込）", f"¥{total_planned_incl:,}")
+    m4.metric("想定粗利（税抜・合計）", f"¥{total_margin:,}")
 
 
 def render_inventory_manager() -> None:
@@ -1539,21 +1607,21 @@ def main():
             st.caption(f"消費税{_tl}を行合計に四捨五入")
     with price_row[2]:
         st.caption(
-            "原価は上記の税抜行計です。下の「販売予定価格」は税抜の任意入力で、粗利は台帳に自動記録されます。"
+            "原価は上記の税抜行計です。販売予定・実売は **1点あたり税抜単価** を入力し、台帳には税抜行計と税込総額も自動で記録します。"
         )
 
     st.markdown("##### 価格管理（任意）")
     st.caption(
-        "販売予定価格・実売価格・粗利は **税抜（円）** で台帳に保存します。"
-        "ステータスが「販売済」のときのみ実売価格が記録され、粗利は「実売−原価」です。"
-        "「在庫中」のときは粗利を「販売予定−原価」で計算します。"
+        "販売予定・実売は **1点あたりの税抜単価（円）** です。税込総額は「単価×数量」した税抜合計に、上の消費税と同じ税率を掛けて四捨五入します。"
+        "ステータスが「販売済」のときのみ実売単価・実売金額（税込）を記録し、粗利は税抜で「実売行計−原価」です。"
+        "「在庫中」のときは「販売予定行計−原価」で粗利を計算します。"
     )
     planned_sale_excl = st.number_input(
-        "販売予定価格（税抜・任意）",
+        "販売予定単価（税抜・任意）",
         min_value=0,
         step=1,
         key="field_planned_sale_excl",
-        help="この行の売却予定額（税抜）。0 のとき台帳では空欄。",
+        help="1点あたり。0 のとき台帳では空欄。税抜行計・税込総額は数量を掛じて自動計算します。",
     )
     st.selectbox(
         "ステータス（在庫中／販売済）",
@@ -1562,31 +1630,50 @@ def main():
     )
     _st = str(st.session_state.get("field_stock_status", STATUS_IN_STOCK)).strip()
     actual_sale_excl = st.number_input(
-        "実売価格（税抜・任意）",
+        "実売単価（税抜・任意）",
         min_value=0,
         step=1,
         key="field_actual_sale_excl",
         disabled=(_st != STATUS_SOLD),
-        help="ステータスが「販売済」のときのみ入力・記録されます。",
+        help="1点あたり。ステータスが「販売済」のときのみ入力・記録されます。",
     )
-    _pl_i = int(planned_sale_excl)
-    _act_i = int(actual_sale_excl)
+    _pl_u = int(planned_sale_excl)
+    _act_u = int(actual_sale_excl)
     _cogs_preview = _q * _u
+    _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
+        _q, _pl_u, _act_u, _st, _tax_r
+    )
     _gp_preview = _compute_gross_profit_row(
         _cogs_preview,
-        _pl_i,
-        _act_i if _st == STATUS_SOLD else 0,
+        _plex,
+        _aex if _st == STATUS_SOLD else 0,
         _st,
     )
-    pm1, pm2, pm3 = st.columns(3)
+    pm1, pm2, pm3, pm4, pm5 = st.columns(5)
     with pm1:
         st.metric("原価（税抜・行計）", f"¥{_cogs_preview:,}")
     with pm2:
         st.metric(
-            "販売予定（税抜）",
-            "—" if _pl_i <= 0 else f"¥{_pl_i:,}",
+            "販売予定（税抜・行計）",
+            "—" if _plex <= 0 else f"¥{_plex:,}",
         )
     with pm3:
+        st.metric(
+            "販売予定（税込・総額）",
+            "—" if _pin <= 0 else f"¥{_pin:,}",
+        )
+    with pm4:
+        st.metric(
+            "実売（税抜・行計）",
+            "—" if _aex <= 0 else f"¥{_aex:,}",
+        )
+    with pm5:
+        st.metric(
+            "実売（税込・総額）",
+            "—" if _ain <= 0 else f"¥{_ain:,}",
+        )
+    pm6, _, _ = st.columns([1, 1, 3])
+    with pm6:
         st.metric(
             "粗利（税抜・プレビュー）",
             "—" if _gp_preview == "" else f"¥{int(_gp_preview):,}",
@@ -1673,9 +1760,10 @@ def main():
                             url,
                             memo_s,
                             record_datetime=_record_dt,
-                            planned_sale_excl_yen=_plan2,
-                            actual_sale_excl_yen=_act_ex2,
+                            planned_sale_unit_excl_yen=_plan2,
+                            actual_sale_unit_excl_yen=_act_ex2,
                             stock_status=_stat2,
+                            consumption_tax_rate=_tax_r2,
                         )
                     except Exception as e:
                         st.error(f"スプレッドシート更新に失敗しました: {e}")
