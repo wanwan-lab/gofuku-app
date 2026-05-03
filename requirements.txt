@@ -1,0 +1,11 @@
+# 呉服在庫アプリのランタイム依存
+# Gemini: `from google import genai` のため google-genai を使用（google-generativeai パッケージは未使用）
+
+streamlit>=1.34.0
+pandas>=2.0.0
+google-genai>=1.0.0
+gspread>=6.0.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+Pillow>=10.0.0
+requests>=2.31.0
