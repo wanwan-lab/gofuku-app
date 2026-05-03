@@ -28,11 +28,12 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額
-  | 希望小売価格（税抜） | 希望小売価格（税込） | 実売価格（税抜） | 実売価格（税込） | メモ（任意） | 画像URL
+  | 販売予定価格 | 実売価格 | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
   ※新規登録画面では税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
-  ※シートの金額列（商品単価・商品金額税抜・税込金額）は、書き込み時に表示形式 **#,##0** を適用します。
+  ※金額列（単価〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
+  ※粗利は「販売済」なら実売−原価、「在庫中」なら販売予定−原価で自動計算し、台帳保存時に再計算します（税抜ベース）。
 """
 
 from __future__ import annotations
@@ -88,12 +89,16 @@ COL_QTY = "数量"
 COL_PRICE_UNIT = "商品単価（税抜）"
 COL_PRICE_EXCL = "商品金額（税抜）"
 COL_PRICE_INCL = "税込金額"
-COL_MSRP_EXCL = "希望小売価格（税抜）"
-COL_MSRP_INCL = "希望小売価格（税込）"
-COL_ACTUAL_EXCL = "実売価格（税抜）"
-COL_ACTUAL_INCL = "実売価格（税込）"
+COL_PLANNED_SALE = "販売予定価格"
+COL_ACTUAL_SALE = "実売価格"
+COL_GROSS_PROFIT = "粗利"
+COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
 COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
+
+STATUS_IN_STOCK = "在庫中"
+STATUS_SOLD = "販売済"
+STOCK_STATUS_OPTIONS: tuple[str, ...] = (STATUS_IN_STOCK, STATUS_SOLD)
 
 CONSUMPTION_TAX_RATE = 0.10
 CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
@@ -111,10 +116,10 @@ EXPECTED_HEADERS: list[str] = [
     COL_PRICE_UNIT,
     COL_PRICE_EXCL,
     COL_PRICE_INCL,
-    COL_MSRP_EXCL,
-    COL_MSRP_INCL,
-    COL_ACTUAL_EXCL,
-    COL_ACTUAL_INCL,
+    COL_PLANNED_SALE,
+    COL_ACTUAL_SALE,
+    COL_GROSS_PROFIT,
+    COL_STOCK_STATUS,
     COL_MEMO,
     COL_IMAGE_URL,
 ]
@@ -162,9 +167,9 @@ def check_password() -> bool:
 
 
 def _apply_inventory_amount_number_formats(ws) -> None:
-    """金額系の列（単価〜実売税込まで）に、2行目以降で #,##0 を適用する。"""
+    """金額系の列（単価〜粗利まで）に、2行目以降で #,##0 を適用する。"""
     idx_start = EXPECTED_HEADERS.index(COL_PRICE_UNIT)
-    idx_end = EXPECTED_HEADERS.index(COL_ACTUAL_INCL)
+    idx_end = EXPECTED_HEADERS.index(COL_GROSS_PROFIT)
     end_row = max(int(ws.row_count), 2)
     ws.spreadsheet.batch_update(
         {
@@ -645,13 +650,70 @@ def upload_image_to_drive(filename: str, mime: str, data: bytes) -> str:
     return str(url)
 
 
-def _optional_price_cells(
-    excl_yen: int, incl_yen: int
-) -> tuple[int | str, int | str]:
-    """任意価格: 税抜が 0 以下ならシートには空文字を書く。"""
-    if excl_yen <= 0:
-        return "", ""
-    return int(excl_yen), int(incl_yen)
+def _optional_amount_cell(yen: int) -> int | str:
+    """0 以下はシート上では空欄。"""
+    if yen <= 0:
+        return ""
+    return int(yen)
+
+
+def _int_from_cell(v: Any) -> int:
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return 0
+        s = str(v).strip().replace(",", "")
+        if not s or s.lower() in ("nan", "none"):
+            return 0
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def _normalize_stock_status(status: str) -> str:
+    s = (status or "").strip()
+    return s if s in STOCK_STATUS_OPTIONS else STATUS_IN_STOCK
+
+
+def _compute_gross_profit_row(
+    cogs_excl: int,
+    planned_excl: int,
+    actual_excl: int,
+    status: str,
+) -> int | str:
+    """税抜ベース。販売済は実売−原価、在庫中は販売予定−原価。"""
+    st = _normalize_stock_status(status)
+    if st == STATUS_SOLD:
+        if actual_excl > 0:
+            return int(actual_excl - cogs_excl)
+        return ""
+    if st == STATUS_IN_STOCK:
+        if planned_excl > 0:
+            return int(planned_excl - cogs_excl)
+        return ""
+    return ""
+
+
+def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """粗利列をステータス・原価・予定/実売から再計算する。"""
+    out = df.copy()
+    need = (
+        COL_GROSS_PROFIT,
+        COL_STOCK_STATUS,
+        COL_PRICE_EXCL,
+        COL_PLANNED_SALE,
+        COL_ACTUAL_SALE,
+    )
+    if not all(c in out.columns for c in need):
+        return out
+    for i in out.index:
+        cogs = _int_from_cell(out.at[i, COL_PRICE_EXCL])
+        pl = _int_from_cell(out.at[i, COL_PLANNED_SALE])
+        ac = _int_from_cell(out.at[i, COL_ACTUAL_SALE])
+        stt = _normalize_stock_status(str(out.at[i, COL_STOCK_STATUS]))
+        out.at[i, COL_STOCK_STATUS] = stt
+        gp = _compute_gross_profit_row(cogs, pl, ac, stt)
+        out.at[i, COL_GROSS_PROFIT] = "" if gp == "" else int(gp)
+    return out
 
 
 def append_sheet_row(
@@ -666,20 +728,30 @@ def append_sheet_row(
     memo: str = "",
     record_datetime: str | None = None,
     *,
-    msrp_excl_yen: int = 0,
-    msrp_incl_yen: int = 0,
+    planned_sale_excl_yen: int = 0,
     actual_sale_excl_yen: int = 0,
-    actual_sale_incl_yen: int = 0,
+    stock_status: str = STATUS_IN_STOCK,
 ):
     ws = ensure_worksheet_header()
     if ws is None:
         st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
         return
     now = (record_datetime or "").strip() or jst_now_str()
-    c_msrp_ex, c_msrp_in = _optional_price_cells(msrp_excl_yen, msrp_incl_yen)
-    c_act_ex, c_act_in = _optional_price_cells(
-        actual_sale_excl_yen, actual_sale_incl_yen
+    cogs = int(line_price_excl_yen)
+    pl = int(planned_sale_excl_yen)
+    ac = int(actual_sale_excl_yen)
+    stt = _normalize_stock_status(str(stock_status))
+    planned_cell = _optional_amount_cell(pl)
+    actual_cell = (
+        _optional_amount_cell(ac) if stt == STATUS_SOLD else ""
     )
+    gp = _compute_gross_profit_row(
+        cogs,
+        pl,
+        ac if stt == STATUS_SOLD else 0,
+        stt,
+    )
+    gross_cell = "" if gp == "" else int(gp)
     try:
         ws.append_row(
             [
@@ -691,10 +763,10 @@ def append_sheet_row(
                 unit_price_excl_yen,
                 line_price_excl_yen,
                 line_price_incl_yen,
-                c_msrp_ex,
-                c_msrp_in,
-                c_act_ex,
-                c_act_in,
+                planned_cell,
+                actual_cell,
+                gross_cell,
+                stt,
                 memo,
                 image_url,
             ],
@@ -771,7 +843,7 @@ def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
         raise RuntimeError(
             f"スプレッドシートに接続できません。{SECRET_GOOGLE_SPREADSHEET_ID} とサービスアカウントを確認してください。"
         )
-    out = df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
+    out = _recalc_gross_profit_dataframe(df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy())
     values: list[list[Any]] = [EXPECTED_HEADERS]
     if not out.empty:
         for row in out[EXPECTED_HEADERS].to_numpy(dtype=object):
@@ -1144,6 +1216,35 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         st.altair_chart(sup_chart, use_container_width=True)
 
 
+def _render_inventory_price_summary(df: pd.DataFrame) -> None:
+    """在庫中の行について、合計原価・合計販売予定・想定粗利（税抜）を表示する。"""
+    st.markdown("##### 価格管理サマリー（在庫中）")
+    st.caption(
+        "上の表のうち、ステータスが「在庫中」の行だけを合算しています（未保存の編集を含みます）。"
+        "想定粗利は、販売予定が入っている行について（販売予定−原価）を足した合計です。"
+    )
+    if df is None or df.empty:
+        return
+    if COL_STOCK_STATUS not in df.columns:
+        return
+    calc = _recalc_gross_profit_dataframe(df.copy())
+    mask = calc[COL_STOCK_STATUS].astype(str).str.strip() == STATUS_IN_STOCK
+    sub = calc.loc[mask]
+    if sub.empty:
+        st.info("「在庫中」の行がありません。")
+        return
+    cg = sub[COL_PRICE_EXCL].map(_int_from_cell)
+    pl = sub[COL_PLANNED_SALE].map(_int_from_cell)
+    total_cogs = int(cg.sum())
+    total_planned = int(pl.sum())
+    m = pl > 0
+    total_margin = int((pl.loc[m] - cg.loc[m]).sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("合計原価（税抜）", f"¥{total_cogs:,}")
+    m2.metric("合計販売予定価格（税抜）", f"¥{total_planned:,}")
+    m3.metric("想定粗利（税抜・合計）", f"¥{total_margin:,}")
+
+
 def render_inventory_manager() -> None:
     st.divider()
     st.subheader("在庫一覧マネージャー")
@@ -1197,13 +1298,25 @@ def render_inventory_manager() -> None:
         sec_ord == "昇順",
     )
 
-    edited = st.data_editor(
-        df_sorted,
-        num_rows="dynamic",
-        key=LEDGER_DATA_EDITOR_KEY,
-        use_container_width=True,
-        hide_index=True,
-    )
+    _ledger_col_cfg: dict[str, Any] = {}
+    if COL_STOCK_STATUS in df_sorted.columns:
+        _ledger_col_cfg[COL_STOCK_STATUS] = st.column_config.SelectboxColumn(
+            COL_STOCK_STATUS,
+            options=list(STOCK_STATUS_OPTIONS),
+            help="在庫中＝未販売想定、販売済＝実売価格で粗利を計算します。",
+        )
+
+    _editor_kw: dict[str, Any] = {
+        "num_rows": "dynamic",
+        "key": LEDGER_DATA_EDITOR_KEY,
+        "use_container_width": True,
+        "hide_index": True,
+    }
+    if _ledger_col_cfg:
+        _editor_kw["column_config"] = _ledger_col_cfg
+    edited = st.data_editor(df_sorted, **_editor_kw)
+
+    _render_inventory_price_summary(edited)
 
     if st.button("台帳を更新する", type="primary", key="ledger_save_overwrite"):
         with st.spinner("スプレッドシートに書き込んでいます…"):
@@ -1239,10 +1352,12 @@ def _init_registration_form_session_state() -> None:
         st.session_state.field_unit_price_excl = 1
     if "field_consumption_tax_choice" not in st.session_state:
         st.session_state.field_consumption_tax_choice = "10%"
-    if "field_msrp_excl" not in st.session_state:
-        st.session_state.field_msrp_excl = 0
+    if "field_planned_sale_excl" not in st.session_state:
+        st.session_state.field_planned_sale_excl = 0
     if "field_actual_sale_excl" not in st.session_state:
         st.session_state.field_actual_sale_excl = 0
+    if "field_stock_status" not in st.session_state:
+        st.session_state.field_stock_status = STATUS_IN_STOCK
     if "hint_filter_product_name" not in st.session_state:
         st.session_state.hint_filter_product_name = ""
     if "hint_filter_supplier" not in st.session_state:
@@ -1291,8 +1406,9 @@ def main():
             st.session_state.ai_parse_ran = False
             st.session_state.field_memo = ""
             st.session_state.field_unit_price_excl = 1
-            st.session_state.field_msrp_excl = 0
+            st.session_state.field_planned_sale_excl = 0
             st.session_state.field_actual_sale_excl = 0
+            st.session_state.field_stock_status = STATUS_IN_STOCK
             st.session_state.hint_filter_product_name = ""
             st.session_state.hint_filter_supplier = ""
             st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
@@ -1399,7 +1515,7 @@ def main():
         options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
         horizontal=True,
         key="field_consumption_tax_choice",
-        help="商品の税込行計に加え、下の希望小売・実売の税込も同じ税率で四捨五入します。非課税のときは税込＝税抜です。",
+        help="商品金額（税抜）の税込行計に使用します。非課税のときは税込＝税抜です。",
     )
     _tax_r = _consumption_tax_rate_from_choice_label(
         str(st.session_state.get("field_consumption_tax_choice", "10%"))
@@ -1423,55 +1539,57 @@ def main():
             st.caption(f"消費税{_tl}を行合計に四捨五入")
     with price_row[2]:
         st.caption(
-            "スプレッドシートには単価・税抜行計・税込行計に加え、任意で希望小売・実売の税抜・税込も記録できます。"
+            "原価は上記の税抜行計です。下の「販売予定価格」は税抜の任意入力で、粗利は台帳に自動記録されます。"
         )
 
-    st.markdown("##### 任意：希望小売・実売価格（税抜）")
+    st.markdown("##### 価格管理（任意）")
     st.caption(
-        "上の「消費税」と同じ税率で税込を自動計算します。"
-        "0円のままにした項目は台帳では空欄として保存されます。"
+        "販売予定価格・実売価格・粗利は **税抜（円）** で台帳に保存します。"
+        "ステータスが「販売済」のときのみ実売価格が記録され、粗利は「実売−原価」です。"
+        "「在庫中」のときは粗利を「販売予定−原価」で計算します。"
     )
-    orow_a, orow_b = st.columns(2)
-    with orow_a:
-        msrp_excl = st.number_input(
-            "希望小売価格／販売予定価格（税抜・任意）",
-            min_value=0,
-            step=1,
-            key="field_msrp_excl",
-            help="0 のときは記録しません。",
-        )
-    with orow_b:
-        actual_sale_excl = st.number_input(
-            "実売価格（税抜・任意）",
-            min_value=0,
-            step=1,
-            key="field_actual_sale_excl",
-            help="売れたときの税抜価格。0 のときは記録しません。",
-        )
-    _msrp_ex_i = int(msrp_excl)
-    _act_ex_i = int(actual_sale_excl)
-    _msrp_in_i = price_incl_tax(_msrp_ex_i, _tax_r) if _msrp_ex_i > 0 else 0
-    _act_in_i = price_incl_tax(_act_ex_i, _tax_r) if _act_ex_i > 0 else 0
-    om1, om2, oa1, oa2 = st.columns(4)
-    with om1:
+    planned_sale_excl = st.number_input(
+        "販売予定価格（税抜・任意）",
+        min_value=0,
+        step=1,
+        key="field_planned_sale_excl",
+        help="この行の売却予定額（税抜）。0 のとき台帳では空欄。",
+    )
+    st.selectbox(
+        "ステータス（在庫中／販売済）",
+        options=list(STOCK_STATUS_OPTIONS),
+        key="field_stock_status",
+    )
+    _st = str(st.session_state.get("field_stock_status", STATUS_IN_STOCK)).strip()
+    actual_sale_excl = st.number_input(
+        "実売価格（税抜・任意）",
+        min_value=0,
+        step=1,
+        key="field_actual_sale_excl",
+        disabled=(_st != STATUS_SOLD),
+        help="ステータスが「販売済」のときのみ入力・記録されます。",
+    )
+    _pl_i = int(planned_sale_excl)
+    _act_i = int(actual_sale_excl)
+    _cogs_preview = _q * _u
+    _gp_preview = _compute_gross_profit_row(
+        _cogs_preview,
+        _pl_i,
+        _act_i if _st == STATUS_SOLD else 0,
+        _st,
+    )
+    pm1, pm2, pm3 = st.columns(3)
+    with pm1:
+        st.metric("原価（税抜・行計）", f"¥{_cogs_preview:,}")
+    with pm2:
         st.metric(
-            "希望小売（税抜）",
-            "—" if _msrp_ex_i <= 0 else f"¥{_msrp_ex_i:,}",
+            "販売予定（税抜）",
+            "—" if _pl_i <= 0 else f"¥{_pl_i:,}",
         )
-    with om2:
+    with pm3:
         st.metric(
-            "希望小売（税込・自動）",
-            "—" if _msrp_ex_i <= 0 else f"¥{_msrp_in_i:,}",
-        )
-    with oa1:
-        st.metric(
-            "実売（税抜）",
-            "—" if _act_ex_i <= 0 else f"¥{_act_ex_i:,}",
-        )
-    with oa2:
-        st.metric(
-            "実売（税込・自動）",
-            "—" if _act_ex_i <= 0 else f"¥{_act_in_i:,}",
+            "粗利（税抜・プレビュー）",
+            "—" if _gp_preview == "" else f"¥{int(_gp_preview):,}",
         )
 
     st.subheader("任意入力")
@@ -1507,14 +1625,13 @@ def main():
                 str(st.session_state.get("field_consumption_tax_choice", "10%"))
             )
             _lin = price_incl_tax(_lex, _tax_r2)
-            _msrp_ex2 = int(st.session_state.get("field_msrp_excl", 0))
+            _plan2 = int(st.session_state.get("field_planned_sale_excl", 0))
             _act_ex2 = int(st.session_state.get("field_actual_sale_excl", 0))
-            _msrp_in2 = (
-                price_incl_tax(_msrp_ex2, _tax_r2) if _msrp_ex2 > 0 else 0
-            )
-            _act_in2 = (
-                price_incl_tax(_act_ex2, _tax_r2) if _act_ex2 > 0 else 0
-            )
+            _stat2 = str(
+                st.session_state.get("field_stock_status", STATUS_IN_STOCK)
+            ).strip()
+            if _stat2 not in STOCK_STATUS_OPTIONS:
+                _stat2 = STATUS_IN_STOCK
             memo_s = (memo or "").strip()
 
             url = ""
@@ -1556,10 +1673,9 @@ def main():
                             url,
                             memo_s,
                             record_datetime=_record_dt,
-                            msrp_excl_yen=_msrp_ex2,
-                            msrp_incl_yen=_msrp_in2,
+                            planned_sale_excl_yen=_plan2,
                             actual_sale_excl_yen=_act_ex2,
-                            actual_sale_incl_yen=_act_in2,
+                            stock_status=_stat2,
                         )
                     except Exception as e:
                         st.error(f"スプレッドシート更新に失敗しました: {e}")
