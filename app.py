@@ -743,9 +743,15 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     movement = d[COL_TYPE].astype(str).str.strip()
     is_in = movement.str.startswith("入庫")
     is_out = movement.str.startswith("出庫")
-    # 単価列あり: 行の金額列を優先（台帳で修正した値を尊重）。単価列なし: 旧形式（金額列=単価）として数量倍
-    line_ex = line_stored_ex.where(unit_ex > 0, qty * line_stored_ex)
-    line_in = line_stored_in.where(unit_ex > 0, qty * line_stored_in)
+    # 単価列なし: 旧形式（金額列を単価相当として数量倍）。
+    # 単価列あり: 税抜・税込の行金額列を優先。未入力・0 のときは数量×単価で補完（グラフと合計の欠損を防ぐ）。
+    line_ex = line_stored_ex.mask(unit_ex <= 0, qty * line_stored_ex)
+    line_needs_derive_ex = (unit_ex > 0) & (line_stored_ex.fillna(0) <= 0)
+    line_ex = line_ex.mask(line_needs_derive_ex, qty * unit_ex)
+    line_in = line_stored_in.mask(unit_ex <= 0, qty * line_stored_in)
+    line_needs_derive_in = (unit_ex > 0) & (line_stored_in.fillna(0) <= 0)
+    _ex_int = line_ex.fillna(0).round().clip(lower=0).astype(int)
+    line_in = line_in.mask(line_needs_derive_in, _ex_int.map(price_incl_tax).astype(float))
     d["_qty_in"] = qty.where(is_in, 0.0)
     d["_qty_out"] = qty.where(is_out, 0.0)
     d["_amt_ex_in"] = line_ex.where(is_in, 0.0)
@@ -764,7 +770,8 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     st.caption(
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
         "金額はシートの「商品金額（税抜）」「税込金額」列を行合計として集計します。"
-        "（単価列が空の旧行は、金額列を単価として数量倍します。）"
+        "（単価列が空の旧行は、金額列を単価として数量倍します。"
+        "単価があるのに税抜行金額が空の行は、数量×単価で補います。税込が空のときは税抜から標準10%で概算します。）"
     )
     if df.empty:
         st.info("集計する行がありません。")
