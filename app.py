@@ -303,6 +303,24 @@ def _coerce_positive_int(val: Any, default: int = 1) -> int:
         return default
 
 
+def _coerce_unit_price_yen(val: Any) -> int | None:
+    """税抜単価（円）を整数にする。不明・null・空なら None（既存入力を上書きしない）。"""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("null", "none", "-", "不明"):
+        return None
+    s = re.sub(r"[,\s円￥¥]", "", s, flags=re.UNICODE)
+    s = re.sub(r"(?i)yen", "", s)
+    if not s or not re.search(r"\d", s):
+        return None
+    try:
+        n = int(round(float(s)))
+        return max(1, n)
+    except Exception:
+        return None
+
+
 def _apply_gemini_json_to_session(result: dict[str, Any]) -> None:
     """Gemini の JSON をフォーム用 session_state に反映する（英日キー両対応）。"""
     r = result
@@ -326,17 +344,32 @@ def _apply_gemini_json_to_session(result: dict[str, Any]) -> None:
         or ""
     ).strip()
     m = r.get("match")
-    if isinstance(m, dict):
-        conf = float(m.get("confidence") or 0)
-        if conf >= 0.75:
-            if not pn:
-                pn = str(m.get("product_name") or "").strip()
-            if not su:
-                su = str(m.get("supplier") or "").strip()
+    match_conf_ok = isinstance(m, dict) and float(m.get("confidence") or 0) >= 0.75
+    if match_conf_ok:
+        if not pn:
+            pn = str(m.get("product_name") or "").strip()
+        if not su:
+            su = str(m.get("supplier") or "").strip()
     if pn:
         st.session_state.field_product_name = pn
     if su:
         st.session_state.field_supplier = su
+
+    unit_yen = _coerce_unit_price_yen(
+        r.get("unit_price_excl")
+        or r.get("unit_price")
+        or r.get("product_unit_price_excl")
+        or r.get("商品単価")
+        or r.get("商品単価（税抜）")
+        or r.get("単価")
+        or r.get("単価（税抜）")
+    )
+    if unit_yen is None and match_conf_ok:
+        unit_yen = _coerce_unit_price_yen(
+            m.get("unit_price_excl") or m.get("unit_price") or m.get("商品単価")
+        )
+    if unit_yen is not None:
+        st.session_state.field_unit_price_excl = unit_yen
 
     kind = str(
         r.get("product_kind")
@@ -398,9 +431,10 @@ def analyze_image_with_gemini(image_data):
 - "pattern" (string): 柄の推定。不明なら ""
 - "material" (string): 素材の推定。不明なら ""
 - "condition" (string): 状態の推定。不明なら ""
+- "unit_price_excl" (integer or null): 1点あたりの税抜単価（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
 
 任意: 既存在庫と照合する場合のみ "match" を付けてもよい
-{"product_name": "...", "supplier": "...", "confidence": 0.0〜1.0} の形。不要なら省略。"""
+{"product_name": "...", "supplier": "...", "unit_price_excl": 整数またはnull, "confidence": 0.0〜1.0} の形。不要なら省略。"""
     response = model.generate_content([prompt, image_data])
     return response.text or ""
 
@@ -1085,7 +1119,9 @@ def main():
                 raw_text = analyze_image_with_gemini(img)
                 result = _parse_json_from_model(raw_text or "")
                 _apply_gemini_json_to_session(result)
-                st.success("解析が完了しました。必要に応じて商品名・仕入先・取引先を修正してください。")
+                st.success(
+                    "解析が完了しました。必要に応じて商品名・仕入先・取引先・数量・単価を修正してください。"
+                )
             except Exception as e:
                 st.warning(
                     "現在混み合っているか、無料枠の上限に達している可能性があります。"
@@ -1097,6 +1133,9 @@ def main():
         st.subheader("AI解析結果（参考）")
         st.write(f"**推定種類:** {st.session_state.ai_kind or '—'}")
         st.write(f"**推定数量:** {int(st.session_state.field_qty)}")
+        st.write(
+            f"**推定単価（税抜）:** ¥{int(st.session_state.field_unit_price_excl):,}"
+        )
         st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
 
     st.subheader("必須入力")
