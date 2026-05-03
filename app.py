@@ -14,11 +14,11 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 任意:
   GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
-  GEMINI_MODEL_NAME        … 画像解析に使うモデル ID（既定: gemini-1.5-flash）
+  GEMINI_MODEL_NAME        … 画像解析のモデル名（既定: gemini-1.5-flash）
   APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
-※ 画像の Gemini 解析はパッケージ `google-genai`（`from google import genai`）のみを使用します。`google-generativeai` は使いません。
-  モデル ID は既定で **gemini-1.5-flash**（任意キー GEMINI_MODEL_NAME で上書き可。先頭の ``models/`` は自動で除きます）。
+※ 画像の Gemini 解析はパッケージ **google-generativeai**（``import google.generativeai as genai``）の ``GenerativeModel`` を使用します。
+  モデル名は既定 **gemini-1.5-flash**（任意キー GEMINI_MODEL_NAME。先頭の ``models/`` は自動で除きます）。
 
 画面下部の「在庫一覧マネージャー」で、同一スプレッドシートを表形式で読み書きし、
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
@@ -79,7 +79,7 @@ from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
-from google import genai
+import google.generativeai as genai
 import gspread
 import requests
 from google.oauth2 import service_account
@@ -290,8 +290,8 @@ def price_incl_tax(price_excl_yen: int) -> int:
     return int(round(int(price_excl_yen) * (1 + CONSUMPTION_TAX_RATE)))
 
 
-def _gemini_model_id() -> str:
-    """Gemini のモデル ID（SDK 既定の API バージョン向け。先頭の models/ は除く）。"""
+def _gemini_model_name() -> str:
+    """``GenerativeModel`` に渡すモデル名（``models/`` プレフィックスなし）。"""
     raw = (_safe_secret("GEMINI_MODEL_NAME") or "gemini-1.5-flash").strip()
     if raw.startswith("models/"):
         raw = raw[len("models/"):].strip()
@@ -299,16 +299,13 @@ def _gemini_model_id() -> str:
 
 
 def analyze_image_with_gemini(image_data):
-    api_key = st.secrets["GEMINI_API_KEY"]
-    client = genai.Client(api_key=api_key)
-
-    prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
-
-    response = client.models.generate_content(
-        model=_gemini_model_id(),
-        contents=[prompt, image_data],
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model = genai.GenerativeModel(_gemini_model_name())
+    prompt = (
+        "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
     )
-    return response.text
+    response = model.generate_content([prompt, image_data])
+    return response.text or ""
 
 
 def ensure_worksheet_header():
