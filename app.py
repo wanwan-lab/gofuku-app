@@ -1285,30 +1285,71 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
 
     st.markdown("##### 仕入先・取引先別サマリー（税抜金額・数量・粗利）")
     sup_col = "仕入先・取引先"
-    g = flt.assign(**{sup_col: flt[COL_SUPPLIER].fillna("(未設定)").astype(str)})
-    _agg_sup: dict[str, tuple[str, str]] = {
-        "入庫数量": ("_qty_in", "sum"),
-        "出庫数量": ("_qty_out", "sum"),
-        "入庫金額税抜": ("_amt_ex_in", "sum"),
-        "出庫金額税抜": ("_amt_ex_out", "sum"),
-    }
-    if COL_GROSS_PROFIT in g.columns:
-        _agg_sup["粗利合計"] = (COL_GROSS_PROFIT, "sum")
-    grp = g.groupby(sup_col, dropna=False).agg(**_agg_sup).reset_index()
-    for _gc in ("入庫数量", "出庫数量", "入庫金額税抜", "出庫金額税抜", "粗利合計"):
-        if _gc in grp.columns:
-            grp[_gc] = (
-                pd.to_numeric(grp[_gc], errors="coerce")
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(0.0)
-            )
-    grp["差し引き数量"] = (grp["入庫数量"] - grp["出庫数量"]).astype(int)
-    grp["差し引き税抜"] = (grp["入庫金額税抜"] - grp["出庫金額税抜"]).round(0).astype(int)
-    st.dataframe(
-        grp.sort_values(sup_col),
-        use_container_width=True,
-        hide_index=True,
-    )
+
+    def _supplier_grp(part: pd.DataFrame) -> pd.DataFrame:
+        if part.empty:
+            cols = [
+                sup_col,
+                "入庫数量",
+                "出庫数量",
+                "入庫金額税抜",
+                "出庫金額税抜",
+            ]
+            if COL_GROSS_PROFIT in flt.columns:
+                cols.append("粗利合計")
+            cols.extend(["差し引き数量", "差し引き税抜"])
+            return pd.DataFrame(columns=cols)
+        g = part.assign(**{sup_col: part[COL_SUPPLIER].fillna("(未設定)").astype(str)})
+        _agg_sup: dict[str, tuple[str, str]] = {
+            "入庫数量": ("_qty_in", "sum"),
+            "出庫数量": ("_qty_out", "sum"),
+            "入庫金額税抜": ("_amt_ex_in", "sum"),
+            "出庫金額税抜": ("_amt_ex_out", "sum"),
+        }
+        if COL_GROSS_PROFIT in g.columns:
+            _agg_sup["粗利合計"] = (COL_GROSS_PROFIT, "sum")
+        out = g.groupby(sup_col, dropna=False).agg(**_agg_sup).reset_index()
+        for _gc in ("入庫数量", "出庫数量", "入庫金額税抜", "出庫金額税抜", "粗利合計"):
+            if _gc in out.columns:
+                out[_gc] = (
+                    pd.to_numeric(out[_gc], errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .fillna(0.0)
+                )
+        out["差し引き数量"] = (out["入庫数量"] - out["出庫数量"]).astype(int)
+        out["差し引き税抜"] = (out["入庫金額税抜"] - out["出庫金額税抜"]).round(0).astype(int)
+        return out
+
+    grp = _supplier_grp(flt)
+    if COL_STOCK_STATUS not in flt.columns:
+        st.caption(
+            f"「{COL_STOCK_STATUS}」列がないため、在庫中／販売済に分けず期間内の全体を表示します。"
+        )
+        st.dataframe(
+            grp.sort_values(sup_col),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption(
+            f"「{COL_STOCK_STATUS}」に従い、在庫中と販売済の行をそれぞれ集計した表です。"
+            "下の「仕入先・取引先別 税抜金額」「粗利」グラフは従来どおり期間内の全体です。"
+        )
+        sn = flt[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
+        flt_in = flt.loc[sn == STATUS_IN_STOCK]
+        flt_so = flt.loc[sn == STATUS_SOLD]
+        st.markdown("###### 在庫中")
+        st.dataframe(
+            _supplier_grp(flt_in).sort_values(sup_col),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.markdown("###### 販売済")
+        st.dataframe(
+            _supplier_grp(flt_so).sort_values(sup_col),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.markdown("##### 月次推移（数量）")
     st.caption("各月で入庫・出庫を並べた棒グラフ（積み上げではありません）。")
