@@ -17,6 +17,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
 ※ 画像の Gemini 解析はパッケージ `google-genai`（`from google import genai`）のみを使用します。`google-generativeai` は使いません。
+  呼び出しは Gemini Developer API の **v1** とリソース名 **models/gemini-1.5-flash** を用います。
 
 画面下部の「在庫一覧マネージャー」で、同一スプレッドシートを表形式で読み書きし、
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
@@ -78,6 +79,7 @@ from zoneinfo import ZoneInfo
 import altair as alt
 import pandas as pd
 from google import genai
+from google.genai import types as genai_types
 import gspread
 import requests
 from google.oauth2 import service_account
@@ -290,12 +292,16 @@ def price_incl_tax(price_excl_yen: int) -> int:
 
 def analyze_image_with_gemini(image_data):
     api_key = st.secrets["GEMINI_API_KEY"]
-    client = genai.Client(api_key=api_key)
+    # 既定の v1beta ではなく安定版 v1（generativelanguage.googleapis.com/v1/...）
+    client = genai.Client(
+        api_key=api_key,
+        http_options=genai_types.HttpOptions(api_version="v1"),
+    )
 
     prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
 
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="models/gemini-1.5-flash",
         contents=[prompt, image_data],
     )
     return response.text
