@@ -1292,7 +1292,7 @@ def main():
             st.text_input(
                 "仕入先・取引先の絞り込み（部分一致）",
                 key="hint_filter_supplier",
-                placeholder="例: 京都",
+                placeholder="例: ⚫︎⚫︎会社",
             )
             fs = st.session_state.get("hint_filter_supplier", "")
             if st.session_state.get("_hint_fs_seen", "") != fs:
