@@ -654,6 +654,33 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
     return pd.DataFrame(data_rows, columns=EXPECTED_HEADERS)
 
 
+# 登録フォーム「台帳から入力補助」用プルダウンの先頭行
+_LEDGER_PICK_PLACEHOLDER = "（選ばない）"
+
+
+def _ledger_unique_col_values(df: pd.DataFrame, col: str, *, max_n: int = 800) -> list[str]:
+    """台帳 DataFrame から列のユニーク値（空除く）を昇順で返す。"""
+    if df is None or df.empty or col not in df.columns:
+        return []
+    s = df[col].astype(str).str.strip()
+    s = s[s != ""]
+    return sorted(set(s.tolist()), key=lambda x: (x.casefold(), x))[:max_n]
+
+
+def _on_ledger_pick_product_name() -> None:
+    v = st.session_state.get("ledger_pick_product_name", "")
+    if v and v != _LEDGER_PICK_PLACEHOLDER:
+        st.session_state.field_product_name = v
+        st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
+
+
+def _on_ledger_pick_supplier() -> None:
+    v = st.session_state.get("ledger_pick_supplier", "")
+    if v and v != _LEDGER_PICK_PLACEHOLDER:
+        st.session_state.field_supplier = v
+        st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
+
+
 def _cell_value_for_sheet(v: Any) -> Any:
     try:
         if pd.api.types.is_scalar(v) and pd.isna(v):
@@ -957,7 +984,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     st.markdown("##### 金額推移（税抜・折れ線）")
     st.caption(
         "その月までの入庫・出庫それぞれの税抜金額の**累計**（いわゆる累積）を、"
-        "各月で入庫・出庫の2本の棒として並べたグラフです（積み上げ棒ではありません）。"
+        "各月で入庫・出庫の2本の棒として並べたグラフです。"
         "上の期間・仕入先・取引先の絞り込みに従います。"
     )
     if not monthly.empty:
@@ -998,7 +1025,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         st.caption("累積金額グラフを表示できる月次データがありません。")
 
     st.markdown("##### 仕入先・取引先別 税抜金額（変動幅の大きい順・上位15件）")
-    st.caption("各仕入先・取引先で入庫・出庫の税抜金額を並べた棒グラフ（積み上げではありません）。")
+    st.caption("各仕入先・取引先で入庫・出庫の税抜金額を並べた棒グラフです。")
     chart_src = (
         grp.set_index(sup_col)[["入庫金額税抜", "出庫金額税抜"]]
         .assign(_abs=lambda x: (x["入庫金額税抜"] - x["出庫金額税抜"]).abs())
@@ -1140,6 +1167,14 @@ def main():
         st.session_state.field_unit_price_excl = 1
     if "field_consumption_tax_choice" not in st.session_state:
         st.session_state.field_consumption_tax_choice = "10%"
+    if "hint_filter_product_name" not in st.session_state:
+        st.session_state.hint_filter_product_name = ""
+    if "hint_filter_supplier" not in st.session_state:
+        st.session_state.hint_filter_supplier = ""
+    if "ledger_pick_product_name" not in st.session_state:
+        st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
+    if "ledger_pick_supplier" not in st.session_state:
+        st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
     st.session_state.pop("field_price_excl", None)
 
     # --- 一時緩和: secrets 一括チェックを無効化（No secrets found 回避・Gemini 動作確認優先） ---
@@ -1188,6 +1223,10 @@ def main():
             st.session_state.ai_parse_ran = False
             st.session_state.field_memo = ""
             st.session_state.field_unit_price_excl = 1
+            st.session_state.hint_filter_product_name = ""
+            st.session_state.hint_filter_supplier = ""
+            st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
+            st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
             st.rerun()
 
     if analyze and uploaded is not None:
@@ -1217,6 +1256,63 @@ def main():
         st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
 
     st.subheader("必須入力")
+
+    df_ledger_hint: pd.DataFrame | None = None
+    if _safe_secret("GOOGLE_SPREADSHEET_ID"):
+        try:
+            df_ledger_hint = load_inventory_dataframe()
+        except Exception:
+            df_ledger_hint = None
+
+    if df_ledger_hint is not None and not df_ledger_hint.empty:
+        st.markdown("##### 台帳から入力補助（任意）")
+        st.caption(
+            "絞り込み欄に文字を入れると候補が絞られます。プルダウンで選ぶと下の入力欄に反映されます（あとから手修正も可能です）。"
+        )
+        hc1, hc2 = st.columns(2)
+        with hc1:
+            st.text_input(
+                "商品名の絞り込み（部分一致）",
+                key="hint_filter_product_name",
+                placeholder="例: 帯",
+            )
+            fp = st.session_state.get("hint_filter_product_name", "")
+            if st.session_state.get("_hint_fp_seen", "") != fp:
+                st.session_state["_hint_fp_seen"] = fp
+                st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
+            opts_p = _ledger_unique_col_values(df_ledger_hint, COL_NAME)
+            if fp.strip():
+                q = fp.strip().casefold()
+                opts_p = [x for x in opts_p if q in x.casefold()][:400]
+            st.selectbox(
+                "台帳に登録済みの商品名から選ぶ",
+                options=[_LEDGER_PICK_PLACEHOLDER] + opts_p,
+                key="ledger_pick_product_name",
+                on_change=_on_ledger_pick_product_name,
+            )
+        with hc2:
+            st.text_input(
+                "仕入先・取引先の絞り込み（部分一致）",
+                key="hint_filter_supplier",
+                placeholder="例: 京都",
+            )
+            fs = st.session_state.get("hint_filter_supplier", "")
+            if st.session_state.get("_hint_fs_seen", "") != fs:
+                st.session_state["_hint_fs_seen"] = fs
+                st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
+            opts_s = _ledger_unique_col_values(df_ledger_hint, COL_SUPPLIER)
+            if fs.strip():
+                q = fs.strip().casefold()
+                opts_s = [x for x in opts_s if q in x.casefold()][:400]
+            st.selectbox(
+                "台帳に登録済みの仕入先・取引先から選ぶ",
+                options=[_LEDGER_PICK_PLACEHOLDER] + opts_s,
+                key="ledger_pick_supplier",
+                on_change=_on_ledger_pick_supplier,
+            )
+    elif _safe_secret("GOOGLE_SPREADSHEET_ID"):
+        st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
+
     product_name = st.text_input("商品名（必須）", key="field_product_name")
     supplier = st.text_input("仕入先・取引先（必須）", key="field_supplier")
     quantity = st.number_input("数量", min_value=1, step=1, key="field_qty")
