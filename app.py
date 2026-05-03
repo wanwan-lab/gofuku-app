@@ -25,7 +25,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
-  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額 | 画像URL | メモ（任意）
+  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額 | メモ（任意） | 画像URL
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
   ※新規登録画面では税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
@@ -120,8 +120,8 @@ EXPECTED_HEADERS = [
     COL_PRICE_UNIT,
     COL_PRICE_EXCL,
     COL_PRICE_INCL,
-    COL_IMAGE_URL,
     COL_MEMO,
+    COL_IMAGE_URL,
 ]
 
 # 一時的: secrets.toml が無い／空でもアプリを落とさない（AI 解析テスト用）
@@ -552,8 +552,8 @@ def append_sheet_row(
                 unit_price_excl_yen,
                 line_price_excl_yen,
                 line_price_incl_yen,
-                image_url,
                 memo,
+                image_url,
             ],
             value_input_option="USER_ENTERED",
         )
