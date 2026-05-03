@@ -6,18 +6,20 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 必須キー:
   GEMINI_API_KEY
   GAS_UPLOAD_URL           … 画像を Google ドライブに保存する Web アプリ（GAS）の URL
-  GAS_API_KEY              … GAS Web アプリ呼び出し用の共有キー（payload の apiKey に付与）
-  GOOGLE_DRIVE_FOLDER_ID   … 保存先フォルダID（GAS に渡す）
-  GOOGLE_SPREADSHEET_ID    … 記録用スプレッドシートID
-  google_service_account   … サービスアカウントJSONの各フィールド（[google_service_account] セクション）
+  GAS_API_KEY                … GAS Web アプリ呼び出し用の共有キー（payload の apiKey に付与）
+  GOOGLE_DRIVE_FOLDER_ID     … 保存先フォルダID（GAS に渡す）
+  GOOGLE_SPREADSHEET_ID      … 記録用スプレッドシートID
+  google_service_account     … サービスアカウントJSONの各フィールド（[google_service_account] セクション）
     または GOOGLE_SERVICE_ACCOUNT_JSON … JSON文字列1本
 
 任意:
-  GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
-  APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
+  GEMINI_MODEL_NAME          … Gemini モデル ID（未設定時は settings.DEFAULT_GEMINI_MODEL）
+  GOOGLE_WORKSHEET_NAME      … ワークシート名（既定は settings.DEFAULT_WORKSHEET_NAME）
+  GAS_UPLOAD_TIMEOUT_SECONDS … GAS への POST タイムアウト秒（既定 300、1〜3600 にクランプ）
+  FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED … GAS 未設定時に台帳の画像URL列へ入れるプレースホルダ URL
+  APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
-※ 画像の Gemini 解析は **google-generativeai** で ``genai.GenerativeModel('gemini-3-flash-preview')`` を使用します
-  （``models/`` プレフィックス・api_version は指定しません）。
+※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（既定は flash 系プレビュー）。
 ※ アップロード画像は任意。ある場合のみ Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
@@ -34,7 +36,61 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 from __future__ import annotations
 
+import base64
+import io
+import json
+import re
+import uuid
+from datetime import datetime
+from typing import Any
+
+import altair as alt
+import google.generativeai as genai
+import gspread
+import pandas as pd
+import requests
 import streamlit as st
+from google.oauth2 import service_account
+from PIL import Image, ImageOps
+
+import settings
+from settings import (
+    COL_DATETIME,
+    COL_IMAGE_URL,
+    COL_MEMO,
+    COL_NAME,
+    COL_PRICE_EXCL,
+    COL_PRICE_INCL,
+    COL_PRICE_UNIT,
+    COL_QTY,
+    COL_SUPPLIER,
+    COL_TYPE,
+    CONSUMPTION_TAX_CHOICE_TO_RATE,
+    CONSUMPTION_TAX_RATE,
+    DEFAULT_GAS_FALLBACK_IMAGE_URL,
+    DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS,
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_WORKSHEET_NAME,
+    EXPECTED_HEADERS,
+    LEDGER_DATA_EDITOR_KEY,
+    LEDGER_PICK_PLACEHOLDER,
+    SECRET_APP_PASSWORD,
+    SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED,
+    SECRET_GAS_API_KEY,
+    SECRET_GAS_UPLOAD_TIMEOUT_SECONDS,
+    SECRET_GAS_UPLOAD_URL,
+    SECRET_GEMINI_API_KEY,
+    SECRET_GEMINI_MODEL_NAME,
+    SECRET_GOOGLE_DRIVE_FOLDER_ID,
+    SECRET_GOOGLE_SERVICE_ACCOUNT_JSON,
+    SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION,
+    SECRET_GOOGLE_SPREADSHEET_ID,
+    SECRET_GOOGLE_WORKSHEET_NAME,
+    SHEET_AMOUNT_NUMBER_PATTERN,
+    TZ_JP,
+    UPLOAD_JPEG_MAX_LONG_EDGE,
+    UPLOAD_JPEG_QUALITY,
+)
 
 
 def check_password() -> bool:
@@ -46,21 +102,23 @@ def check_password() -> bool:
     st.header("認証")
 
     try:
-        expected = str(st.secrets["APP_PASSWORD"]).strip()
+        expected = str(st.secrets[SECRET_APP_PASSWORD]).strip()
     except Exception:
         st.error(
-            "`.streamlit/secrets.toml` に **APP_PASSWORD** を設定してください。"
+            f"`.streamlit/secrets.toml` に **{SECRET_APP_PASSWORD}** を設定してください。"
             "（ローカルで `secrets.toml` が無い場合は作成してください）"
         )
         st.stop()
 
     if not expected:
-        st.error("APP_PASSWORD が空です。secrets.toml を確認してください。")
+        st.error(f"{SECRET_APP_PASSWORD} が空です。secrets.toml を確認してください。")
         st.stop()
 
     with st.form("auth_screen_form"):
         password = st.text_input("パスワード", type="password")
-        submitted = st.form_submit_button("ログイン（パスワード入力後は Enter でも送信できます）")
+        submitted = st.form_submit_button(
+            "ログイン（パスワード入力後は Enter でも送信できます）"
+        )
 
     if submitted:
         if (password or "").strip() == expected:
@@ -69,64 +127,6 @@ def check_password() -> bool:
         st.error("パスワードが正しくありません。")
 
     st.stop()
-
-
-import base64
-import io
-import json
-import re
-import uuid
-from datetime import datetime
-from typing import Any
-
-import pytz
-
-import altair as alt
-import pandas as pd
-import google.generativeai as genai
-import gspread
-import requests
-from google.oauth2 import service_account
-from PIL import Image, ImageOps
-
-
-# --- スプレッドシート列（ヘッダーと一致させる） ---
-COL_DATETIME = "日時"
-COL_TYPE = "入出庫種別"
-COL_NAME = "商品名"
-COL_SUPPLIER = "仕入先・取引先"
-COL_QTY = "数量"
-COL_PRICE_UNIT = "商品単価（税抜）"
-COL_PRICE_EXCL = "商品金額（税抜）"
-COL_PRICE_INCL = "税込金額"
-COL_IMAGE_URL = "画像URL"
-COL_MEMO = "メモ"
-
-# 消費税（税込計算の既定・ダッシュボード等で参照する標準税率）
-CONSUMPTION_TAX_RATE = 0.10
-
-# 登録画面ラジオの表示ラベル → 税率（小数）。非課税は税込＝税抜。
-_CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
-    "10%": 0.10,
-    "8%": 0.08,
-    "非課税": 0.0,
-}
-
-EXPECTED_HEADERS = [
-    COL_DATETIME,
-    COL_TYPE,
-    COL_NAME,
-    COL_SUPPLIER,
-    COL_QTY,
-    COL_PRICE_UNIT,
-    COL_PRICE_EXCL,
-    COL_PRICE_INCL,
-    COL_MEMO,
-    COL_IMAGE_URL,
-]
-
-# スプレッドシート金額列の表示形式（Google Sheets API repeatCell）
-_SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
 
 
 def _apply_inventory_amount_number_formats(ws) -> None:
@@ -150,7 +150,7 @@ def _apply_inventory_amount_number_formats(ws) -> None:
                             "userEnteredFormat": {
                                 "numberFormat": {
                                     "type": "NUMBER",
-                                    "pattern": _SHEET_AMOUNT_NUMBER_PATTERN,
+                                    "pattern": SHEET_AMOUNT_NUMBER_PATTERN,
                                 }
                             }
                         },
@@ -160,13 +160,6 @@ def _apply_inventory_amount_number_formats(ws) -> None:
             ]
         }
     )
-
-
-# 一時的: secrets.toml が無い／空でもアプリを落とさない（AI 解析テスト用）
-_PLACEHOLDER_DRIVE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
-
-# アプリ全体の基準タイムゾーン（台帳の「日時」・ファイル名・EXIF 未取得時のデフォルト）
-TZ_JP = pytz.timezone("Asia/Tokyo")
 
 
 def jst_now() -> datetime:
@@ -234,11 +227,6 @@ def capture_datetime_jst_from_upload(uploaded) -> str | None:
         return None
 
 
-# 解析・ドライブ保存共通: Pillow で長辺リサイズ + JPEG 再エンコード（データ量削減）
-_UPLOAD_JPEG_MAX_LONG_EDGE = 1280
-_UPLOAD_JPEG_QUALITY = 80
-
-
 def _resize_long_edge_max(img: Image.Image, max_edge: int) -> Image.Image:
     w, h = img.size
     long_edge = max(w, h)
@@ -253,7 +241,8 @@ def _resize_long_edge_max(img: Image.Image, max_edge: int) -> Image.Image:
 def prepare_upload_image_jpeg(raw: bytes) -> tuple[bytes, str]:
     """Gemini 送信用・GAS 保存用の共通前処理。
 
-    EXIF 向き補正のうえ長辺を最大 1280px に収め、JPEG 品質 80% で再エンコードする。
+    EXIF 向き補正のうえ、:data:`UPLOAD_JPEG_MAX_LONG_EDGE` と :data:`UPLOAD_JPEG_QUALITY` に従い
+    長辺リサイズと JPEG 再エンコードを行う。
 
     Returns:
         (jpeg_bytes, mime_type)  mime_type は常に ``image/jpeg`` 。
@@ -264,12 +253,12 @@ def prepare_upload_image_jpeg(raw: bytes) -> tuple[bytes, str]:
     bg = Image.new("RGB", rgba.size, (255, 255, 255))
     bg.paste(rgba, mask=rgba.getchannel("A"))
     img = bg
-    img = _resize_long_edge_max(img, _UPLOAD_JPEG_MAX_LONG_EDGE)
+    img = _resize_long_edge_max(img, UPLOAD_JPEG_MAX_LONG_EDGE)
     buf = io.BytesIO()
     img.save(
         buf,
         format="JPEG",
-        quality=_UPLOAD_JPEG_QUALITY,
+        quality=UPLOAD_JPEG_QUALITY,
         optimize=True,
         progressive=True,
     )
@@ -287,25 +276,60 @@ def _safe_secret(key: str, default: str = "") -> str:
         return default
 
 
+def _secret_int(
+    key: str, default: int, *, min_value: int = 1, max_value: int = 10_000
+) -> int:
+    raw = _safe_secret(key)
+    if not raw:
+        return default
+    try:
+        return max(min_value, min(max_value, int(raw)))
+    except ValueError:
+        return default
+
+
+def _gas_upload_timeout_seconds() -> int:
+    return _secret_int(
+        SECRET_GAS_UPLOAD_TIMEOUT_SECONDS,
+        DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS,
+        min_value=30,
+        max_value=3600,
+    )
+
+
+def _fallback_image_url_when_gas_unconfigured() -> str:
+    return _safe_secret(
+        SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED,
+        DEFAULT_GAS_FALLBACK_IMAGE_URL,
+    )
+
+
+def _gemini_model_name() -> str:
+    return _safe_secret(SECRET_GEMINI_MODEL_NAME, DEFAULT_GEMINI_MODEL)
+
+
 def _get_secrets() -> dict[str, Any]:
     return dict(st.secrets)
 
 
 def _load_service_account_info() -> dict[str, Any]:
     s = _get_secrets()
-    if "GOOGLE_SERVICE_ACCOUNT_JSON" in s:
-        raw = s["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    if SECRET_GOOGLE_SERVICE_ACCOUNT_JSON in s:
+        raw = s[SECRET_GOOGLE_SERVICE_ACCOUNT_JSON]
         if isinstance(raw, str):
             return json.loads(raw)
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON は文字列である必要があります。")
-    if "google_service_account" in s:
-        ga = s["google_service_account"]
+        raise ValueError(
+            f"{SECRET_GOOGLE_SERVICE_ACCOUNT_JSON} は文字列である必要があります。"
+        )
+    if SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION in s:
+        ga = s[SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION]
         if hasattr(ga, "to_dict"):
             return dict(ga.to_dict())
         return dict(ga)
     raise ValueError(
         "サービスアカウントが見つかりません。"
-        " [google_service_account] セクションか GOOGLE_SERVICE_ACCOUNT_JSON を設定してください。"
+        f" [{SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION}] セクションか "
+        f"{SECRET_GOOGLE_SERVICE_ACCOUNT_JSON} を設定してください。"
     )
 
 
@@ -458,7 +482,7 @@ def _gemini_input_image_from_upload(uploaded) -> Image.Image:
 
 
 def _consumption_tax_rate_from_choice_label(label: str) -> float:
-    return _CONSUMPTION_TAX_CHOICE_TO_RATE.get(label, CONSUMPTION_TAX_RATE)
+    return CONSUMPTION_TAX_CHOICE_TO_RATE.get(label, CONSUMPTION_TAX_RATE)
 
 
 def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
@@ -473,8 +497,13 @@ def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
 
 
 def analyze_image_with_gemini(image_data):
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel('gemini-3-flash-preview')
+    api_key = _safe_secret(SECRET_GEMINI_API_KEY)
+    if not api_key:
+        raise RuntimeError(
+            f"{SECRET_GEMINI_API_KEY} が設定されていません。`.streamlit/secrets.toml` を確認してください。"
+        )
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(_gemini_model_name())
     prompt = """この画像は呉服店の在庫・売買用の商品写真です。次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
 説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
 
@@ -495,19 +524,41 @@ def analyze_image_with_gemini(image_data):
     return response.text or ""
 
 
-def ensure_worksheet_header():
-    """1行目がヘッダーでなければ作成（初回のみ想定）。secrets 未設定時は None。"""
-    sid = _safe_secret("GOOGLE_SPREADSHEET_ID")
+def _open_inventory_workbook():
+    sid = _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID)
     if not sid:
         return None
-    wname = _safe_secret("GOOGLE_WORKSHEET_NAME", "在庫履歴")
     try:
-        sh = _gspread_client().open_by_key(str(sid))
-        try:
-            ws = sh.worksheet(str(wname))
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=str(wname), rows=1000, cols=10)
+        return _gspread_client().open_by_key(str(sid))
+    except Exception:
+        return None
 
+
+def _get_or_create_inventory_worksheet():
+    """在庫ワークシートを開く。無ければ十分な行・列で作成する。失敗時は None。"""
+    sh = _open_inventory_workbook()
+    if sh is None:
+        return None
+    wname = _safe_secret(SECRET_GOOGLE_WORKSHEET_NAME, DEFAULT_WORKSHEET_NAME)
+    try:
+        try:
+            return sh.worksheet(str(wname))
+        except gspread.WorksheetNotFound:
+            return sh.add_worksheet(
+                title=str(wname),
+                rows=2000,
+                cols=max(20, len(EXPECTED_HEADERS) + 2),
+            )
+    except Exception:
+        return None
+
+
+def ensure_worksheet_header():
+    """1行目がヘッダーでなければ作成（初回のみ想定）。secrets 未設定時は None。"""
+    ws = _get_or_create_inventory_worksheet()
+    if ws is None:
+        return None
+    try:
         first = ws.row_values(1)
         if not first or first[: len(EXPECTED_HEADERS)] != EXPECTED_HEADERS:
             ws.update("A1", [EXPECTED_HEADERS], value_input_option="USER_ENTERED")
@@ -527,11 +578,11 @@ def upload_image_to_drive(filename: str, mime: str, data: bytes) -> str:
     { folderId, fileName, mimeType, base64Data, apiKey } を受け取り、
     { status: \"success\", url: \"...\" } 形式で返す想定。
     """
-    gas_url = _safe_secret("GAS_UPLOAD_URL")
-    gas_api_key = _safe_secret("GAS_API_KEY")
-    folder_id = _safe_secret("GOOGLE_DRIVE_FOLDER_ID")
+    gas_url = _safe_secret(SECRET_GAS_UPLOAD_URL)
+    gas_api_key = _safe_secret(SECRET_GAS_API_KEY)
+    folder_id = _safe_secret(SECRET_GOOGLE_DRIVE_FOLDER_ID)
     if not gas_url or not gas_api_key or not folder_id:
-        return _PLACEHOLDER_DRIVE_URL
+        return _fallback_image_url_when_gas_unconfigured()
 
     base64_data = base64.b64encode(data).decode("ascii")
     payload = {
@@ -546,7 +597,7 @@ def upload_image_to_drive(filename: str, mime: str, data: bytes) -> str:
         gas_url,
         json=payload,
         headers={"Content-Type": "application/json"},
-        timeout=300,
+        timeout=_gas_upload_timeout_seconds(),
     )
     resp.raise_for_status()
 
@@ -607,32 +658,9 @@ def append_sheet_row(
         st.warning(f"スプレッドシート更新をスキップしました: {e}")
 
 
-LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
-
-
-def _open_inventory_worksheet():
-    """在庫ワークシートを開く。存在しなければ作成する。失敗時は None。"""
-    sid = _safe_secret("GOOGLE_SPREADSHEET_ID")
-    if not sid:
-        return None
-    wname = _safe_secret("GOOGLE_WORKSHEET_NAME", "在庫履歴")
-    try:
-        sh = _gspread_client().open_by_key(str(sid))
-        try:
-            return sh.worksheet(str(wname))
-        except gspread.WorksheetNotFound:
-            return sh.add_worksheet(
-                title=str(wname),
-                rows=2000,
-                cols=max(20, len(EXPECTED_HEADERS) + 2),
-            )
-    except Exception:
-        return None
-
-
 def load_inventory_dataframe() -> pd.DataFrame | None:
     """1行目をヘッダー、2行目以降をデータとして読み込み、列は EXPECTED_HEADERS に揃える。"""
-    ws = _open_inventory_worksheet()
+    ws = _get_or_create_inventory_worksheet()
     if ws is None:
         return None
     try:
@@ -654,10 +682,6 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
     return pd.DataFrame(data_rows, columns=EXPECTED_HEADERS)
 
 
-# 登録フォーム「台帳から入力補助」用プルダウンの先頭行
-_LEDGER_PICK_PLACEHOLDER = "（選ばない）"
-
-
 def _ledger_unique_col_values(df: pd.DataFrame, col: str, *, max_n: int = 800) -> list[str]:
     """台帳 DataFrame から列のユニーク値（空除く）を昇順で返す。"""
     if df is None or df.empty or col not in df.columns:
@@ -669,16 +693,16 @@ def _ledger_unique_col_values(df: pd.DataFrame, col: str, *, max_n: int = 800) -
 
 def _on_ledger_pick_product_name() -> None:
     v = st.session_state.get("ledger_pick_product_name", "")
-    if v and v != _LEDGER_PICK_PLACEHOLDER:
+    if v and v != LEDGER_PICK_PLACEHOLDER:
         st.session_state.field_product_name = v
-        st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
+        st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
 
 
 def _on_ledger_pick_supplier() -> None:
     v = st.session_state.get("ledger_pick_supplier", "")
-    if v and v != _LEDGER_PICK_PLACEHOLDER:
+    if v and v != LEDGER_PICK_PLACEHOLDER:
         st.session_state.field_supplier = v
-        st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
+        st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
 
 
 def _cell_value_for_sheet(v: Any) -> Any:
@@ -692,10 +716,10 @@ def _cell_value_for_sheet(v: Any) -> Any:
 
 def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
     """編集後の DataFrame の内容でワークシートをクリアし、ヘッダー＋全行を書き直す。"""
-    ws = _open_inventory_worksheet()
+    ws = _get_or_create_inventory_worksheet()
     if ws is None:
         raise RuntimeError(
-            "スプレッドシートに接続できません。GOOGLE_SPREADSHEET_ID とサービスアカウントを確認してください。"
+            f"スプレッドシートに接続できません。{SECRET_GOOGLE_SPREADSHEET_ID} とサービスアカウントを確認してください。"
         )
     out = df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
     values: list[list[Any]] = [EXPECTED_HEADERS]
@@ -1081,8 +1105,10 @@ def render_inventory_manager() -> None:
     if msg := st.session_state.pop("_ledger_saved_flash", None):
         st.success(msg)
 
-    if not _safe_secret("GOOGLE_SPREADSHEET_ID"):
-        st.info("GOOGLE_SPREADSHEET_ID を設定すると、台帳の表示・編集ができます。")
+    if not _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID):
+        st.info(
+            f"{SECRET_GOOGLE_SPREADSHEET_ID} を設定すると、台帳の表示・編集ができます。"
+        )
         return
 
     r1, _ = st.columns([1, 2])
@@ -1143,12 +1169,8 @@ def render_inventory_manager() -> None:
     render_ledger_dashboard(edited)
 
 
-def main():
-    st.set_page_config(page_title="商品 在庫・販売", layout="wide")
-    st.title("商品 在庫・販売管理")
-    st.caption("写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・スプレッドシート記録ができます。")
-
-    # --- session 初期化（フォームは key で状態管理） ---
+def _init_registration_form_session_state() -> None:
+    """登録フォーム用の session_state 初期値（キーはウィジェットと連動）。"""
     if "field_product_name" not in st.session_state:
         st.session_state.field_product_name = ""
     if "field_supplier" not in st.session_state:
@@ -1172,34 +1194,26 @@ def main():
     if "hint_filter_supplier" not in st.session_state:
         st.session_state.hint_filter_supplier = ""
     if "ledger_pick_product_name" not in st.session_state:
-        st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
+        st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
     if "ledger_pick_supplier" not in st.session_state:
-        st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
+        st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
     st.session_state.pop("field_price_excl", None)
 
-    # --- 一時緩和: secrets 一括チェックを無効化（No secrets found 回避・Gemini 動作確認優先） ---
-    # try:
-    #     _ = st.secrets["GEMINI_API_KEY"]
-    #     _ = st.secrets["GAS_UPLOAD_URL"]
-    #     _ = st.secrets["GAS_API_KEY"]
-    #     _ = st.secrets["GOOGLE_DRIVE_FOLDER_ID"]
-    #     _ = st.secrets["GOOGLE_SPREADSHEET_ID"]
-    #     _load_service_account_info()
-    # except Exception as e:
-    #     st.error(f"設定エラー: {e}")
-    #     st.info(
-    #         "`.streamlit/secrets.toml` に GEMINI_API_KEY・GAS_UPLOAD_URL・GAS_API_KEY・"
-    #         "GOOGLE_DRIVE_FOLDER_ID・GOOGLE_SPREADSHEET_ID・サービスアカウントを設定してください。"
-    #     )
-    #     return
-    st.caption("開発モード: secrets の起動時チェックをスキップしています（AI解析の確認用）。")
+
+def main():
+    st.set_page_config(page_title="商品 在庫・販売", layout="wide")
+    st.title("商品 在庫・販売管理")
+    st.caption("写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・スプレッドシート記録ができます。")
+
+    _init_registration_form_session_state()
 
     uploaded = st.file_uploader(
         "商品写真（任意・カメラやギャラリーからアップロード）",
         type=["jpg", "jpeg", "png", "webp"],
     )
     st.caption(
-        "写真がある場合のみ、EXIF向き補正のうえ長辺最大1280px・JPEG品質80％へ変換してから AI 解析・ドライブ保存します。"
+        f"写真がある場合のみ、EXIF向き補正のうえ長辺最大{UPLOAD_JPEG_MAX_LONG_EDGE}px・"
+        f"JPEG品質{UPLOAD_JPEG_QUALITY}％へ変換してから AI 解析・ドライブ保存します。"
         "台帳の日時は写真があるとき EXIF の撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
         "必須項目だけでも確定して台帳記録できます（画像URLは空欄になります）。"
     )
@@ -1225,8 +1239,8 @@ def main():
             st.session_state.field_unit_price_excl = 1
             st.session_state.hint_filter_product_name = ""
             st.session_state.hint_filter_supplier = ""
-            st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
-            st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
+            st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+            st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
             st.rerun()
 
     if analyze and uploaded is not None:
@@ -1256,7 +1270,7 @@ def main():
         st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
 
     df_ledger_hint: pd.DataFrame | None = None
-    if _safe_secret("GOOGLE_SPREADSHEET_ID"):
+    if _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID):
         try:
             df_ledger_hint = load_inventory_dataframe()
         except Exception:
@@ -1277,14 +1291,14 @@ def main():
             fp = st.session_state.get("hint_filter_product_name", "")
             if st.session_state.get("_hint_fp_seen", "") != fp:
                 st.session_state["_hint_fp_seen"] = fp
-                st.session_state.ledger_pick_product_name = _LEDGER_PICK_PLACEHOLDER
+                st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
             opts_p = _ledger_unique_col_values(df_ledger_hint, COL_NAME)
             if fp.strip():
                 q = fp.strip().casefold()
                 opts_p = [x for x in opts_p if q in x.casefold()][:400]
             st.selectbox(
                 "台帳に登録済みの商品名から選ぶ",
-                options=[_LEDGER_PICK_PLACEHOLDER] + opts_p,
+                options=[LEDGER_PICK_PLACEHOLDER] + opts_p,
                 key="ledger_pick_product_name",
                 on_change=_on_ledger_pick_product_name,
             )
@@ -1297,18 +1311,18 @@ def main():
             fs = st.session_state.get("hint_filter_supplier", "")
             if st.session_state.get("_hint_fs_seen", "") != fs:
                 st.session_state["_hint_fs_seen"] = fs
-                st.session_state.ledger_pick_supplier = _LEDGER_PICK_PLACEHOLDER
+                st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
             opts_s = _ledger_unique_col_values(df_ledger_hint, COL_SUPPLIER)
             if fs.strip():
                 q = fs.strip().casefold()
                 opts_s = [x for x in opts_s if q in x.casefold()][:400]
             st.selectbox(
                 "台帳に登録済みの仕入先・取引先から選ぶ",
-                options=[_LEDGER_PICK_PLACEHOLDER] + opts_s,
+                options=[LEDGER_PICK_PLACEHOLDER] + opts_s,
                 key="ledger_pick_supplier",
                 on_change=_on_ledger_pick_supplier,
             )
-    elif _safe_secret("GOOGLE_SPREADSHEET_ID"):
+    elif _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID):
         st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
 
     st.markdown("##### 必須入力項目")
@@ -1326,7 +1340,7 @@ def main():
 
     st.radio(
         "消費税（税込金額の計算）",
-        options=list(_CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
+        options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
         horizontal=True,
         key="field_consumption_tax_choice",
         help="税込金額＝税抜行合計×（1＋税率）を四捨五入。非課税のときは税込＝税抜です。",
