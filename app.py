@@ -1048,16 +1048,28 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     line_needs_derive_in = (unit_ex > 0) & (line_stored_in.fillna(0) <= 0)
     _ex_int = line_ex.fillna(0).round().clip(lower=0).astype(int)
     line_in = line_in.mask(line_needs_derive_in, _ex_int.map(price_incl_tax).astype(float))
-    d["_qty_in"] = qty.where(is_in, 0.0)
-    d["_qty_out"] = qty.where(is_out, 0.0)
-    d["_amt_ex_in"] = line_ex.where(is_in, 0.0)
-    d["_amt_ex_out"] = line_ex.where(is_out, 0.0)
-    d["_amt_in_in"] = line_in.where(is_in, 0.0)
-    d["_amt_in_out"] = line_in.where(is_out, 0.0)
+    line_ex = line_ex.fillna(0).replace([np.inf, -np.inf], 0)
+    line_in = line_in.fillna(0).replace([np.inf, -np.inf], 0)
+    d["_qty_in"] = qty.where(is_in, 0.0).fillna(0).astype(float)
+    d["_qty_out"] = qty.where(is_out, 0.0).fillna(0).astype(float)
+    d["_amt_ex_in"] = line_ex.where(is_in, 0.0).fillna(0).astype(float)
+    d["_amt_ex_out"] = line_ex.where(is_out, 0.0).fillna(0).astype(float)
+    d["_amt_in_in"] = line_in.where(is_in, 0.0).fillna(0).astype(float)
+    d["_amt_in_out"] = line_in.where(is_out, 0.0).fillna(0).astype(float)
     d["_ym"] = d[COL_DATETIME].dt.to_period("M").astype(str)
     d["_year"] = d[COL_DATETIME].dt.year
     d["_month"] = d[COL_DATETIME].dt.month
     return d
+
+
+def _altair_y_scale_positive(s: pd.Series) -> alt.Scale:
+    """金額がすべて 0 のときでも棒グラフが潰れないよう Y 軸上限を確保する。"""
+    v = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    hi = float(v.max())
+    if not math.isfinite(hi):
+        hi = 0.0
+    top = max(hi * 1.08, 1.0)
+    return alt.Scale(domain=[0.0, top])
 
 
 def render_ledger_dashboard(df: pd.DataFrame) -> None:
@@ -1073,7 +1085,15 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         st.info("集計する行がありません。")
         return
 
-    ad = _prepare_ledger_analysis(df)
+    df_in = df.copy()
+    for _col in (COL_QTY, COL_PRICE_UNIT, COL_PRICE_EXCL, COL_PRICE_INCL):
+        if _col in df_in.columns:
+            df_in[_col] = (
+                pd.to_numeric(df_in[_col], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0)
+            )
+    ad = _prepare_ledger_analysis(df_in)
     ad_f = ad.dropna(subset=[COL_DATETIME], how="all")
 
     p1, p2, p3, p4 = st.columns(4)
@@ -1117,17 +1137,20 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         flt = flt[flt[COL_SUPPLIER].astype(str).isin(supplier_filter)]
 
     if flt.empty:
-        st.warning("条件に一致するデータがありません。")
+        st.warning(
+            "条件に一致するデータがありません。"
+            "期間を「全期間」にするか、年・月・仕入先の絞り込みを見直してください。"
+        )
         return
 
-    q_in = int(flt["_qty_in"].sum())
-    q_out = int(flt["_qty_out"].sum())
+    q_in = _finite_int(flt["_qty_in"].sum(), 0)
+    q_out = _finite_int(flt["_qty_out"].sum(), 0)
     q_net = q_in - q_out
-    ex_in = int(round(flt["_amt_ex_in"].sum()))
-    ex_out = int(round(flt["_amt_ex_out"].sum()))
+    ex_in = _finite_int(flt["_amt_ex_in"].sum(), 0)
+    ex_out = _finite_int(flt["_amt_ex_out"].sum(), 0)
     ex_net = ex_in - ex_out
-    in_in = int(round(flt["_amt_in_in"].sum()))
-    in_out = int(round(flt["_amt_in_out"].sum()))
+    in_in = _finite_int(flt["_amt_in_in"].sum(), 0)
+    in_out = _finite_int(flt["_amt_in_out"].sum(), 0)
     in_net = in_in - in_out
 
     m1, m2, m3 = st.columns(3)
@@ -1153,6 +1176,13 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         )
         .reset_index()
     )
+    for _gc in ("入庫数量", "出庫数量", "入庫金額税抜", "出庫金額税抜"):
+        if _gc in grp.columns:
+            grp[_gc] = (
+                pd.to_numeric(grp[_gc], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+            )
     grp["差し引き数量"] = (grp["入庫数量"] - grp["出庫数量"]).astype(int)
     grp["差し引き税抜"] = (grp["入庫金額税抜"] - grp["出庫金額税抜"]).round(0).astype(int)
     st.dataframe(
@@ -1175,6 +1205,18 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         .sort_values("_ym")
     )
     if not monthly.empty:
+        for _mc in (
+            "入庫数量",
+            "出庫数量",
+            "入庫金額税抜",
+            "出庫金額税抜",
+        ):
+            if _mc in monthly.columns:
+                monthly[_mc] = (
+                    pd.to_numeric(monthly[_mc], errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .fillna(0.0)
+                )
         month_order = monthly["_ym"].astype(str).tolist()
         mdf_qty = monthly.rename(
             columns={"_ym": "月", "入庫数量": "入庫", "出庫数量": "出庫"}
@@ -1186,12 +1228,20 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
             var_name="区分",
             value_name="数量",
         )
+        qty_long["数量"] = pd.to_numeric(
+            qty_long["数量"], errors="coerce"
+        ).fillna(0.0)
         chart_qty = (
             alt.Chart(qty_long)
             .mark_bar()
             .encode(
                 x=alt.X("月:N", sort=month_order, axis=alt.Axis(title="月", labelAngle=-45)),
-                y=alt.Y("数量:Q", title="数量", axis=alt.Axis(format=",.0f")),
+                y=alt.Y(
+                    "数量:Q",
+                    title="数量",
+                    axis=alt.Axis(format=",.0f"),
+                    scale=_altair_y_scale_positive(qty_long["数量"]),
+                ),
                 xOffset=alt.XOffset("区分:N"),
                 color=alt.Color(
                     "区分:N",
@@ -1226,12 +1276,20 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
             var_name="区分",
             value_name="金額",
         )
+        amt_bar_long["金額"] = pd.to_numeric(
+            amt_bar_long["金額"], errors="coerce"
+        ).fillna(0.0)
         chart_amt_bar = (
             alt.Chart(amt_bar_long)
             .mark_bar()
             .encode(
                 x=alt.X("月:N", sort=month_order, axis=alt.Axis(title="月", labelAngle=-45)),
-                y=alt.Y("金額:Q", title="金額（税抜・円）", axis=alt.Axis(format=",.0f")),
+                y=alt.Y(
+                    "金額:Q",
+                    title="金額（税抜・円）",
+                    axis=alt.Axis(format=",.0f"),
+                    scale=_altair_y_scale_positive(amt_bar_long["金額"]),
+                ),
                 xOffset=alt.XOffset("区分:N"),
                 color=alt.Color(
                     "区分:N",
@@ -1269,12 +1327,20 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
             var_name="区分",
             value_name="累積金額",
         )
+        cum_long["累積金額"] = pd.to_numeric(
+            cum_long["累積金額"], errors="coerce"
+        ).fillna(0.0)
         chart_cum_bar = (
             alt.Chart(cum_long)
             .mark_bar()
             .encode(
                 x=alt.X("月:N", sort=month_order_c, axis=alt.Axis(title="月", labelAngle=-45)),
-                y=alt.Y("累積金額:Q", title="累積金額（税抜・円）", axis=alt.Axis(format=",.0f")),
+                y=alt.Y(
+                    "累積金額:Q",
+                    title="累積金額（税抜・円）",
+                    axis=alt.Axis(format=",.0f"),
+                    scale=_altair_y_scale_positive(cum_long["累積金額"]),
+                ),
                 xOffset=alt.XOffset("区分:N"),
                 color=alt.Color(
                     "区分:N",
@@ -1312,6 +1378,9 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
             var_name="区分",
             value_name="金額",
         )
+        top_long["金額"] = pd.to_numeric(
+            top_long["金額"], errors="coerce"
+        ).fillna(0.0)
         sup_chart = (
             alt.Chart(top_long)
             .mark_bar()
@@ -1321,7 +1390,12 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
                     sort=top_order,
                     axis=alt.Axis(title=sup_col, labelAngle=-45),
                 ),
-                y=alt.Y("金額:Q", title="金額（税抜・円）", axis=alt.Axis(format=",.0f")),
+                y=alt.Y(
+                    "金額:Q",
+                    title="金額（税抜・円）",
+                    axis=alt.Axis(format=",.0f"),
+                    scale=_altair_y_scale_positive(top_long["金額"]),
+                ),
                 xOffset=alt.XOffset("区分:N"),
                 color=alt.Color(
                     "区分:N",
