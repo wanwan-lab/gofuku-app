@@ -27,14 +27,15 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
-  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入単価（税抜） | 仕入金額（税抜） | 仕入税込金額
+  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
   | 販売予定単価（税抜） | 販売予定金額（税込） | 実売単価（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID
   ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
-  ※仕入金額（税抜）は「数量×仕入単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
-  ※新規登録画面では仕入税込金額に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
+  ※「仕入金額（税抜）」「仕入金額（税込）」は **1点あたりの行合計**（台帳の各行は数量1）です。
+  ※旧シートに「仕入単価（税抜）」列が残っている場合は、読み込み時にその列を除いて新しい列構成に揃えます。
+  ※新規登録画面では仕入金額（税込）の計算に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
   ※販売予定・実売は **1点あたり税抜単価** を保存し、税込総額列は「単価×数量」を税抜行合計にしたうえで仕入行と同じ税率で四捨五入します。
   ※金額列（単価〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
   ※粗利は税抜ベースで「販売済」なら（実売単価×数量）−原価、「在庫中」なら（販売予定単価×数量）−原価。台帳保存時に再計算します。
@@ -92,9 +93,10 @@ COL_TYPE = "入出庫種別"
 COL_NAME = "商品名"
 COL_SUPPLIER = "仕入先・取引先"
 COL_QTY = "数量"
-COL_PRICE_UNIT = "仕入単価（税抜）"
 COL_PRICE_EXCL = "仕入金額（税抜）"
-COL_PRICE_INCL = "仕入税込金額"
+COL_PRICE_INCL = "仕入金額（税込）"
+# 旧スプレッドシート1行目に残る列名（load 時に列を落として新 EXPECTED に合わせる）
+LEGACY_COL_UNIT_PRICE = "仕入単価（税抜）"
 COL_PLANNED_SALE = "販売予定単価（税抜）"
 COL_PLANNED_SALE_INCL = "販売予定金額（税込）"
 COL_ACTUAL_SALE = "実売単価（税抜）"
@@ -122,7 +124,6 @@ EXPECTED_HEADERS: list[str] = [
     COL_NAME,
     COL_SUPPLIER,
     COL_QTY,
-    COL_PRICE_UNIT,
     COL_PRICE_EXCL,
     COL_PRICE_INCL,
     COL_PLANNED_SALE,
@@ -180,7 +181,7 @@ def check_password() -> bool:
 
 def _apply_inventory_amount_number_formats(ws) -> None:
     """金額系の列（単価〜粗利まで）に、2行目以降で #,##0 を適用する。"""
-    idx_start = EXPECTED_HEADERS.index(COL_PRICE_UNIT)
+    idx_start = EXPECTED_HEADERS.index(COL_PRICE_EXCL)
     idx_end = EXPECTED_HEADERS.index(COL_GROSS_PROFIT)
     end_row = max(int(ws.row_count), 2)
     ws.spreadsheet.batch_update(
@@ -470,26 +471,24 @@ def _apply_gemini_json_to_session(result: dict[str, Any]) -> None:
     if su:
         st.session_state.field_supplier = su
 
-    unit_yen = _coerce_unit_price_yen(
-        r.get("unit_price_excl")
+    line_yen = _coerce_unit_price_yen(
+        r.get("line_price_excl")
+        or r.get("line_excl_yen")
+        or r.get("仕入金額（税抜）")
+        or r.get("unit_price_excl")
         or r.get("unit_price")
         or r.get("product_unit_price_excl")
-        or r.get("仕入単価")
-        or r.get("仕入単価（税抜）")
-        or r.get("商品単価")
-        or r.get("商品単価（税抜）")
         or r.get("単価")
         or r.get("単価（税抜）")
     )
-    if unit_yen is None and match_conf_ok:
-        unit_yen = _coerce_unit_price_yen(
-            m.get("unit_price_excl")
+    if line_yen is None and match_conf_ok:
+        line_yen = _coerce_unit_price_yen(
+            m.get("line_price_excl")
+            or m.get("unit_price_excl")
             or m.get("unit_price")
-            or m.get("仕入単価")
-            or m.get("商品単価")
         )
-    if unit_yen is not None:
-        st.session_state.field_unit_price_excl = unit_yen
+    if line_yen is not None:
+        st.session_state.field_line_excl_yen = line_yen
 
     kind = str(
         r.get("product_kind")
@@ -597,7 +596,7 @@ def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
 
 
 def _infer_tax_rate_from_main_line(line_excl_yen: int, line_incl_yen: int) -> float:
-    """仕入金額（税抜）と仕入税込金額から、登録時と同じ消費税区分を推定する。"""
+    """仕入金額（税抜）と仕入金額（税込）から、登録時と同じ消費税区分を推定する。"""
     excl = _finite_int(line_excl_yen, 0)
     incl = _finite_int(line_incl_yen, 0)
     if excl <= 0:
@@ -670,7 +669,7 @@ def analyze_image_with_gemini(image_data):
 - "pattern" (string): 柄の推定。不明なら ""
 - "material" (string): 素材の推定。不明なら ""
 - "condition" (string): 状態の推定。不明なら ""
-- "unit_price_excl" (integer or null): 1点あたりの税抜単価（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
+- "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
 
 任意: 既存在庫と照合する場合のみ "match" を付けてもよい
 {"product_name": "...", "supplier": "...", "unit_price_excl": 整数またはnull, "confidence": 0.0〜1.0} の形。不要なら省略。"""
@@ -786,7 +785,6 @@ def _coerce_money_columns_for_recalc(df: pd.DataFrame) -> pd.DataFrame:
     """数値列を ``pd.to_numeric`` で揃え、inf/NaN を 0 にして int 化する。"""
     out = df.copy()
     money_cols = (
-        COL_PRICE_UNIT,
         COL_PRICE_EXCL,
         COL_PRICE_INCL,
         COL_PLANNED_SALE,
@@ -910,7 +908,6 @@ def append_sheet_row(
     movement: str,
     product_name: str,
     supplier: str,
-    unit_price_excl_yen: int,
     line_price_excl_yen: int,
     line_price_incl_yen: int,
     image_url: str,
@@ -923,7 +920,7 @@ def append_sheet_row(
     stock_status: str = STATUS_IN_STOCK,
     consumption_tax_rate: float | None = None,
 ):
-    """1点1行で台帳に追記する（数量列は常に 1）。"""
+    """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。"""
     ws = ensure_worksheet_header()
     if ws is None:
         st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
@@ -969,7 +966,6 @@ def append_sheet_row(
                 product_name,
                 supplier,
                 1,
-                unit_price_excl_yen,
                 line_price_excl_yen,
                 line_price_incl_yen,
                 planned_unit_cell,
@@ -1003,11 +999,17 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
         return None
     if not raw:
         return pd.DataFrame(columns=EXPECTED_HEADERS)
+    header0 = [("" if c is None else str(c)).strip() for c in raw[0]]
     rows = raw[1:]
     n = len(EXPECTED_HEADERS)
+    drop_unit_j: int | None = None
+    if LEGACY_COL_UNIT_PRICE in header0:
+        drop_unit_j = header0.index(LEGACY_COL_UNIT_PRICE)
 
     def pad(row: list[Any]) -> list[str]:
         r = [("" if c is None else str(c)) for c in list(row)]
+        if drop_unit_j is not None and drop_unit_j < len(r):
+            r = r[:drop_unit_j] + r[drop_unit_j + 1 :]
         if len(r) < n:
             r.extend([""] * (n - len(r)))
         return r[:n]
@@ -1122,21 +1124,13 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
         return d
     d[COL_DATETIME] = pd.to_datetime(d[COL_DATETIME], errors="coerce")
     qty = _series_to_numeric_loose(d[COL_QTY]).fillna(0)
-    unit_ex = (
-        _series_to_numeric_loose(d[COL_PRICE_UNIT]).fillna(0)
-        if COL_PRICE_UNIT in d.columns
-        else pd.Series(0.0, index=d.index)
-    )
     line_stored_ex = _series_to_numeric_loose(d[COL_PRICE_EXCL]).fillna(0)
     line_stored_in = _series_to_numeric_loose(d[COL_PRICE_INCL]).fillna(0)
     movement = d[COL_TYPE].astype(str).str.strip()
     is_in = movement.str.startswith("入庫")
     is_out = movement.str.startswith("出庫")
-    # 単価列なし: 旧形式（金額列を単価相当として数量倍）。
-    # 単価列あり: 税抜・税込の行金額列を優先。未入力・0 のときは数量×単価で補完（グラフと合計の欠損を防ぐ）。
-    line_ex = line_stored_ex.mask(unit_ex <= 0, qty * line_stored_ex)
-    line_needs_derive_ex = (unit_ex > 0) & (line_stored_ex.fillna(0) <= 0)
-    line_ex = line_ex.mask(line_needs_derive_ex, qty * unit_ex)
+    # 税抜・税込はいずれも行合計として解釈（仕入単価列は廃止）
+    line_ex = line_stored_ex.astype(float)
     # 税抜が取り込めず 0 のままだが税込と数量がある行は、税込から税抜を逆算する
     mask_ex_from_incl = (
         (line_ex.fillna(0) <= 0)
@@ -1148,8 +1142,8 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
             lambda v: float(_estimate_excl_yen_from_incl_yen(_finite_int(v, 0)))
         )
         line_ex = line_ex.where(~mask_ex_from_incl, fill_ex)
-    line_in = line_stored_in.mask(unit_ex <= 0, qty * line_stored_in)
-    line_needs_derive_in = (unit_ex > 0) & (line_stored_in.fillna(0) <= 0)
+    line_in = line_stored_in.astype(float)
+    line_needs_derive_in = line_stored_in.fillna(0) <= 0
     _ex_int = line_ex.fillna(0).round().clip(lower=0).astype(int)
     line_in = line_in.mask(line_needs_derive_in, _ex_int.map(price_incl_tax).astype(float))
     line_ex = line_ex.fillna(0).replace([np.inf, -np.inf], 0)
@@ -1191,9 +1185,8 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     st.caption(
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
         f"金額はシートの「{COL_PRICE_EXCL}」「{COL_PRICE_INCL}」列を行合計として集計します。"
-        "（仕入単価列が空の旧行は、仕入金額列を単価相当として数量倍します。"
-        "仕入単価があるのに税抜の仕入金額が空の行は、数量×仕入単価で補います。"
-        "税抜の仕入金額が空で仕入税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
+        f"仕入先・取引先別の粗利は「{COL_GROSS_PROFIT}」列を合算しています（税抜・台帳保存時の値）。"
+        "（税抜の仕入金額が空で税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
         "カンマ区切り・円記号付きの数値も読み取ります。）"
     )
     if df.empty:
@@ -1201,7 +1194,12 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         return
 
     df_in = df.copy()
-    for _col in (COL_QTY, COL_PRICE_UNIT, COL_PRICE_EXCL, COL_PRICE_INCL):
+    for _col in (
+        COL_QTY,
+        COL_PRICE_EXCL,
+        COL_PRICE_INCL,
+        COL_GROSS_PROFIT,
+    ):
         if _col in df_in.columns:
             df_in[_col] = (
                 _series_to_numeric_loose(df_in[_col])
@@ -1271,26 +1269,33 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     m1.metric("入庫 合計数量", f"{q_in:,}")
     m2.metric("出庫 合計数量", f"{q_out:,}")
     m3.metric("差し引き 数量（入−出）", f"{q_net:,}")
-    m5, m6, m7, m8 = st.columns(4)
+    m5, m6, m7, m8, m9 = st.columns(5)
     m5.metric("入庫 合計金額（税抜）", f"¥{ex_in:,}")
     m6.metric("出庫 合計金額（税抜）", f"¥{ex_out:,}")
     m7.metric("差し引き 税抜（入−出）", f"¥{ex_net:,}")
     m8.metric("差し引き 税込（入−出）", f"¥{in_net:,}")
+    with m9:
+        if COL_GROSS_PROFIT in flt.columns:
+            gp_tot = _finite_int(
+                _series_to_numeric_loose(flt[COL_GROSS_PROFIT]).fillna(0).sum(), 0
+            )
+            st.metric("粗利合計（税抜）", f"¥{gp_tot:,}")
+        else:
+            st.metric("粗利合計（税抜）", "—")
 
-    st.markdown("##### 仕入先・取引先別サマリー（税抜金額・数量）")
+    st.markdown("##### 仕入先・取引先別サマリー（税抜金額・数量・粗利）")
     sup_col = "仕入先・取引先"
     g = flt.assign(**{sup_col: flt[COL_SUPPLIER].fillna("(未設定)").astype(str)})
-    grp = (
-        g.groupby(sup_col, dropna=False)
-        .agg(
-            入庫数量=("_qty_in", "sum"),
-            出庫数量=("_qty_out", "sum"),
-            入庫金額税抜=("_amt_ex_in", "sum"),
-            出庫金額税抜=("_amt_ex_out", "sum"),
-        )
-        .reset_index()
-    )
-    for _gc in ("入庫数量", "出庫数量", "入庫金額税抜", "出庫金額税抜"):
+    _agg_sup: dict[str, tuple[str, str]] = {
+        "入庫数量": ("_qty_in", "sum"),
+        "出庫数量": ("_qty_out", "sum"),
+        "入庫金額税抜": ("_amt_ex_in", "sum"),
+        "出庫金額税抜": ("_amt_ex_out", "sum"),
+    }
+    if COL_GROSS_PROFIT in g.columns:
+        _agg_sup["粗利合計"] = (COL_GROSS_PROFIT, "sum")
+    grp = g.groupby(sup_col, dropna=False).agg(**_agg_sup).reset_index()
+    for _gc in ("入庫数量", "出庫数量", "入庫金額税抜", "出庫金額税抜", "粗利合計"):
         if _gc in grp.columns:
             grp[_gc] = (
                 pd.to_numeric(grp[_gc], errors="coerce")
@@ -1526,6 +1531,49 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         )
         st.altair_chart(sup_chart, use_container_width=True)
 
+    if "粗利合計" in grp.columns:
+        st.markdown("##### 仕入先・取引先別 粗利（税抜・上位15件）")
+        st.caption(
+            f"台帳の「{COL_GROSS_PROFIT}」列を仕入先・取引先ごとに合算しています。"
+            "並びは粗利の絶対値が大きい順です（マイナスも含みます）。"
+        )
+        gp_ch = (
+            grp[[sup_col, "粗利合計"]]
+            .assign(
+                粗利合計=lambda x: pd.to_numeric(
+                    x["粗利合計"], errors="coerce"
+                ).fillna(0.0)
+            )
+            .assign(_abs=lambda x: x["粗利合計"].abs())
+            .sort_values("_abs", ascending=False)
+            .drop(columns=["_abs"])
+            .head(15)
+        )
+        if not gp_ch.empty:
+            g_order = gp_ch[sup_col].astype(str).tolist()
+            gp_bar = (
+                alt.Chart(gp_ch)
+                .mark_bar()
+                .encode(
+                    x=alt.X(
+                        f"{sup_col}:N",
+                        sort=g_order,
+                        axis=alt.Axis(title=sup_col, labelAngle=-45),
+                    ),
+                    y=alt.Y(
+                        "粗利合計:Q",
+                        title="粗利（税抜・円）",
+                        axis=alt.Axis(format=",.0f"),
+                    ),
+                    tooltip=[
+                        alt.Tooltip(f"{sup_col}:N", title=sup_col),
+                        alt.Tooltip("粗利合計:Q", title="粗利（円）", format=",.0f"),
+                    ],
+                )
+                .properties(height=380)
+            )
+            st.altair_chart(gp_bar, use_container_width=True)
+
 
 def _render_inventory_price_summary(df: pd.DataFrame) -> None:
     """在庫中の行について、合計原価・販売予定（税抜行計・税込総額）・想定粗利を表示する。"""
@@ -1670,8 +1718,9 @@ def _init_registration_form_session_state() -> None:
         st.session_state.ai_parse_ran = False
     if "field_memo" not in st.session_state:
         st.session_state.field_memo = ""
-    if "field_unit_price_excl" not in st.session_state:
-        st.session_state.field_unit_price_excl = 1
+    if "field_line_excl_yen" not in st.session_state:
+        st.session_state.field_line_excl_yen = 1
+    st.session_state.pop("field_unit_price_excl", None)
     if "field_consumption_tax_choice" not in st.session_state:
         st.session_state.field_consumption_tax_choice = "10%"
     if "field_planned_sale_excl" not in st.session_state:
@@ -1734,7 +1783,7 @@ def main():
             st.session_state.ai_features = ""
             st.session_state.ai_parse_ran = False
             st.session_state.field_memo = ""
-            st.session_state.field_unit_price_excl = 1
+            st.session_state.field_line_excl_yen = 1
             st.session_state.field_planned_sale_excl = 0
             st.session_state.field_actual_sale_excl = 0
             st.session_state.field_stock_status = STATUS_IN_STOCK
@@ -1752,7 +1801,7 @@ def main():
                 result = _parse_json_from_model(raw_text or "")
                 _apply_gemini_json_to_session(result)
                 st.success(
-                    "解析が完了しました。必要に応じて商品名・仕入先・取引先・数量・仕入単価を修正してください。"
+                    "解析が完了しました。必要に応じて商品名・仕入先・取引先・数量・仕入金額（税抜）を修正してください。"
                 )
             except Exception as e:
                 st.warning(
@@ -1766,7 +1815,7 @@ def main():
         st.write(f"**推定種類:** {st.session_state.ai_kind or '—'}")
         st.write(f"**推定数量:** {int(st.session_state.field_qty)}")
         st.write(
-            f"**推定仕入単価（税抜）:** ¥{int(st.session_state.field_unit_price_excl):,}"
+            f"**推定仕入金額（税抜・1点）:** ¥{int(st.session_state.field_line_excl_yen):,}"
         )
         st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
 
@@ -1837,16 +1886,16 @@ def main():
         help="台帳は **1点1行** で保存します。行数は常にこの数量と同じです（写真は1枚まで・複数点のときは同じ画像URLを各行に入れます）。",
     )
 
-    unit_price_excl = st.number_input(
-        "仕入単価（税抜・必須）",
+    line_excl_yen = st.number_input(
+        "仕入金額（税抜・必須）",
         min_value=1,
         step=1,
-        key="field_unit_price_excl",
-        help="1点あたりの税抜単価（円）。台帳の各行は数量1・税抜行計＝この単価です。",
+        key="field_line_excl_yen",
+        help="1点あたりの税抜の仕入金額（円）。台帳の各行は数量1で、この金額が税抜行計になります。",
     )
 
     st.radio(
-        "消費税（仕入税込金額の計算）",
+        "消費税（仕入金額（税込）の計算）",
         options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
         horizontal=True,
         key="field_consumption_tax_choice",
@@ -1857,9 +1906,9 @@ def main():
     )
 
     _q = int(quantity)
-    _u = int(unit_price_excl)
+    _lex_inp = int(line_excl_yen)
     _n_save = _q
-    _line_ex_one = _u
+    _line_ex_one = _lex_inp
     _line_in_one = price_incl_tax(_line_ex_one, _tax_r)
 
     price_row = st.columns([1, 1, 1])
@@ -1870,7 +1919,7 @@ def main():
             f"写真があるとき、数量が2以上なら **同じ画像URLを全行** に記録します。"
         )
     with price_row[1]:
-        st.metric("仕入税込金額（1点・自動）", f"¥{_line_in_one:,}")
+        st.metric("仕入金額（税込・1点・自動）", f"¥{_line_in_one:,}")
         _tl = st.session_state.get("field_consumption_tax_choice", "10%")
         if _tl == "非課税":
             st.caption("非課税のため税込＝税抜行合計")
@@ -1910,7 +1959,7 @@ def main():
     )
     _pl_u = int(planned_sale_excl)
     _act_u = int(actual_sale_excl)
-    _cogs_preview = _u
+    _cogs_preview = _lex_inp
     _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
         1, _pl_u, _act_u, _st, _tax_r
     )
@@ -1971,13 +2020,12 @@ def main():
         elif not (supplier or "").strip():
             st.error("仕入先・取引先を入力してください。")
             validation_ok = False
-        elif int(unit_price_excl) < 1:
-            st.error("仕入単価（税抜）を1円以上で入力してください。")
+        elif int(line_excl_yen) < 1:
+            st.error("仕入金額（税抜）を1円以上で入力してください。")
             validation_ok = False
 
         if validation_ok:
-            _u2 = int(unit_price_excl)
-            _lex_one = _u2
+            _lex_one = int(line_excl_yen)
             _tax_r2 = _consumption_tax_rate_from_choice_label(
                 str(st.session_state.get("field_consumption_tax_choice", "10%"))
             )
@@ -2034,7 +2082,6 @@ def main():
                                     movement,
                                     product_name.strip(),
                                     supplier.strip(),
-                                    _u2,
                                     _lex_one,
                                     _lin_one,
                                     urls[i],
