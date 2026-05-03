@@ -45,7 +45,7 @@ import json
 import math
 import re
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import altair as alt
@@ -1125,6 +1125,15 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def _ledger_dashboard_date_bounds(df: pd.DataFrame) -> tuple[date, date]:
+    """台帳の日時列から From/To の既定値（JST 日付）。有効な日付が無いときは今日（JST）。"""
+    s = pd.to_datetime(df[COL_DATETIME], errors="coerce").dropna()
+    if s.empty:
+        t = jst_now().date()
+        return t, t
+    return s.min().date(), s.max().date()
+
+
 def _altair_y_scale_positive(s: pd.Series) -> alt.Scale:
     """金額がすべて 0 のときでも棒グラフが潰れないよう Y 軸上限を確保する。"""
     v = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -1161,50 +1170,49 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     ad = _prepare_ledger_analysis(df_in)
     ad_f = ad.dropna(subset=[COL_DATETIME], how="all")
 
-    p1, p2, p3, p4 = st.columns(4)
+    d_lo, d_hi = _ledger_dashboard_date_bounds(ad_f)
+    p1, p2, p3 = st.columns([1, 1, 2])
     with p1:
-        period = st.radio(
-            "期間",
-            ("全期間", "年を指定", "月を指定"),
-            horizontal=True,
-            key="dash_period_mode",
+        date_from = st.date_input(
+            "開始日（From）",
+            value=d_lo,
+            min_value=date(1970, 1, 1),
+            max_value=date(2100, 12, 31),
+            key="dash_date_from",
         )
-    years = sorted(ad_f["_year"].dropna().unique().astype(int).tolist(), reverse=True)
-    months = list(range(1, 13))
     with p2:
-        year_sel = st.selectbox(
-            "年",
-            options=years if years else [jst_now().year],
-            key="dash_year_sel",
-            disabled=period == "全期間",
+        date_to = st.date_input(
+            "終了日（To）",
+            value=d_hi,
+            min_value=date(1970, 1, 1),
+            max_value=date(2100, 12, 31),
+            key="dash_date_to",
         )
     with p3:
-        month_sel = st.selectbox(
-            "月",
-            options=months,
-            format_func=lambda m: f"{m}月",
-            key="dash_month_sel",
-            disabled=period != "月を指定",
-        )
-    with p4:
         supplier_filter = st.multiselect(
             "仕入先・取引先で絞り込み（未選択は全件）",
             options=sorted(ad_f[COL_SUPPLIER].fillna("").astype(str).unique().tolist()),
             key="dash_supplier_filter",
         )
 
-    flt = ad_f
-    if period == "年を指定":
-        flt = flt[flt["_year"] == int(year_sel)]
-    elif period == "月を指定":
-        flt = flt[(flt["_year"] == int(year_sel)) & (flt["_month"] == int(month_sel))]
+    dfb = date_from
+    dtb = date_to
+    if dfb > dtb:
+        st.warning("開始日が終了日より後です。入れ替えて集計します。")
+        dfb, dtb = dtb, dfb
+
+    row_ts = pd.to_datetime(ad_f[COL_DATETIME], errors="coerce")
+    row_day = row_ts.dt.normalize()
+    from_ts = pd.Timestamp(datetime.combine(dfb, datetime.min.time()))
+    to_ts = pd.Timestamp(datetime.combine(dtb, datetime.min.time()))
+    flt = ad_f[(row_day >= from_ts) & (row_day <= to_ts)]
     if supplier_filter:
         flt = flt[flt[COL_SUPPLIER].astype(str).isin(supplier_filter)]
 
     if flt.empty:
         st.warning(
             "条件に一致するデータがありません。"
-            "期間を「全期間」にするか、年・月・仕入先の絞り込みを見直してください。"
+            "From〜To の日付範囲または仕入先・取引先の絞り込みを見直してください。"
         )
         return
 
@@ -1377,7 +1385,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     st.caption(
         "その月までの入庫・出庫それぞれの税抜金額の**累計**（いわゆる累積）を、"
         "各月で入庫・出庫の2本の棒として並べたグラフです。"
-        "上の期間・仕入先・取引先の絞り込みに従います。"
+        "上の From〜To・仕入先・取引先の絞り込みに従います。"
     )
     if not monthly.empty:
         month_order_c = monthly["_ym"].astype(str).tolist()
@@ -1640,6 +1648,7 @@ def main():
     st.set_page_config(page_title="商品在庫・販売", layout="wide")
     st.title("商品在庫・販売管理")
     st.caption("写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・スプレッドシート記録ができます。")
+    st.subheader("台帳登録")
 
     _init_registration_form_session_state()
 
