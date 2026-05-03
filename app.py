@@ -116,6 +116,12 @@ STATUS_IN_STOCK = "在庫中"
 STATUS_SOLD = "販売済"
 STOCK_STATUS_OPTIONS: tuple[str, ...] = (STATUS_IN_STOCK, STATUS_SOLD)
 
+
+def _movement_is_outbound(mv: str) -> bool:
+    """入出庫種別が出庫（販売・浮貸など）かどうか。"""
+    return (mv or "").strip().startswith("出庫")
+
+
 CONSUMPTION_TAX_RATE = 0.10
 CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
     "10%": 0.10,
@@ -2275,6 +2281,8 @@ def main():
         ("入庫（購入）", "入庫（返品）", "出庫（販売）", "出庫（浮貸）"),
         horizontal=True,
     )
+    if _movement_is_outbound(movement):
+        st.session_state.field_qty = 1
 
     col_a, col_b, col_c = st.columns([1, 1, 1])
     with col_a:
@@ -2453,13 +2461,29 @@ def main():
                 hide_index=True,
             )
 
-    quantity = st.number_input(
-        "数量（点数）",
-        min_value=1,
-        step=1,
-        key="field_qty",
-        help="台帳は **1点1行** で保存します。行数は常にこの数量と同じです（写真は1枚まで・複数点のときは同じ画像URLを各行に入れます）。",
-    )
+    _outbound_mv = _movement_is_outbound(movement)
+    if _outbound_mv:
+        st.caption(
+            "区分が **出庫** のときは、数量は **1** に固定され、この欄は **変更できません**（台帳は1点1行）。"
+        )
+        st.number_input(
+            "数量（点数）",
+            min_value=1,
+            max_value=1,
+            step=1,
+            key="field_qty",
+            disabled=True,
+            help="出庫のため 1 のみです。区分を入庫に切り替えると数量を変更できます。",
+        )
+        quantity = 1
+    else:
+        quantity = st.number_input(
+            "数量（点数）",
+            min_value=1,
+            step=1,
+            key="field_qty",
+            help="台帳は **1点1行** で保存します。行数は常にこの数量と同じです（写真は1枚まで・複数点のときは同じ画像URLを各行に入れます）。",
+        )
 
     line_excl_yen = st.number_input(
         "仕入金額（税抜・必須）",
@@ -2480,7 +2504,7 @@ def main():
         str(st.session_state.get("field_consumption_tax_choice", "10%"))
     )
 
-    _q = int(quantity)
+    _q = 1 if _outbound_mv else int(quantity)
     _lex_inp = int(line_excl_yen)
     _n_save = _q
     _line_ex_one = _lex_inp
@@ -2489,10 +2513,14 @@ def main():
     price_row = st.columns([1, 1, 1])
     with price_row[0]:
         st.metric("仕入金額（税抜・1点）", f"¥{_line_ex_one:,}")
-        st.caption(
+        _cap_rows = (
             f"確定時は **{_n_save} 行**（各行 数量1）。税抜合計（参考） ¥{_line_ex_one * _n_save:,}。"
-            f"写真があるとき、数量が2以上なら **同じ画像URLを全行** に記録します。"
         )
+        if not _outbound_mv and _n_save > 1:
+            _cap_rows += (
+                "写真があるとき、数量が2以上なら **同じ画像URLを全行** に記録します。"
+            )
+        st.caption(_cap_rows)
     with price_row[1]:
         st.metric("仕入金額（税込・1点・自動）", f"¥{_line_in_one:,}")
         _tl = st.session_state.get("field_consumption_tax_choice", "10%")
@@ -2658,7 +2686,7 @@ def main():
                     st.session_state.get("field_sale_source_mgmt_id", "") or ""
                 ).strip()
 
-            _q2 = int(quantity)
+            _q2 = 1 if _movement_is_outbound(movement) else int(quantity)
             n_save = _q2
             urls: list[str] = [""] * n_save
             _record_dt = jst_now_str()
