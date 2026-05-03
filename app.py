@@ -1514,7 +1514,7 @@ def _render_inventory_price_summary(df: pd.DataFrame) -> None:
 
 def render_inventory_manager() -> None:
     st.divider()
-    st.subheader("在庫一覧")
+    st.markdown("##### 在庫一覧")
     st.caption(
         "スプレッドシートの全データを編集できます。行の追加・削除は表から操作し、"
         "表の直下の「台帳を更新する」でシートを上書き保存します。"
@@ -1878,7 +1878,7 @@ def main():
             "—" if _gp_preview is None else f"¥{int(_gp_preview):,}",
         )
 
-    st.subheader("補足情報（任意）")
+    st.markdown("##### 補足情報（任意）")
     memo = st.text_area(
         "メモ（任意）",
         key="field_memo",
