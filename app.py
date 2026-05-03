@@ -18,7 +18,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 ※ 画像の Gemini 解析は **google-generativeai** で ``genai.GenerativeModel('gemini-3-flash-preview')`` を使用します
   （``models/`` プレフィックス・api_version は指定しません）。
-※ アップロード画像は Pillow で長辺最大1280px・JPEG品質80に変換したうえで解析・ドライブ保存します。
+※ アップロード画像は任意。ある場合のみ Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
 画面下部の「在庫一覧マネージャー」で、同一スプレッドシートを表形式で読み書きし、
@@ -1119,7 +1119,7 @@ def render_inventory_manager() -> None:
 def main():
     st.set_page_config(page_title="商品 在庫・販売", layout="wide")
     st.title("商品 在庫・販売管理")
-    st.caption("写真アップロード・AI解析・Googleドライブ保存・スプレッドシート記録")
+    st.caption("写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・スプレッドシート記録ができます。")
 
     # --- session 初期化（フォームは key で状態管理） ---
     if "field_product_name" not in st.session_state:
@@ -1160,12 +1160,13 @@ def main():
     st.caption("開発モード: secrets の起動時チェックをスキップしています（AI解析の確認用）。")
 
     uploaded = st.file_uploader(
-        "商品写真（カメラで撮影した画像をアップロード）",
+        "商品写真（任意・カメラやギャラリーからアップロード）",
         type=["jpg", "jpeg", "png", "webp"],
     )
     st.caption(
-        "AI解析・ドライブ保存のいずれも、EXIF向き補正のうえ長辺最大1280px・JPEG品質80％へ変換してから行います（軽量化）。"
-        "台帳の日時は EXIF の撮影日時が使えない場合は日本時間（JST）の現在時刻になります。"
+        "写真がある場合のみ、EXIF向き補正のうえ長辺最大1280px・JPEG品質80％へ変換してから AI 解析・ドライブ保存します。"
+        "台帳の日時は写真があるとき EXIF の撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
+        "必須項目だけでも確定して台帳記録できます（画像URLは空欄になります）。"
     )
 
     movement = st.radio(
@@ -1266,7 +1267,10 @@ def main():
         placeholder="備考・社内メモなどがあれば入力してください",
     )
 
-    confirm = st.button("確定（ドライブ保存・スプレッドシート記録）", type="primary", disabled=uploaded is None)
+    confirm = st.button(
+        "確定（スプレッドシート記録・写真は任意でドライブ保存）",
+        type="primary",
+    )
 
     if confirm:
         validation_ok = True
@@ -1279,63 +1283,67 @@ def main():
         elif int(unit_price_excl) < 1:
             st.error("商品単価（税抜）を1円以上で入力してください。")
             validation_ok = False
-        elif uploaded is None:
-            st.error("画像をアップロードしてください。")
-            validation_ok = False
 
         if validation_ok:
-            safe_base = re.sub(r"[^\w\-_.]", "_", uploaded.name.rsplit(".", 1)[0])[:80]
-            raw_bytes = uploaded.getvalue()
-            _record_dt = capture_datetime_jst_from_bytes(raw_bytes) or jst_now_str()
+            _q2 = int(quantity)
+            _u2 = int(unit_price_excl)
+            _lex = _q2 * _u2
+            _tax_r2 = _consumption_tax_rate_from_choice_label(
+                str(st.session_state.get("field_consumption_tax_choice", "10%"))
+            )
+            _lin = price_incl_tax(_lex, _tax_r2)
+            memo_s = (memo or "").strip()
 
-            try:
-                with st.spinner("画像をリサイズ・圧縮しています…"):
-                    data, mime = prepare_upload_image_jpeg(raw_bytes)
-            except Exception as e:
-                st.error(f"画像の処理に失敗しました: {e}")
-            else:
-                fname = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
+            url = ""
+            _record_dt = jst_now_str()
+            ready_for_sheet = True
 
-                with st.spinner("Googleドライブに保存しています…"):
+            if uploaded is not None:
+                safe_base = re.sub(r"[^\w\-_.]", "_", uploaded.name.rsplit(".", 1)[0])[
+                    :80
+                ]
+                raw_bytes = uploaded.getvalue()
+                _record_dt = capture_datetime_jst_from_bytes(raw_bytes) or jst_now_str()
+                try:
+                    with st.spinner("画像をリサイズ・圧縮しています…"):
+                        data, mime = prepare_upload_image_jpeg(raw_bytes)
+                except Exception as e:
+                    st.error(f"画像の処理に失敗しました: {e}")
+                    ready_for_sheet = False
+                else:
+                    fname = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
+                    with st.spinner("Googleドライブに保存しています…"):
+                        try:
+                            url = upload_image_to_drive(fname, mime, data)
+                        except Exception as e:
+                            st.error(f"ドライブ保存に失敗しました: {e}")
+                            ready_for_sheet = False
+
+            if ready_for_sheet:
+                with st.spinner("スプレッドシートに記録しています…"):
                     try:
-                        url = upload_image_to_drive(fname, mime, data)
-                    except Exception as e:
-                        st.error(f"ドライブ保存に失敗しました: {e}")
-                    else:
-                        _q2 = int(quantity)
-                        _u2 = int(unit_price_excl)
-                        _lex = _q2 * _u2
-                        _tax_r2 = _consumption_tax_rate_from_choice_label(
-                            str(
-                                st.session_state.get(
-                                    "field_consumption_tax_choice", "10%"
-                                )
-                            )
+                        append_sheet_row(
+                            movement,
+                            product_name.strip(),
+                            supplier.strip(),
+                            _q2,
+                            _u2,
+                            _lex,
+                            _lin,
+                            url,
+                            memo_s,
+                            record_datetime=_record_dt,
                         )
-                        _lin = price_incl_tax(_lex, _tax_r2)
-
-                        with st.spinner("スプレッドシートに記録しています…"):
-                            try:
-                                append_sheet_row(
-                                    movement,
-                                    product_name.strip(),
-                                    supplier.strip(),
-                                    _q2,
-                                    _u2,
-                                    _lex,
-                                    _lin,
-                                    url,
-                                    (memo or "").strip(),
-                                    record_datetime=_record_dt,
-                                )
-                            except Exception as e:
-                                st.error(f"スプレッドシート更新に失敗しました: {e}")
-                                st.warning(f"画像は保存済みです: {url}")
-                            else:
-                                st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-                                st.success("記録しました。")
-                                st.markdown(f"[保存した画像を開く]({url})")
-                                st.balloons()
+                    except Exception as e:
+                        st.error(f"スプレッドシート更新に失敗しました: {e}")
+                        if url:
+                            st.warning(f"画像は保存済みです: {url}")
+                    else:
+                        st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+                        st.success("記録しました。")
+                        if url:
+                            st.markdown(f"[保存した画像を開く]({url})")
+                        st.balloons()
 
     render_inventory_manager()
 
