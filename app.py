@@ -28,7 +28,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
-  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日）
+  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID
   ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
@@ -40,6 +40,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※金額列（仕入〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
   ※粗利は税抜ベースで「販売済」なら（実売金額（税抜）×数量）−原価、「在庫中」なら（販売予定金額（税抜）×数量）−原価。台帳保存時に再計算します。
   ※「最後に確認した日付（棚卸日）」は棚卸作業用の任意列です（YYYY-MM-DD 推奨）。1人棚卸しの進捗把握に使います。
+  ※「販売元管理ID」は出庫（販売）などで、**売れた在庫行の入庫時管理ID（G########）** を紐付ける任意列です（追跡・照合用）。
 """
 
 from __future__ import annotations
@@ -109,6 +110,7 @@ COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
 COL_MANAGEMENT_ID = "管理ID"
 COL_LAST_STOCKTAKE = "最後に確認した日付（棚卸日）"
+COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
 
 STATUS_IN_STOCK = "在庫中"
 STATUS_SOLD = "販売済"
@@ -139,6 +141,7 @@ EXPECTED_HEADERS: list[str] = [
     COL_IMAGE_URL,
     COL_MANAGEMENT_ID,
     COL_LAST_STOCKTAKE,
+    COL_SALE_SOURCE_MGMT_ID,
 ]
 
 SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
@@ -556,6 +559,63 @@ def _apply_gemini_json_to_session(
     st.session_state.ai_parse_ran = True
 
 
+def _apply_gemini_sale_link_to_session(
+    result: dict[str, Any],
+    df_ledger: pd.DataFrame | None,
+) -> None:
+    """販売元管理ID（入庫時の管理ID）の写真照合結果を session_state に反映する。"""
+    st.session_state.pop("_sale_link_management_id", None)
+    st.session_state.pop("_sale_link_warn", None)
+    r = result
+    m = r.get("match")
+    if not isinstance(m, dict):
+        m = {}
+    mid = str(
+        m.get("management_id")
+        or m.get("管理ID")
+        or r.get("management_id")
+        or ""
+    ).strip()
+    conf = float(m.get("confidence") or r.get("confidence") or 0)
+    row_hit: pd.Series | None = None
+    if (
+        mid
+        and df_ledger is not None
+        and not df_ledger.empty
+        and COL_MANAGEMENT_ID in df_ledger.columns
+    ):
+        hits = df_ledger.loc[
+            df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid
+        ]
+        if len(hits) == 1:
+            row_hit = hits.iloc[0]
+    if not mid:
+        return
+    if row_hit is None:
+        st.session_state.field_sale_source_mgmt_id = mid
+        st.session_state["_sale_link_warn"] = (
+            f"管理ID {mid} が台帳に見つかりません。表記を確認するか手入力してください。"
+        )
+        return
+    stt_row = _normalize_stock_status(str(row_hit.get(COL_STOCK_STATUS, "")))
+    if stt_row != STATUS_IN_STOCK:
+        st.session_state["_sale_link_warn"] = (
+            f"管理ID {mid} はステータス「{stt_row}」です。通常は在庫中の行を紐付けます。"
+        )
+    st.session_state.field_sale_source_mgmt_id = mid
+    st.session_state["_sale_link_management_id"] = mid
+    if conf >= 0.72:
+        rpn = str(row_hit.get(COL_NAME, "") or "").strip()
+        rsu = str(row_hit.get(COL_SUPPLIER, "") or "").strip()
+        if rpn:
+            st.session_state.field_product_name = rpn
+        if rsu:
+            st.session_state.field_supplier = rsu
+        ly = _finite_int(row_hit.get(COL_PRICE_EXCL), 0)
+        if ly > 0:
+            st.session_state.field_line_excl_yen = ly
+
+
 def _gemini_input_image_from_upload(uploaded) -> Image.Image:
     """解析直前に ``prepare_upload_image_jpeg`` と同じ圧縮・リサイズを適用した PIL 画像を返す。"""
     jpeg_bytes, _ = prepare_upload_image_jpeg(uploaded.getvalue())
@@ -685,6 +745,7 @@ def analyze_image_with_gemini(
     image_data,
     *,
     inventory_context: str | None = None,
+    prompt_mode: str = "full",
 ) -> str:
     api_key = _secret_str(SECRET_GEMINI_API_KEY)
     if not api_key:
@@ -708,6 +769,28 @@ def analyze_image_with_gemini(
 
 同一行が見つからない場合は management_id を "" にし、confidence は 0.4 未満にしてください。
 """
+    if prompt_mode == "sale_link":
+        if not inventory_context or not inventory_context.strip():
+            raise ValueError(
+                "販売元の写真照合には、台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
+            )
+        prompt = f"""この画像は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（呉服店の在庫）。
+次のリストは台帳の **在庫中** の行だけです。写真と **同一の在庫1行** を選び、JSON だけを返してください（説明文・コードフェンス禁止）。
+
+{inventory_context.strip()}
+
+返却形式（キーは次のみ）:
+- "match" (object): 必須。フィールド:
+  - "management_id" (string): 選んだ行の管理ID（G########）。該当なしなら ""
+  - "confidence" (number): 0.0〜1.0
+  - "product_name" (string): その行の商品名（参考）
+  - "supplier" (string): その行の仕入先（参考）
+  - "line_price_excl" (integer or null): その行の仕入金額（税抜）
+
+該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
+        response = model.generate_content([prompt, image_data])
+        return response.text or ""
+
     prompt = f"""この画像は呉服店の在庫・売買用の商品写真です。次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
 説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
 
@@ -1078,6 +1161,7 @@ def append_sheet_row(
     actual_sale_unit_excl_yen: int = 0,
     stock_status: str = STATUS_IN_STOCK,
     consumption_tax_rate: float | None = None,
+    sale_source_management_id: str = "",
 ):
     """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。"""
     ws = ensure_worksheet_header()
@@ -1137,6 +1221,7 @@ def append_sheet_row(
                 image_url,
                 management_id,
                 "",
+                (sale_source_management_id or "").strip(),
             ],
             value_input_option="USER_ENTERED",
         )
@@ -1211,6 +1296,16 @@ def _ledger_unique_col_values(df: pd.DataFrame, col: str, *, max_n: int = 800) -
     return sorted(set(s.tolist()), key=lambda x: (x.casefold(), x))[:max_n]
 
 
+def _ledger_in_stock_management_ids(df: pd.DataFrame, *, max_n: int = 600) -> list[str]:
+    """在庫中の行の管理ID一覧（販売元のプルダウン用）。"""
+    if df is None or df.empty or COL_MANAGEMENT_ID not in df.columns:
+        return []
+    sub = df.loc[_mask_ledger_in_stock(df)]
+    s = sub[COL_MANAGEMENT_ID].astype(str).str.strip()
+    s = s[s != ""]
+    return sorted(set(s.tolist()), key=lambda x: (x.casefold(), x))[:max_n]
+
+
 def _on_ledger_pick_product_name() -> None:
     v = st.session_state.get("ledger_pick_product_name", "")
     if v and v != LEDGER_PICK_PLACEHOLDER:
@@ -1223,6 +1318,13 @@ def _on_ledger_pick_supplier() -> None:
     if v and v != LEDGER_PICK_PLACEHOLDER:
         st.session_state.field_supplier = v
         st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+
+
+def _on_sale_pick_source_id() -> None:
+    v = st.session_state.get("sale_pick_source_id", "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.field_sale_source_mgmt_id = v
+        st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
 
 
 def _cell_value_for_sheet(v: Any) -> Any:
@@ -1984,6 +2086,11 @@ def render_inventory_manager() -> None:
             COL_LAST_STOCKTAKE,
             help=f"棚卸・実地確認した日（日本時間の暦日推奨）。例: {_today_jst_date().isoformat()}",
         )
+    if COL_SALE_SOURCE_MGMT_ID in df_sorted.columns:
+        _ledger_col_cfg[COL_SALE_SOURCE_MGMT_ID] = st.column_config.TextColumn(
+            COL_SALE_SOURCE_MGMT_ID,
+            help="出庫（販売）などで売れた在庫行の入庫時管理ID（G########）。登録画面の販売管理からも入力できます。",
+        )
 
     _editor_kw: dict[str, Any] = {
         "num_rows": "dynamic",
@@ -2067,6 +2174,10 @@ def _init_registration_form_session_state() -> None:
         st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
     if "ledger_pick_supplier" not in st.session_state:
         st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+    if "field_sale_source_mgmt_id" not in st.session_state:
+        st.session_state.field_sale_source_mgmt_id = ""
+    if "sale_pick_source_id" not in st.session_state:
+        st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
     st.session_state.pop("field_price_excl", None)
 
 
@@ -2128,8 +2239,12 @@ def main():
             st.session_state.hint_filter_supplier = ""
             st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
             st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+            st.session_state.field_sale_source_mgmt_id = ""
+            st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
             st.session_state.pop("ledger_quick_candidates", None)
             st.session_state.pop("_gemini_match_management_id", None)
+            st.session_state.pop("_sale_link_management_id", None)
+            st.session_state.pop("_sale_link_warn", None)
             st.rerun()
 
     if analyze and uploaded is not None:
@@ -2240,6 +2355,7 @@ def main():
                     COL_SUPPLIER,
                     COL_PRICE_EXCL,
                     COL_LAST_STOCKTAKE,
+                    COL_SALE_SOURCE_MGMT_ID,
                 )
                 if c in _cand.columns
             ]
@@ -2298,14 +2414,13 @@ def main():
             st.caption(f"消費税{_tl}を行合計に四捨五入")
     with price_row[2]:
         st.caption(
-            "原価は各行の仕入金額（税抜）です。**販売予定金額（税抜）**と**実売金額（税抜）**には1点あたりの税抜金額を入力し、台帳では各行数量1として税抜行計と税込総額を記録します。"
+            "原価は各行の仕入金額（税抜）です。販売予定・実売・販売元の詳細は下の **価格管理／販売管理** で入力します。"
         )
 
     st.markdown("##### 価格管理（任意）")
     st.caption(
-        "**販売予定金額（税抜）**と**実売金額（税抜）**は、いずれも **1点あたりの税抜金額（円）** です。税込総額は「税抜列×数量」した合計に、上の消費税と同じ税率を掛けて四捨五入します。"
-        "ステータスが「販売済」のときのみ実売金額（税抜）・実売金額（税込）を記録し、粗利は税抜で「実売行計−原価」です。"
-        "「在庫中」のときは「販売予定行計−原価」で粗利を計算します。"
+        "「販売予定金額（税抜）」は **1点あたりの税抜金額（円）** です。"
+        "「在庫中」のときは販売予定行計−原価で粗利の参考になります（下のプレビュー）。"
     )
     planned_sale_excl = st.number_input(
         "販売予定金額（税抜・任意）",
@@ -2313,6 +2428,80 @@ def main():
         step=1,
         key="field_planned_sale_excl",
         help="1点あたり。0 のとき台帳では空欄。税抜行計・税込総額は各行数量1として自動計算します。",
+    )
+
+    st.markdown("##### 販売管理（任意）")
+    st.caption(
+        "実売・ステータス・**販売元管理ID**（売れた在庫の入庫時の管理ID）をまとめて扱います。"
+        "区分が **出庫（販売）** のとき、下の写真で **販売元を写真から照合** すると在庫中の行と照らし合わせ、"
+        f"台帳の「{COL_SALE_SOURCE_MGMT_ID}」列に記録できるようにします（フォーム上部の写真とは別枠です）。"
+    )
+    sale_q_upload = st.file_uploader(
+        "販売照合用の写真（任意・1枚）",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="sale_quick_search_upload",
+        help="販売した商品の写真から、在庫中のどの管理IDに相当するかを AI で推定します。",
+    )
+    sq_a, sq_b = st.columns([1, 2])
+    with sq_a:
+        sale_photo_analyze = st.button(
+            "販売元を写真から照合",
+            type="secondary",
+            key="sale_quick_analyze_btn",
+            disabled=sale_q_upload is None,
+        )
+    with sq_b:
+        if movement == "出庫（販売）":
+            st.caption("出庫（販売）のときは、販売元管理IDの入力を推奨します。")
+
+    if sale_photo_analyze and sale_q_upload is not None:
+        with st.spinner("販売元を照合しています…"):
+            try:
+                img_sq = _gemini_input_image_from_upload(sale_q_upload)
+                inv_sq = ""
+                if df_ledger_hint is not None and not df_ledger_hint.empty:
+                    inv_sq = _build_gemini_inventory_context(df_ledger_hint)
+                raw_sq = analyze_image_with_gemini(
+                    img_sq,
+                    inventory_context=inv_sq or None,
+                    prompt_mode="sale_link",
+                )
+                res_sq = _parse_json_from_model(raw_sq or "")
+                _apply_gemini_sale_link_to_session(res_sq, df_ledger_hint)
+                _refresh_ledger_quick_search_candidates(df_ledger_hint)
+                st.success("販売元の候補を反映しました。内容を確認し、必要なら修正してください。")
+            except Exception as e:
+                st.warning(str(e))
+
+    _swarn = st.session_state.pop("_sale_link_warn", None)
+    if _swarn:
+        st.warning(_swarn)
+    _sale_link_flash = st.session_state.pop("_sale_link_management_id", None)
+    if _sale_link_flash:
+        st.info(
+            f"販売元として **{_sale_link_flash}** をセットしました。"
+            "（信頼度が高いときは商品名・仕入先・仕入金額（税抜）も台帳の行に合わせています。）"
+        )
+
+    if df_ledger_hint is not None and not df_ledger_hint.empty:
+        _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
+        if _sale_id_opts:
+            st.selectbox(
+                "在庫中の管理IDから販売元を選ぶ",
+                options=[LEDGER_PICK_PLACEHOLDER] + _sale_id_opts,
+                key="sale_pick_source_id",
+                on_change=_on_sale_pick_source_id,
+            )
+    st.text_input(
+        "販売元管理ID（手入力・例 G00000001）",
+        key="field_sale_source_mgmt_id",
+        placeholder="売れた在庫行の管理ID",
+    )
+
+    st.caption(
+        "**実売金額（税抜）**は **1点あたりの税抜金額（円）** です。税込総額は「税抜列×数量」した合計に、上の消費税と同じ税率を掛けて四捨五入します。"
+        "ステータスが「販売済」のときのみ実売金額（税抜）・実売金額（税込）を台帳に記録し、粗利は税抜で「実売行計−原価」です。"
+        "「在庫中」のときは「販売予定行計−原価」で粗利を計算します。"
     )
     st.selectbox(
         "ステータス（在庫中／販売済）",
@@ -2409,6 +2598,11 @@ def main():
             if _stat2 not in STOCK_STATUS_OPTIONS:
                 _stat2 = STATUS_IN_STOCK
             memo_s = (memo or "").strip()
+            _sale_src_save = ""
+            if movement == "出庫（販売）":
+                _sale_src_save = str(
+                    st.session_state.get("field_sale_source_mgmt_id", "") or ""
+                ).strip()
 
             _q2 = int(quantity)
             n_save = _q2
@@ -2463,6 +2657,7 @@ def main():
                                     actual_sale_unit_excl_yen=_act_ex2,
                                     stock_status=_stat2,
                                     consumption_tax_rate=_tax_r2,
+                                    sale_source_management_id=_sale_src_save,
                                 )
                     except Exception as e:
                         st.error(f"スプレッドシート更新に失敗しました: {e}")
@@ -2472,7 +2667,12 @@ def main():
                             )
                     else:
                         st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-                        st.success(f"記録しました（{n_save} 行・1点1行）。管理IDを自動付与しています。")
+                        _msg_ok = (
+                            f"記録しました（{n_save} 行・1点1行）。管理IDを自動付与しています。"
+                        )
+                        if _sale_src_save:
+                            _msg_ok += f" 販売元管理ID: {_sale_src_save}"
+                        st.success(_msg_ok)
                         _link_urls = list(dict.fromkeys(u for u in urls if u))
                         for _uurl in _link_urls[:8]:
                             st.markdown(f"[保存した画像を開く]({_uurl})")
