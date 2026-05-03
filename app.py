@@ -277,8 +277,10 @@ def _parse_json_from_model(text: str) -> dict[str, Any]:
     return json.loads(t)
 
 
-def _pillow_image(uploaded) -> Image.Image:
-    return Image.open(io.BytesIO(uploaded.getvalue())).convert("RGB")
+def _gemini_input_image_from_upload(uploaded) -> Image.Image:
+    """確定保存と同じ ``prepare_upload_image_jpeg`` で軽量化してから開く（Gemini のペイロード超過対策）。"""
+    jpeg_bytes, _ = prepare_upload_image_jpeg(uploaded.getvalue())
+    return Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
 
 
 def price_incl_tax(price_excl_yen: int) -> int:
@@ -945,7 +947,7 @@ def main():
         type=["jpg", "jpeg", "png", "webp"],
     )
     st.caption(
-        "確定時に長辺最大1280px・JPEG品質80％へ自動変換してから保存します（軽量化）。"
+        "AI解析・ドライブ保存のいずれも、EXIF向き補正のうえ長辺最大1280px・JPEG品質80％へ変換してから行います（軽量化）。"
         "台帳の日時は EXIF の撮影日時が使えない場合は日本時間（JST）の現在時刻になります。"
     )
 
@@ -972,7 +974,7 @@ def main():
     if analyze and uploaded is not None:
         with st.spinner("画像を解析しています…"):
             try:
-                img = _pillow_image(uploaded)
+                img = _gemini_input_image_from_upload(uploaded)
                 raw_text = analyze_image_with_gemini(img)
                 result = _parse_json_from_model(raw_text or "")
                 st.session_state.field_qty = int(
