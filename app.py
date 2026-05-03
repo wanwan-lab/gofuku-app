@@ -1535,21 +1535,34 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         st.markdown("##### 仕入先・取引先別 粗利（税抜・上位15件）")
         st.caption(
             f"台帳の「{COL_GROSS_PROFIT}」列を仕入先・取引先ごとに合算しています。"
-            "並びは粗利の絶対値が大きい順です（マイナスも含みます）。"
+            "未販売は「在庫中」、販売済は「販売済」の行に限定します。"
+            "各グラフの並びは粗利の絶対値が大きい順です（マイナスも含みます）。"
         )
-        gp_ch = (
-            grp[[sup_col, "粗利合計"]]
-            .assign(
-                粗利合計=lambda x: pd.to_numeric(
-                    x["粗利合計"], errors="coerce"
-                ).fillna(0.0)
+
+        def _gp_supplier_top15_bar(sub: pd.DataFrame) -> None:
+            if sub.empty:
+                st.caption("該当する行がありません。")
+                return
+            gsub = sub.assign(**{sup_col: sub[COL_SUPPLIER].fillna("(未設定)").astype(str)})
+            gg = (
+                gsub.groupby(sup_col, dropna=False)
+                .agg(粗利合計=(COL_GROSS_PROFIT, "sum"))
+                .reset_index()
             )
-            .assign(_abs=lambda x: x["粗利合計"].abs())
-            .sort_values("_abs", ascending=False)
-            .drop(columns=["_abs"])
-            .head(15)
-        )
-        if not gp_ch.empty:
+            gg["粗利合計"] = (
+                pd.to_numeric(gg["粗利合計"], errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+            )
+            gp_ch = (
+                gg.assign(_abs=lambda x: x["粗利合計"].abs())
+                .sort_values("_abs", ascending=False)
+                .drop(columns=["_abs"])
+                .head(15)
+            )
+            if gp_ch.empty:
+                st.caption("該当するデータがありません。")
+                return
             g_order = gp_ch[sup_col].astype(str).tolist()
             gp_bar = (
                 alt.Chart(gp_ch)
@@ -1573,6 +1586,21 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
                 .properties(height=380)
             )
             st.altair_chart(gp_bar, use_container_width=True)
+
+        if COL_STOCK_STATUS not in flt.columns:
+            st.caption(
+                f"「{COL_STOCK_STATUS}」列がないため、未販売／販売済に分けず期間内の全体を表示します。"
+            )
+            st.markdown("###### 全体")
+            _gp_supplier_top15_bar(flt)
+        else:
+            sn = flt[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
+            flt_unsold = flt.loc[sn == STATUS_IN_STOCK]
+            flt_sold = flt.loc[sn == STATUS_SOLD]
+            st.markdown("###### 未販売（在庫中）")
+            _gp_supplier_top15_bar(flt_unsold)
+            st.markdown("###### 販売済")
+            _gp_supplier_top15_bar(flt_sold)
 
 
 def _render_inventory_price_summary(df: pd.DataFrame) -> None:
