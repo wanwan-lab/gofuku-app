@@ -29,8 +29,8 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入単価（税抜） | 仕入金額（税抜） | 仕入税込金額
   | 販売予定単価（税抜） | 販売予定金額（税込） | 実売単価（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID
-  ※在庫は **1点につき1行** で統一します。登録時は数量と写真枚数の大きい方の件数で行を分割し、各行の数量は **1** です。
-  ※数量が **2以上** で写真があるときは、**先頭の1枚** をドライブに保存し、分割した **全行に同じ画像URL** を入れます（数量が1で複数枚のときは従来どおり枚数ぶん別URL）。
+  ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
+  ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※仕入金額（税抜）は「数量×仕入単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
@@ -906,15 +906,6 @@ def allocate_management_ids(ws: Any, count: int) -> list[str]:
     return [f"G{mx + i + 1:08d}" for i in range(count)]
 
 
-def _coerce_uploaded_files(uploaded_u: Any) -> list[Any]:
-    """st.file_uploader の戻り（単一 or 複数）を常にリスト化する。"""
-    if uploaded_u is None:
-        return []
-    if isinstance(uploaded_u, (list, tuple)):
-        return [x for x in uploaded_u if x is not None]
-    return [uploaded_u]
-
-
 def append_sheet_row(
     movement: str,
     product_name: str,
@@ -1709,17 +1700,15 @@ def main():
     _init_registration_form_session_state()
 
     uploaded = st.file_uploader(
-        "商品写真（任意・複数枚可・カメラやギャラリーから）",
+        "商品写真（任意・1枚まで・カメラやギャラリーから）",
         type=["jpg", "jpeg", "png", "webp"],
-        accept_multiple_files=True,
     )
-    upload_files = _coerce_uploaded_files(uploaded)
     st.caption(
-        "数量が **1** で複数枚選ぶと **1枚につき1行** で分割します。"
-        "数量が **2以上** で写真があるときは行は数量ぶんですが、**先頭1枚の画像URLを全行に共通**で入れます。"
+        "写真は **1枚まで** です。数量が **2以上** のときは、その1枚をドライブに保存し、"
+        "作成する **全行に同じ画像URL** を入れます。"
         f"写真がある場合のみ、EXIF向き補正のうえ長辺最大{UPLOAD_JPEG_MAX_LONG_EDGE}px・"
         f"JPEG品質{UPLOAD_JPEG_QUALITY}％へ変換してから AI 解析・ドライブ保存します。"
-        "台帳の日時は先頭の写真で EXIF の撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
+        "台帳の日時は写真の EXIF 撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
         "必須項目だけでも確定して台帳記録できます（画像URLは空欄になります）。"
     )
 
@@ -1734,7 +1723,7 @@ def main():
         analyze = st.button(
             "AIで画像を解析",
             type="primary",
-            disabled=len(upload_files) == 0,
+            disabled=uploaded is None,
         )
     with col_b:
         if st.button("候補の自動入力をクリア"):
@@ -1755,10 +1744,10 @@ def main():
             st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
             st.rerun()
 
-    if analyze and upload_files:
+    if analyze and uploaded is not None:
         with st.spinner("画像を解析しています…"):
             try:
-                img = _gemini_input_image_from_upload(upload_files[0])
+                img = _gemini_input_image_from_upload(uploaded)
                 raw_text = analyze_image_with_gemini(img)
                 result = _parse_json_from_model(raw_text or "")
                 _apply_gemini_json_to_session(result)
@@ -1845,8 +1834,7 @@ def main():
         min_value=1,
         step=1,
         key="field_qty",
-        help="台帳は **1点1行** で保存します。写真枚数と数量の大きい方の件数だけ行を作成します。"
-        "数量が1のときは写真を先頭から1行ずつ対応付け、数量が2以上のときは先頭1枚のURLを全行に入れます。",
+        help="台帳は **1点1行** で保存します。行数は常にこの数量と同じです（写真は1枚まで・複数点のときは同じ画像URLを各行に入れます）。",
     )
 
     unit_price_excl = st.number_input(
@@ -1870,7 +1858,7 @@ def main():
 
     _q = int(quantity)
     _u = int(unit_price_excl)
-    _n_save = max(_q, len(upload_files)) if upload_files else _q
+    _n_save = _q
     _line_ex_one = _u
     _line_in_one = price_incl_tax(_line_ex_one, _tax_r)
 
@@ -1879,7 +1867,7 @@ def main():
         st.metric("仕入金額（税抜・1点）", f"¥{_line_ex_one:,}")
         st.caption(
             f"確定時は **{_n_save} 行**（各行 数量1）。税抜合計（参考） ¥{_line_ex_one * _n_save:,}。"
-            f"数量が2以上で写真があるときは、**先頭1枚のURLを全行に同じ**で記録します。"
+            f"写真があるとき、数量が2以上なら **同じ画像URLを全行** に記録します。"
         )
     with price_row[1]:
         st.metric("仕入税込金額（1点・自動）", f"¥{_line_in_one:,}")
@@ -2003,65 +1991,35 @@ def main():
                 _stat2 = STATUS_IN_STOCK
             memo_s = (memo or "").strip()
 
-            reg_files = _coerce_uploaded_files(uploaded)
             _q2 = int(quantity)
-            n_save = max(_q2, len(reg_files)) if reg_files else _q2
+            n_save = _q2
             urls: list[str] = [""] * n_save
             _record_dt = jst_now_str()
             ready_for_sheet = True
 
-            if reg_files:
+            if uploaded is not None:
                 with st.spinner("画像をリサイズ・圧縮してドライブに保存しています…"):
-                    if _q2 > 1:
-                        uf0 = reg_files[0]
-                        raw0 = uf0.getvalue()
-                        _record_dt = (
-                            capture_datetime_jst_from_bytes(raw0) or _record_dt
-                        )
+                    raw0 = uploaded.getvalue()
+                    _record_dt = (
+                        capture_datetime_jst_from_bytes(raw0) or _record_dt
+                    )
+                    try:
+                        data0, mime0 = prepare_upload_image_jpeg(raw0)
+                    except Exception as e:
+                        st.error(f"画像の処理に失敗しました: {e}")
+                        ready_for_sheet = False
+                    else:
+                        safe_base = re.sub(
+                            r"[^\w\-_.]", "_", uploaded.name.rsplit(".", 1)[0]
+                        )[:80]
+                        fname0 = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
                         try:
-                            data0, mime0 = prepare_upload_image_jpeg(raw0)
+                            shared_url = upload_image_to_drive(fname0, mime0, data0)
                         except Exception as e:
-                            st.error(f"画像の処理に失敗しました: {e}")
+                            st.error(f"ドライブ保存に失敗しました: {e}")
                             ready_for_sheet = False
                         else:
-                            safe_base = re.sub(
-                                r"[^\w\-_.]", "_", uf0.name.rsplit(".", 1)[0]
-                            )[:80]
-                            fname0 = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
-                            try:
-                                shared_url = upload_image_to_drive(fname0, mime0, data0)
-                            except Exception as e:
-                                st.error(f"ドライブ保存に失敗しました: {e}")
-                                ready_for_sheet = False
-                            else:
-                                urls = [shared_url] * n_save
-                    else:
-                        for i in range(n_save):
-                            if i >= len(reg_files):
-                                continue
-                            uf = reg_files[i]
-                            raw_bytes = uf.getvalue()
-                            if i == 0:
-                                _record_dt = (
-                                    capture_datetime_jst_from_bytes(raw_bytes)
-                                    or _record_dt
-                                )
-                            try:
-                                data, mime = prepare_upload_image_jpeg(raw_bytes)
-                            except Exception as e:
-                                st.error(f"画像の処理に失敗しました（{i + 1} 枚目）: {e}")
-                                ready_for_sheet = False
-                                break
-                            safe_base = re.sub(
-                                r"[^\w\-_.]", "_", uf.name.rsplit(".", 1)[0]
-                            )[:80]
-                            fname = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
-                            try:
-                                urls[i] = upload_image_to_drive(fname, mime, data)
-                            except Exception as e:
-                                st.error(f"ドライブ保存に失敗しました（{i + 1} 枚目）: {e}")
-                                ready_for_sheet = False
-                                break
+                            urls = [shared_url] * n_save
 
             if ready_for_sheet:
                 ws0 = ensure_worksheet_header()
