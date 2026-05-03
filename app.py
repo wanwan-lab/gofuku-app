@@ -16,8 +16,8 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
   APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
-※ 画像の Gemini 解析は **google-generativeai** で ``genai.GenerativeModel('gemini-1.5-flash-latest')`` を固定使用します
-  （``models/`` プレフィックス・api_version 指定なし。``GEMINI_MODEL_NAME`` は参照しません）。
+※ 画像の Gemini 解析は **google-generativeai** で ``genai.GenerativeModel('gemini-2.0-flash')`` を固定使用します
+  （``models/`` プレフィックス・api_version 指定なし。``GEMINI_MODEL_NAME`` が secrets にあっても参照しません）。
 ※ アップロード画像は Pillow で長辺最大1280px・JPEG品質80に変換したうえで解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
@@ -296,7 +296,7 @@ def price_incl_tax(price_excl_yen: int) -> int:
 
 def analyze_image_with_gemini(image_data):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    model = genai.GenerativeModel('gemini-2.0-flash')
     prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
     response = model.generate_content([prompt, image_data])
     return response.text or ""
