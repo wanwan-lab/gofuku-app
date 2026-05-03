@@ -13,8 +13,8 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
     または GOOGLE_SERVICE_ACCOUNT_JSON … JSON文字列1本
 
 任意:
-  GEMINI_MODEL_NAME          … Gemini モデル ID（未設定時は settings.DEFAULT_GEMINI_MODEL）
-  GOOGLE_WORKSHEET_NAME      … ワークシート名（既定は settings.DEFAULT_WORKSHEET_NAME）
+  GEMINI_MODEL_NAME          … Gemini モデル ID（未設定時は下記 DEFAULT_GEMINI_MODEL）
+  GOOGLE_WORKSHEET_NAME      … ワークシート名（未設定時は DEFAULT_WORKSHEET_NAME）
   GAS_UPLOAD_TIMEOUT_SECONDS … GAS への POST タイムアウト秒（既定 300、1〜3600 にクランプ）
   FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED … GAS 未設定時に台帳の画像URL列へ入れるプレースホルダ URL
   APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
@@ -48,49 +48,72 @@ import altair as alt
 import google.generativeai as genai
 import gspread
 import pandas as pd
+import pytz
 import requests
 import streamlit as st
 from google.oauth2 import service_account
 from PIL import Image, ImageOps
 
-import settings
-from settings import (
+# --- st.secrets のキー名（文字列リテラルの散在を避ける） ---
+SECRET_GEMINI_API_KEY = "GEMINI_API_KEY"
+SECRET_GEMINI_MODEL_NAME = "GEMINI_MODEL_NAME"
+SECRET_GAS_UPLOAD_URL = "GAS_UPLOAD_URL"
+SECRET_GAS_API_KEY = "GAS_API_KEY"
+SECRET_GAS_UPLOAD_TIMEOUT_SECONDS = "GAS_UPLOAD_TIMEOUT_SECONDS"
+SECRET_GOOGLE_DRIVE_FOLDER_ID = "GOOGLE_DRIVE_FOLDER_ID"
+SECRET_GOOGLE_SPREADSHEET_ID = "GOOGLE_SPREADSHEET_ID"
+SECRET_GOOGLE_WORKSHEET_NAME = "GOOGLE_WORKSHEET_NAME"
+SECRET_GOOGLE_SERVICE_ACCOUNT_JSON = "GOOGLE_SERVICE_ACCOUNT_JSON"
+SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION = "google_service_account"
+SECRET_APP_PASSWORD = "APP_PASSWORD"
+SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED = "FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED"
+
+# --- secrets に無いときの既定（非機密のデフォルトのみ） ---
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+DEFAULT_WORKSHEET_NAME = "在庫履歴"
+DEFAULT_GAS_FALLBACK_IMAGE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
+DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS = 300
+
+# --- 画像アップロード前処理 ---
+UPLOAD_JPEG_MAX_LONG_EDGE = 1280
+UPLOAD_JPEG_QUALITY = 80
+
+# --- スプレッドシート列 ---
+COL_DATETIME = "日時"
+COL_TYPE = "入出庫種別"
+COL_NAME = "商品名"
+COL_SUPPLIER = "仕入先・取引先"
+COL_QTY = "数量"
+COL_PRICE_UNIT = "商品単価（税抜）"
+COL_PRICE_EXCL = "商品金額（税抜）"
+COL_PRICE_INCL = "税込金額"
+COL_IMAGE_URL = "画像URL"
+COL_MEMO = "メモ"
+
+CONSUMPTION_TAX_RATE = 0.10
+CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
+    "10%": 0.10,
+    "8%": 0.08,
+    "非課税": 0.0,
+}
+
+EXPECTED_HEADERS: list[str] = [
     COL_DATETIME,
-    COL_IMAGE_URL,
-    COL_MEMO,
+    COL_TYPE,
     COL_NAME,
+    COL_SUPPLIER,
+    COL_QTY,
+    COL_PRICE_UNIT,
     COL_PRICE_EXCL,
     COL_PRICE_INCL,
-    COL_PRICE_UNIT,
-    COL_QTY,
-    COL_SUPPLIER,
-    COL_TYPE,
-    CONSUMPTION_TAX_CHOICE_TO_RATE,
-    CONSUMPTION_TAX_RATE,
-    DEFAULT_GAS_FALLBACK_IMAGE_URL,
-    DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS,
-    DEFAULT_GEMINI_MODEL,
-    DEFAULT_WORKSHEET_NAME,
-    EXPECTED_HEADERS,
-    LEDGER_DATA_EDITOR_KEY,
-    LEDGER_PICK_PLACEHOLDER,
-    SECRET_APP_PASSWORD,
-    SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED,
-    SECRET_GAS_API_KEY,
-    SECRET_GAS_UPLOAD_TIMEOUT_SECONDS,
-    SECRET_GAS_UPLOAD_URL,
-    SECRET_GEMINI_API_KEY,
-    SECRET_GEMINI_MODEL_NAME,
-    SECRET_GOOGLE_DRIVE_FOLDER_ID,
-    SECRET_GOOGLE_SERVICE_ACCOUNT_JSON,
-    SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION,
-    SECRET_GOOGLE_SPREADSHEET_ID,
-    SECRET_GOOGLE_WORKSHEET_NAME,
-    SHEET_AMOUNT_NUMBER_PATTERN,
-    TZ_JP,
-    UPLOAD_JPEG_MAX_LONG_EDGE,
-    UPLOAD_JPEG_QUALITY,
-)
+    COL_MEMO,
+    COL_IMAGE_URL,
+]
+
+SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
+TZ_JP = pytz.timezone("Asia/Tokyo")
+LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
+LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 
 
 def check_password() -> bool:
@@ -101,14 +124,14 @@ def check_password() -> bool:
     st.set_page_config(page_title="認証", layout="centered")
     st.header("認証")
 
-    try:
-        expected = str(st.secrets[SECRET_APP_PASSWORD]).strip()
-    except Exception:
+    raw_pw = st.secrets.get(SECRET_APP_PASSWORD)
+    if raw_pw is None:
         st.error(
             f"`.streamlit/secrets.toml` に **{SECRET_APP_PASSWORD}** を設定してください。"
             "（ローカルで `secrets.toml` が無い場合は作成してください）"
         )
         st.stop()
+    expected = str(raw_pw).strip()
 
     if not expected:
         st.error(f"{SECRET_APP_PASSWORD} が空です。secrets.toml を確認してください。")
@@ -265,25 +288,26 @@ def prepare_upload_image_jpeg(raw: bytes) -> tuple[bytes, str]:
     return buf.getvalue(), "image/jpeg"
 
 
-def _safe_secret(key: str, default: str = "") -> str:
-    try:
-        v = st.secrets[key]
-        if v is None:
-            return default
-        s = str(v).strip()
-        return s if s else default
-    except Exception:
+def _secret_str(key: str, default: str = "") -> str:
+    """設定文字列を ``st.secrets.get`` で取得。欠損・空は default。"""
+    v = st.secrets.get(key, default)
+    if v is None:
         return default
+    s = str(v).strip()
+    return s if s else default
 
 
 def _secret_int(
     key: str, default: int, *, min_value: int = 1, max_value: int = 10_000
 ) -> int:
-    raw = _safe_secret(key)
-    if not raw:
+    raw = st.secrets.get(key)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
         return default
     try:
-        return max(min_value, min(max_value, int(raw)))
+        return max(min_value, min(max_value, int(s)))
     except ValueError:
         return default
 
@@ -298,31 +322,26 @@ def _gas_upload_timeout_seconds() -> int:
 
 
 def _fallback_image_url_when_gas_unconfigured() -> str:
-    return _safe_secret(
+    return _secret_str(
         SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED,
         DEFAULT_GAS_FALLBACK_IMAGE_URL,
     )
 
 
 def _gemini_model_name() -> str:
-    return _safe_secret(SECRET_GEMINI_MODEL_NAME, DEFAULT_GEMINI_MODEL)
-
-
-def _get_secrets() -> dict[str, Any]:
-    return dict(st.secrets)
+    return _secret_str(SECRET_GEMINI_MODEL_NAME, DEFAULT_GEMINI_MODEL)
 
 
 def _load_service_account_info() -> dict[str, Any]:
-    s = _get_secrets()
-    if SECRET_GOOGLE_SERVICE_ACCOUNT_JSON in s:
-        raw = s[SECRET_GOOGLE_SERVICE_ACCOUNT_JSON]
-        if isinstance(raw, str):
-            return json.loads(raw)
+    raw_json = st.secrets.get(SECRET_GOOGLE_SERVICE_ACCOUNT_JSON)
+    if raw_json is not None and str(raw_json).strip():
+        if isinstance(raw_json, str):
+            return json.loads(raw_json)
         raise ValueError(
             f"{SECRET_GOOGLE_SERVICE_ACCOUNT_JSON} は文字列である必要があります。"
         )
-    if SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION in s:
-        ga = s[SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION]
+    ga = st.secrets.get(SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION)
+    if ga is not None:
         if hasattr(ga, "to_dict"):
             return dict(ga.to_dict())
         return dict(ga)
@@ -497,7 +516,7 @@ def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
 
 
 def analyze_image_with_gemini(image_data):
-    api_key = _safe_secret(SECRET_GEMINI_API_KEY)
+    api_key = _secret_str(SECRET_GEMINI_API_KEY)
     if not api_key:
         raise RuntimeError(
             f"{SECRET_GEMINI_API_KEY} が設定されていません。`.streamlit/secrets.toml` を確認してください。"
@@ -525,7 +544,7 @@ def analyze_image_with_gemini(image_data):
 
 
 def _open_inventory_workbook():
-    sid = _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID)
+    sid = _secret_str(SECRET_GOOGLE_SPREADSHEET_ID)
     if not sid:
         return None
     try:
@@ -539,7 +558,7 @@ def _get_or_create_inventory_worksheet():
     sh = _open_inventory_workbook()
     if sh is None:
         return None
-    wname = _safe_secret(SECRET_GOOGLE_WORKSHEET_NAME, DEFAULT_WORKSHEET_NAME)
+    wname = _secret_str(SECRET_GOOGLE_WORKSHEET_NAME, DEFAULT_WORKSHEET_NAME)
     try:
         try:
             return sh.worksheet(str(wname))
@@ -578,9 +597,9 @@ def upload_image_to_drive(filename: str, mime: str, data: bytes) -> str:
     { folderId, fileName, mimeType, base64Data, apiKey } を受け取り、
     { status: \"success\", url: \"...\" } 形式で返す想定。
     """
-    gas_url = _safe_secret(SECRET_GAS_UPLOAD_URL)
-    gas_api_key = _safe_secret(SECRET_GAS_API_KEY)
-    folder_id = _safe_secret(SECRET_GOOGLE_DRIVE_FOLDER_ID)
+    gas_url = _secret_str(SECRET_GAS_UPLOAD_URL)
+    gas_api_key = _secret_str(SECRET_GAS_API_KEY)
+    folder_id = _secret_str(SECRET_GOOGLE_DRIVE_FOLDER_ID)
     if not gas_url or not gas_api_key or not folder_id:
         return _fallback_image_url_when_gas_unconfigured()
 
@@ -1105,7 +1124,7 @@ def render_inventory_manager() -> None:
     if msg := st.session_state.pop("_ledger_saved_flash", None):
         st.success(msg)
 
-    if not _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID):
+    if not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
         st.info(
             f"{SECRET_GOOGLE_SPREADSHEET_ID} を設定すると、台帳の表示・編集ができます。"
         )
@@ -1270,7 +1289,7 @@ def main():
         st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
 
     df_ledger_hint: pd.DataFrame | None = None
-    if _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID):
+    if _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
         try:
             df_ledger_hint = load_inventory_dataframe()
         except Exception:
@@ -1322,7 +1341,7 @@ def main():
                 key="ledger_pick_supplier",
                 on_change=_on_ledger_pick_supplier,
             )
-    elif _safe_secret(SECRET_GOOGLE_SPREADSHEET_ID):
+    elif _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
         st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
 
     st.markdown("##### 必須入力項目")
