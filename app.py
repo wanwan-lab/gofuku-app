@@ -14,10 +14,11 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 任意:
   GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
+  GEMINI_MODEL_NAME        … 画像解析に使うモデル ID（既定: gemini-1.5-flash）
   APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
 ※ 画像の Gemini 解析はパッケージ `google-genai`（`from google import genai`）のみを使用します。`google-generativeai` は使いません。
-  呼び出しは Gemini Developer API の **v1** とリソース名 **models/gemini-1.5-flash** を用います。
+  モデル ID は既定で **gemini-1.5-flash**（任意キー GEMINI_MODEL_NAME で上書き可。先頭の ``models/`` は自動で除きます）。
 
 画面下部の「在庫一覧マネージャー」で、同一スプレッドシートを表形式で読み書きし、
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
@@ -79,7 +80,6 @@ from zoneinfo import ZoneInfo
 import altair as alt
 import pandas as pd
 from google import genai
-from google.genai import types as genai_types
 import gspread
 import requests
 from google.oauth2 import service_account
@@ -290,18 +290,22 @@ def price_incl_tax(price_excl_yen: int) -> int:
     return int(round(int(price_excl_yen) * (1 + CONSUMPTION_TAX_RATE)))
 
 
+def _gemini_model_id() -> str:
+    """Gemini のモデル ID（SDK 既定の API バージョン向け。先頭の models/ は除く）。"""
+    raw = (_safe_secret("GEMINI_MODEL_NAME") or "gemini-1.5-flash").strip()
+    if raw.startswith("models/"):
+        raw = raw[len("models/"):].strip()
+    return raw or "gemini-1.5-flash"
+
+
 def analyze_image_with_gemini(image_data):
     api_key = st.secrets["GEMINI_API_KEY"]
-    # 既定の v1beta ではなく安定版 v1（generativelanguage.googleapis.com/v1/...）
-    client = genai.Client(
-        api_key=api_key,
-        http_options=genai_types.HttpOptions(api_version="v1"),
-    )
+    client = genai.Client(api_key=api_key)
 
     prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
 
     response = client.models.generate_content(
-        model="models/gemini-1.5-flash",
+        model=_gemini_model_id(),
         contents=[prompt, image_data],
     )
     return response.text
@@ -1010,6 +1014,10 @@ def main():
                 st.success("解析が完了しました。必要に応じて商品名・仕入先・取引先を修正してください。")
             except Exception as e:
                 st.error(f"AI解析に失敗しました: {e}")
+                st.info(
+                    "一時的な通信やレート制限の可能性があります。"
+                    "しばらく待ってから「AIで画像を解析」をもう一度お試しください。"
+                )
 
     if st.session_state.ai_kind or st.session_state.ai_features:
         st.subheader("AI解析結果（参考）")
