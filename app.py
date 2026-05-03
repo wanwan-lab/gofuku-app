@@ -275,12 +275,101 @@ def _gspread_client():
 
 
 def _parse_json_from_model(text: str) -> dict[str, Any]:
-    """モデル出力から JSON オブジェクトを抽出する。"""
+    """モデル出力から JSON オブジェクトを抽出する（コードフェンスや前後の説明文を許容）。"""
     t = text.strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t)
     if fence:
         t = fence.group(1).strip()
-    return json.loads(t)
+    try:
+        obj = json.loads(t)
+    except json.JSONDecodeError:
+        i0 = t.find("{")
+        i1 = t.rfind("}")
+        if i0 == -1 or i1 <= i0:
+            raise
+        obj = json.loads(t[i0 : i1 + 1])
+    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        obj = obj[0]
+    if not isinstance(obj, dict):
+        raise ValueError("JSON がオブジェクト形式ではありません。")
+    return obj
+
+
+def _coerce_positive_int(val: Any, default: int = 1) -> int:
+    try:
+        n = int(float(str(val).strip()))
+        return max(1, n)
+    except Exception:
+        return default
+
+
+def _apply_gemini_json_to_session(result: dict[str, Any]) -> None:
+    """Gemini の JSON をフォーム用 session_state に反映する（英日キー両対応）。"""
+    r = result
+    st.session_state.field_qty = _coerce_positive_int(
+        r.get("quantity") or r.get("数量") or r.get("qty") or 1,
+        default=1,
+    )
+
+    pn = str(
+        r.get("product_name")
+        or r.get("商品名")
+        or r.get("name")
+        or ""
+    ).strip()
+    su = str(
+        r.get("supplier")
+        or r.get("仕入先・取引先")
+        or r.get("仕入先")
+        or r.get("取引先")
+        or r.get("vendor")
+        or ""
+    ).strip()
+    m = r.get("match")
+    if isinstance(m, dict):
+        conf = float(m.get("confidence") or 0)
+        if conf >= 0.75:
+            if not pn:
+                pn = str(m.get("product_name") or "").strip()
+            if not su:
+                su = str(m.get("supplier") or "").strip()
+    if pn:
+        st.session_state.field_product_name = pn
+    if su:
+        st.session_state.field_supplier = su
+
+    kind = str(
+        r.get("product_kind")
+        or r.get("種類")
+        or r.get("type")
+        or r.get("商品カテゴリ")
+        or ""
+    ).strip()
+    if not kind and pn:
+        kind = pn
+    st.session_state.ai_kind = kind
+
+    vf = r.get("visual_features")
+    if not vf:
+        parts = [
+            r.get(k)
+            for k in (
+                "色",
+                "柄",
+                "素材",
+                "状態",
+                "色柄",
+                "備考",
+                "color",
+                "pattern",
+                "material",
+                "condition",
+            )
+            if r.get(k)
+        ]
+        vf = " / ".join(str(p) for p in parts)
+    st.session_state.ai_features = str(vf or "")
+    st.session_state.ai_parse_ran = True
 
 
 def _gemini_input_image_from_upload(uploaded) -> Image.Image:
@@ -297,7 +386,21 @@ def price_incl_tax(price_excl_yen: int) -> int:
 def analyze_image_with_gemini(image_data):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
     model = genai.GenerativeModel('gemini-3-flash-preview')
-    prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
+    prompt = """この画像は呉服店の在庫・売買用の商品写真です。次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
+説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
+
+必須キー（値の型を守ること）:
+- "product_name" (string): 商品名として適切な短い名称。不明なら ""
+- "supplier" (string): 仕入先・取引先として推測できる名称。不明なら ""
+- "quantity" (integer): 写っている点数・束の本数などの推定。最低 1
+- "product_kind" (string): 種類の推定（例: 振袖、訪問着、帯、長襦袢）。不明なら ""
+- "color" (string): 色の推定。不明なら ""
+- "pattern" (string): 柄の推定。不明なら ""
+- "material" (string): 素材の推定。不明なら ""
+- "condition" (string): 状態の推定。不明なら ""
+
+任意: 既存在庫と照合する場合のみ "match" を付けてもよい
+{"product_name": "...", "supplier": "...", "confidence": 0.0〜1.0} の形。不要なら省略。"""
     response = model.generate_content([prompt, image_data])
     return response.text or ""
 
@@ -920,6 +1023,8 @@ def main():
         st.session_state.ai_kind = ""
     if "ai_features" not in st.session_state:
         st.session_state.ai_features = ""
+    if "ai_parse_ran" not in st.session_state:
+        st.session_state.ai_parse_ran = False
     if "field_memo" not in st.session_state:
         st.session_state.field_memo = ""
     if "field_unit_price_excl" not in st.session_state:
@@ -968,6 +1073,7 @@ def main():
             st.session_state.field_qty = 1
             st.session_state.ai_kind = ""
             st.session_state.ai_features = ""
+            st.session_state.ai_parse_ran = False
             st.session_state.field_memo = ""
             st.session_state.field_unit_price_excl = 1
             st.rerun()
@@ -978,30 +1084,7 @@ def main():
                 img = _gemini_input_image_from_upload(uploaded)
                 raw_text = analyze_image_with_gemini(img)
                 result = _parse_json_from_model(raw_text or "")
-                st.session_state.field_qty = int(
-                    result.get("quantity") or result.get("数量") or 1
-                )
-                st.session_state.ai_kind = str(
-                    result.get("product_kind")
-                    or result.get("商品名")
-                    or result.get("種類")
-                    or ""
-                )
-                vf = result.get("visual_features")
-                if not vf:
-                    parts = [
-                        result.get(k)
-                        for k in ("色", "柄", "素材", "状態", "色柄", "備考")
-                        if result.get(k)
-                    ]
-                    vf = " / ".join(str(p) for p in parts)
-                st.session_state.ai_features = str(vf or "")
-                m = result.get("match")
-                if isinstance(m, dict):
-                    conf = float(m.get("confidence") or 0)
-                    if conf >= 0.75:
-                        st.session_state.field_product_name = str(m.get("product_name") or "").strip()
-                        st.session_state.field_supplier = str(m.get("supplier") or "").strip()
+                _apply_gemini_json_to_session(result)
                 st.success("解析が完了しました。必要に応じて商品名・仕入先・取引先を修正してください。")
             except Exception as e:
                 st.warning(
@@ -1010,7 +1093,7 @@ def main():
                 )
                 st.caption(f"詳細: {e}")
 
-    if st.session_state.ai_kind or st.session_state.ai_features:
+    if st.session_state.get("ai_parse_ran"):
         st.subheader("AI解析結果（参考）")
         st.write(f"**推定種類:** {st.session_state.ai_kind or '—'}")
         st.write(f"**推定数量:** {int(st.session_state.field_qty)}")
