@@ -23,6 +23,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 商品単価（税抜） | 商品金額（税抜） | 税込金額 | 画像URL | メモ（任意）
+  ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※商品金額（税抜）は「数量×商品単価」の行合計。旧データは単価列が空のとき従来どおり数量×金額列で集計します。
 """
 
@@ -73,13 +74,14 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+import pytz
 import altair as alt
 import pandas as pd
 from google import genai
 import gspread
 import requests
 from google.oauth2 import service_account
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 # --- スプレッドシート列（ヘッダーと一致させる） ---
@@ -112,6 +114,114 @@ EXPECTED_HEADERS = [
 
 # 一時的: secrets.toml が無い／空でもアプリを落とさない（AI 解析テスト用）
 _PLACEHOLDER_DRIVE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
+
+# アプリ全体の基準タイムゾーン（台帳の「日時」・ファイル名など）
+TZ_JP = pytz.timezone("Asia/Tokyo")
+
+
+def jst_now() -> datetime:
+    """現在の日本時間（timezone-aware）。"""
+    return datetime.now(TZ_JP)
+
+
+def jst_now_str() -> str:
+    """スプレッドシート用の日時文字列（JST・秒まで）。"""
+    return jst_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def capture_datetime_jst_from_bytes(raw: bytes) -> str | None:
+    """画像バイナリの EXIF から撮影日時を読み、JST の壁時計として解釈して文字列化する。
+
+    リサイズ前の元データに対して呼ぶこと（EXIF 失効前に取得する）。
+    EXIF にタイムゾーンが無いため、取得値は **日本のローカル時刻** として ``Asia/Tokyo`` に固定する。
+    失敗時は ``None``（呼び出し側で ``jst_now_str()`` をデフォルトにする）。
+    """
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            exif = img.getexif()
+        if not exif:
+            return None
+        dt_s: str | None = None
+        try:
+            from PIL.ExifTags import IFD
+
+            sub = exif.get_ifd(IFD.Exif)
+            if sub:
+                dt_s = sub.get(36867) or sub.get(36868)  # DateTimeOriginal, DateTimeDigitized
+            if not dt_s:
+                sub0 = exif.get_ifd(IFD.IFD0)
+                if sub0:
+                    dt_s = sub0.get(306)  # DateTime
+        except Exception:
+            pass
+        if not dt_s:
+            dt_s = exif.get(36867) or exif.get(306)
+        if not dt_s:
+            return None
+        if isinstance(dt_s, bytes):
+            dt_s = dt_s.decode("utf-8", errors="ignore")
+        dt_s = str(dt_s).strip()
+        naive: datetime | None = None
+        for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                naive = datetime.strptime(dt_s, fmt)
+                break
+            except ValueError:
+                continue
+        if naive is None:
+            return None
+        aware = TZ_JP.localize(naive)
+        return aware.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def capture_datetime_jst_from_upload(uploaded) -> str | None:
+    """UploadedFile から EXIF 日時を取得（内部は :func:`capture_datetime_jst_from_bytes`）。"""
+    try:
+        return capture_datetime_jst_from_bytes(uploaded.getvalue())
+    except Exception:
+        return None
+
+
+# ドライブ保存前の軽量化（長辺・JPEG 品質）
+_UPLOAD_JPEG_MAX_LONG_EDGE = 1280
+_UPLOAD_JPEG_QUALITY = 80
+
+
+def _resize_long_edge_max(img: Image.Image, max_edge: int) -> Image.Image:
+    w, h = img.size
+    long_edge = max(w, h)
+    if long_edge <= max_edge:
+        return img
+    scale = max_edge / float(long_edge)
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    return img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+
+def prepare_upload_image_jpeg(raw: bytes) -> tuple[bytes, str]:
+    """EXIF 向き補正のうえ長辺を最大 1280px に収め、JPEG 品質 80 で再エンコードしたバイト列を返す。
+
+    Returns:
+        (jpeg_bytes, mime_type)  mime_type は常に ``image/jpeg`` 。
+    """
+    img = Image.open(io.BytesIO(raw))
+    img = ImageOps.exif_transpose(img)
+    rgba = img.convert("RGBA")
+    bg = Image.new("RGB", rgba.size, (255, 255, 255))
+    bg.paste(rgba, mask=rgba.getchannel("A"))
+    img = bg
+    img = _resize_long_edge_max(img, _UPLOAD_JPEG_MAX_LONG_EDGE)
+    buf = io.BytesIO()
+    img.save(
+        buf,
+        format="JPEG",
+        quality=_UPLOAD_JPEG_QUALITY,
+        optimize=True,
+        progressive=True,
+    )
+    return buf.getvalue(), "image/jpeg"
 
 
 def _safe_secret(key: str, default: str = "") -> str:
@@ -266,12 +376,13 @@ def append_sheet_row(
     line_price_incl_yen: int,
     image_url: str,
     memo: str = "",
+    record_datetime: str | None = None,
 ):
     ws = ensure_worksheet_header()
     if ws is None:
         st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
         return
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = (record_datetime or "").strip() or jst_now_str()
     try:
         ws.append_row(
             [
@@ -467,7 +578,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     with p2:
         year_sel = st.selectbox(
             "年",
-            options=years if years else [datetime.now().year],
+            options=years if years else [jst_now().year],
             key="dash_year_sel",
             disabled=period == "全期間",
         )
@@ -833,6 +944,10 @@ def main():
         "商品写真（カメラで撮影した画像をアップロード）",
         type=["jpg", "jpeg", "png", "webp"],
     )
+    st.caption(
+        "確定時に長辺最大1280px・JPEG品質80へ自動変換してから保存します（軽量化）。"
+        "台帳の日時は EXIF の撮影日時が使えない場合は日本時間（JST）の現在時刻になります。"
+    )
 
     movement = st.radio(
         "区分",
@@ -948,44 +1063,51 @@ def main():
             validation_ok = False
 
         if validation_ok:
-            ext = (uploaded.name.rsplit(".", 1)[-1] if "." in uploaded.name else "jpg").lower()
-            mime = uploaded.type or "image/jpeg"
-            data = uploaded.getvalue()
             safe_base = re.sub(r"[^\w\-_.]", "_", uploaded.name.rsplit(".", 1)[0])[:80]
-            fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.{ext}"
+            raw_bytes = uploaded.getvalue()
+            _record_dt = capture_datetime_jst_from_bytes(raw_bytes) or jst_now_str()
 
-            with st.spinner("Googleドライブに保存しています…"):
-                try:
-                    url = upload_image_to_drive(fname, mime, data)
-                except Exception as e:
-                    st.error(f"ドライブ保存に失敗しました: {e}")
-                else:
-                    _q2 = int(quantity)
-                    _u2 = int(unit_price_excl)
-                    _lex = _q2 * _u2
-                    _lin = price_incl_tax(_lex)
+            try:
+                with st.spinner("画像をリサイズ・圧縮しています…"):
+                    data, mime = prepare_upload_image_jpeg(raw_bytes)
+            except Exception as e:
+                st.error(f"画像の処理に失敗しました: {e}")
+            else:
+                fname = f"{jst_now().strftime('%Y%m%d_%H%M%S')}_{safe_base}_{uuid.uuid4().hex[:8]}.jpg"
 
-                    with st.spinner("スプレッドシートに記録しています…"):
-                        try:
-                            append_sheet_row(
-                                movement,
-                                product_name.strip(),
-                                supplier.strip(),
-                                _q2,
-                                _u2,
-                                _lex,
-                                _lin,
-                                url,
-                                (memo or "").strip(),
-                            )
-                        except Exception as e:
-                            st.error(f"スプレッドシート更新に失敗しました: {e}")
-                            st.warning(f"画像は保存済みです: {url}")
-                        else:
-                            st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-                            st.success("記録しました。")
-                            st.markdown(f"[保存した画像を開く]({url})")
-                            st.balloons()
+                with st.spinner("Googleドライブに保存しています…"):
+                    try:
+                        url = upload_image_to_drive(fname, mime, data)
+                    except Exception as e:
+                        st.error(f"ドライブ保存に失敗しました: {e}")
+                    else:
+                        _q2 = int(quantity)
+                        _u2 = int(unit_price_excl)
+                        _lex = _q2 * _u2
+                        _lin = price_incl_tax(_lex)
+
+                        with st.spinner("スプレッドシートに記録しています…"):
+                            try:
+                                append_sheet_row(
+                                    movement,
+                                    product_name.strip(),
+                                    supplier.strip(),
+                                    _q2,
+                                    _u2,
+                                    _lex,
+                                    _lin,
+                                    url,
+                                    (memo or "").strip(),
+                                    record_datetime=_record_dt,
+                                )
+                            except Exception as e:
+                                st.error(f"スプレッドシート更新に失敗しました: {e}")
+                                st.warning(f"画像は保存済みです: {url}")
+                            else:
+                                st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+                                st.success("記録しました。")
+                                st.markdown(f"[保存した画像を開く]({url})")
+                                st.balloons()
 
     render_inventory_manager()
 
