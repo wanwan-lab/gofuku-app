@@ -14,11 +14,11 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 任意:
   GOOGLE_WORKSHEET_NAME    … ワークシート名（既定: 在庫履歴）
-  GEMINI_MODEL_NAME        … 画像解析のモデル名（既定: gemini-1.5-flash）
   APP_PASSWORD             … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
-※ 画像の Gemini 解析はパッケージ **google-generativeai**（``import google.generativeai as genai``）の ``GenerativeModel`` を使用します。
-  モデル名は既定 **gemini-1.5-flash**（任意キー GEMINI_MODEL_NAME。先頭の ``models/`` は自動で除きます）。
+※ 画像の Gemini 解析は **google-generativeai** の ``GenerativeModel('gemini-1.5-flash')``（プレフィックスなし）を使用します。
+※ アップロード画像は Pillow で長辺最大1280px・JPEG品質80に変換したうえで解析・ドライブ保存します。
+※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
 画面下部の「在庫一覧マネージャー」で、同一スプレッドシートを表形式で読み書きし、
 入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
@@ -75,7 +75,8 @@ import re
 import uuid
 from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
+
+import pytz
 
 import altair as alt
 import pandas as pd
@@ -117,12 +118,12 @@ EXPECTED_HEADERS = [
 # 一時的: secrets.toml が無い／空でもアプリを落とさない（AI 解析テスト用）
 _PLACEHOLDER_DRIVE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
 
-# アプリ全体の基準タイムゾーン（台帳の「日時」・ファイル名など）
-TZ_JP = ZoneInfo("Asia/Tokyo")
+# アプリ全体の基準タイムゾーン（台帳の「日時」・ファイル名・EXIF 未取得時のデフォルト）
+TZ_JP = pytz.timezone("Asia/Tokyo")
 
 
 def jst_now() -> datetime:
-    """現在の日本時間（timezone-aware）。"""
+    """現在の日本時間（JST・timezone-aware）。"""
     return datetime.now(TZ_JP)
 
 
@@ -172,7 +173,7 @@ def capture_datetime_jst_from_bytes(raw: bytes) -> str | None:
                 continue
         if naive is None:
             return None
-        aware = naive.replace(tzinfo=TZ_JP)
+        aware = TZ_JP.localize(naive)
         return aware.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
@@ -186,7 +187,7 @@ def capture_datetime_jst_from_upload(uploaded) -> str | None:
         return None
 
 
-# ドライブ保存前の軽量化（長辺・JPEG 品質）
+# 解析・ドライブ保存共通: Pillow で長辺リサイズ + JPEG 再エンコード（データ量削減）
 _UPLOAD_JPEG_MAX_LONG_EDGE = 1280
 _UPLOAD_JPEG_QUALITY = 80
 
@@ -203,7 +204,9 @@ def _resize_long_edge_max(img: Image.Image, max_edge: int) -> Image.Image:
 
 
 def prepare_upload_image_jpeg(raw: bytes) -> tuple[bytes, str]:
-    """EXIF 向き補正のうえ長辺を最大 1280px に収め、JPEG 品質 80 で再エンコードしたバイト列を返す。
+    """Gemini 送信用・GAS 保存用の共通前処理。
+
+    EXIF 向き補正のうえ長辺を最大 1280px に収め、JPEG 品質 80% で再エンコードする。
 
     Returns:
         (jpeg_bytes, mime_type)  mime_type は常に ``image/jpeg`` 。
@@ -280,7 +283,7 @@ def _parse_json_from_model(text: str) -> dict[str, Any]:
 
 
 def _gemini_input_image_from_upload(uploaded) -> Image.Image:
-    """確定保存と同じ ``prepare_upload_image_jpeg`` で軽量化してから開く（Gemini のペイロード超過対策）。"""
+    """解析直前に ``prepare_upload_image_jpeg`` と同じ圧縮・リサイズを適用した PIL 画像を返す。"""
     jpeg_bytes, _ = prepare_upload_image_jpeg(uploaded.getvalue())
     return Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
 
@@ -290,20 +293,10 @@ def price_incl_tax(price_excl_yen: int) -> int:
     return int(round(int(price_excl_yen) * (1 + CONSUMPTION_TAX_RATE)))
 
 
-def _gemini_model_name() -> str:
-    """``GenerativeModel`` に渡すモデル名（``models/`` プレフィックスなし）。"""
-    raw = (_safe_secret("GEMINI_MODEL_NAME") or "gemini-1.5-flash").strip()
-    if raw.startswith("models/"):
-        raw = raw[len("models/"):].strip()
-    return raw or "gemini-1.5-flash"
-
-
 def analyze_image_with_gemini(image_data):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel(_gemini_model_name())
-    prompt = (
-        "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
-    )
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    prompt = "この呉服の画像を解析し、商品名、色、柄、素材、状態を推定してJSON形式で返してください。"
     response = model.generate_content([prompt, image_data])
     return response.text or ""
 
@@ -1010,11 +1003,11 @@ def main():
                         st.session_state.field_supplier = str(m.get("supplier") or "").strip()
                 st.success("解析が完了しました。必要に応じて商品名・仕入先・取引先を修正してください。")
             except Exception as e:
-                st.error(f"AI解析に失敗しました: {e}")
-                st.info(
-                    "一時的な通信やレート制限の可能性があります。"
-                    "しばらく待ってから「AIで画像を解析」をもう一度お試しください。"
+                st.warning(
+                    "現在混み合っているか、無料枠の上限に達している可能性があります。"
+                    "1分ほど待ってから再試行してください。"
                 )
+                st.caption(f"詳細: {e}")
 
     if st.session_state.ai_kind or st.session_state.ai_features:
         st.subheader("AI解析結果（参考）")
