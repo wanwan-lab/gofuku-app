@@ -533,14 +533,42 @@ def _finite_int(val: Any, default: int = 0) -> int:
         if isinstance(val, (float, np.floating)):
             if not math.isfinite(float(val)) or pd.isna(val):
                 return default
-        if isinstance(val, str) and not str(val).strip():
-            return default
+        if isinstance(val, str):
+            t = val.strip()
+            if not t or t.lower() in ("nan", "none", "<na>", "nat"):
+                return default
+            t = (
+                t.replace(",", "")
+                .replace("，", "")
+                .replace("¥", "")
+                .replace("\u00a5", "")
+                .strip()
+            )
+            if not t:
+                return default
+            val = t
         n = float(pd.to_numeric(val, errors="coerce"))
         if not math.isfinite(n) or pd.isna(n):
             return default
         return int(round(n))
     except (OverflowError, ValueError, TypeError):
         return default
+
+
+def _series_to_numeric_loose(s: pd.Series) -> pd.Series:
+    """カンマ区切り・円記号付きのセルでも数値化する（スプレッドシート取り込み用）。"""
+    if not isinstance(s, pd.Series):
+        s = pd.Series(s)
+    if s.dtype == object or pd.api.types.is_string_dtype(s):
+        st = s.where(pd.notna(s), "").astype(str)
+        st = st.str.replace(",", "", regex=False)
+        st = st.str.replace("，", "", regex=False)
+        st = st.str.replace("¥", "", regex=False)
+        st = st.str.replace("\u00a5", "", regex=False)
+        st = st.str.strip()
+        st = st.replace({"nan": "", "None": "", "<NA>": ""})
+        return pd.to_numeric(st, errors="coerce")
+    return pd.to_numeric(s, errors="coerce")
 
 
 def price_incl_tax(price_excl_yen: int, tax_rate: float | None = None) -> int:
@@ -570,6 +598,25 @@ def _infer_tax_rate_from_main_line(line_excl_yen: int, line_incl_yen: int) -> fl
         if price_incl_tax(excl, float(rate)) == incl:
             return float(rate)
     return float(CONSUMPTION_TAX_RATE)
+
+
+def _estimate_excl_yen_from_incl_yen(incl_yen: int) -> int:
+    """税込行金額から税抜行金額を推定（登録時の税率候補に税込が一致する組を採用）。"""
+    incl_i = _finite_int(incl_yen, 0)
+    if incl_i <= 0:
+        return 0
+    seen: set[float] = set()
+    for rate in CONSUMPTION_TAX_CHOICE_TO_RATE.values():
+        rr = float(rate)
+        if rr in seen:
+            continue
+        seen.add(rr)
+        if rr == 0.0:
+            return incl_i
+        ex = int(round(incl_i / (1 + rr)))
+        if price_incl_tax(ex, rr) == incl_i:
+            return ex
+    return int(round(incl_i / (1 + float(CONSUMPTION_TAX_RATE))))
 
 
 def _planned_actual_line_amounts(
@@ -743,7 +790,7 @@ def _coerce_money_columns_for_recalc(df: pd.DataFrame) -> pd.DataFrame:
         if c not in out.columns:
             continue
         s = (
-            pd.to_numeric(out[c], errors="coerce")
+            _series_to_numeric_loose(out[c])
             .replace([np.inf, -np.inf], np.nan)
             .fillna(0)
         )
@@ -1028,14 +1075,14 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     if d.empty:
         return d
     d[COL_DATETIME] = pd.to_datetime(d[COL_DATETIME], errors="coerce")
-    qty = pd.to_numeric(d[COL_QTY], errors="coerce").fillna(0)
+    qty = _series_to_numeric_loose(d[COL_QTY]).fillna(0)
     unit_ex = (
-        pd.to_numeric(d[COL_PRICE_UNIT], errors="coerce").fillna(0)
+        _series_to_numeric_loose(d[COL_PRICE_UNIT]).fillna(0)
         if COL_PRICE_UNIT in d.columns
         else pd.Series(0.0, index=d.index)
     )
-    line_stored_ex = pd.to_numeric(d[COL_PRICE_EXCL], errors="coerce").fillna(0)
-    line_stored_in = pd.to_numeric(d[COL_PRICE_INCL], errors="coerce").fillna(0)
+    line_stored_ex = _series_to_numeric_loose(d[COL_PRICE_EXCL]).fillna(0)
+    line_stored_in = _series_to_numeric_loose(d[COL_PRICE_INCL]).fillna(0)
     movement = d[COL_TYPE].astype(str).str.strip()
     is_in = movement.str.startswith("入庫")
     is_out = movement.str.startswith("出庫")
@@ -1044,6 +1091,17 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     line_ex = line_stored_ex.mask(unit_ex <= 0, qty * line_stored_ex)
     line_needs_derive_ex = (unit_ex > 0) & (line_stored_ex.fillna(0) <= 0)
     line_ex = line_ex.mask(line_needs_derive_ex, qty * unit_ex)
+    # 税抜が取り込めず 0 のままだが税込と数量がある行は、税込から税抜を逆算する
+    mask_ex_from_incl = (
+        (line_ex.fillna(0) <= 0)
+        & (qty.fillna(0) > 0)
+        & (line_stored_in.fillna(0) > 0)
+    )
+    if bool(mask_ex_from_incl.any()):
+        fill_ex = line_stored_in.map(
+            lambda v: float(_estimate_excl_yen_from_incl_yen(_finite_int(v, 0)))
+        )
+        line_ex = line_ex.where(~mask_ex_from_incl, fill_ex)
     line_in = line_stored_in.mask(unit_ex <= 0, qty * line_stored_in)
     line_needs_derive_in = (unit_ex > 0) & (line_stored_in.fillna(0) <= 0)
     _ex_int = line_ex.fillna(0).round().clip(lower=0).astype(int)
@@ -1079,7 +1137,9 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
         "金額はシートの「商品金額（税抜）」「税込金額」列を行合計として集計します。"
         "（単価列が空の旧行は、金額列を単価として数量倍します。"
-        "単価があるのに税抜行金額が空の行は、数量×単価で補います。税込が空のときは税抜から標準10%で概算します。）"
+        "単価があるのに税抜行金額が空の行は、数量×単価で補います。"
+        "税抜が空で税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
+        "カンマ区切り・円記号付きの数値も読み取ります。）"
     )
     if df.empty:
         st.info("集計する行がありません。")
@@ -1089,7 +1149,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     for _col in (COL_QTY, COL_PRICE_UNIT, COL_PRICE_EXCL, COL_PRICE_INCL):
         if _col in df_in.columns:
             df_in[_col] = (
-                pd.to_numeric(df_in[_col], errors="coerce")
+                _series_to_numeric_loose(df_in[_col])
                 .replace([np.inf, -np.inf], np.nan)
                 .fillna(0)
             )
