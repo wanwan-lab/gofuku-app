@@ -1472,110 +1472,110 @@ def _render_voucher_inventory_panel() -> None:
     _vflash = st.session_state.pop("_voucher_import_flash", None)
     if _vflash:
         st.success(_vflash)
-    st.markdown("### 証憑から在庫反映")
-    st.caption(
-        "納品書・請求書・領収書を画像・PDF・Excel・Word から読み取り、入庫（購入）として台帳に反映します。"
-        "PDF はテキスト優先、空ならページ画像として解析します。解析後は表で修正してから確定してください。"
-    )
-    if not _secret_str(SECRET_GEMINI_API_KEY):
-        st.info(f"{SECRET_GEMINI_API_KEY} が未設定のため使えません。")
-        return
-    if not _uses_local_inventory_csv() and not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
-        st.info(
-            "在庫の保存先が未設定です。`GOOGLE_SPREADSHEET_ID` を設定するか、"
-            "`INVENTORY_SOURCE = \"csv\"` で共有の inventory.csv を使ってください。"
+    with st.expander("証憑から在庫反映（帳票から取込）", expanded=False):
+        st.caption(
+            "納品書・請求書・領収書を画像・PDF・Excel・Word から読み取り、入庫（購入）として台帳に反映します。"
+            "PDF はテキスト優先、空ならページ画像として解析します。解析後は表で修正してから確定してください。"
         )
-        return
+        if not _secret_str(SECRET_GEMINI_API_KEY):
+            st.info(f"{SECRET_GEMINI_API_KEY} が未設定のため使えません。")
+            return
+        if not _uses_local_inventory_csv() and not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+            st.info(
+                "在庫の保存先が未設定です。`GOOGLE_SPREADSHEET_ID` を設定するか、"
+                "`INVENTORY_SOURCE = \"csv\"` で共有の inventory.csv を使ってください。"
+            )
+            return
 
-    voucher_up = st.file_uploader(
-        "証憑ファイル（画像 / PDF / Excel / Word）",
-        type=["jpg", "jpeg", "png", "pdf", "xlsx", "docx"],
-        key="voucher_file_uploader",
-    )
-    if st.button(
-        "証憑を解析",
-        key="voucher_analyze_btn",
-        disabled=voucher_up is None,
-    ):
-        with st.spinner("証憑を解析しています…"):
-            try:
-                raw = analyze_voucher_upload_bytes(
-                    voucher_up.getvalue(), voucher_up.name
-                )
-                d = _parse_json_from_model(raw)
-                items = d.get("items")
-                if not isinstance(items, list) or not items:
-                    st.error(
-                        "items が見つかりませんでした。ファイル内容を確認してください。"
-                    )
-                else:
-                    merged = _merge_voucher_items_for_preview(
-                        [x for x in items if isinstance(x, dict)]
-                    )
-                    if not merged:
-                        st.error("有効な商品行がありません。")
-                    else:
-                        st.session_state.voucher_supplier_edit = str(
-                            d.get("supplier_name") or ""
-                        ).strip()
-                        st.session_state.voucher_date_edit = str(
-                            d.get("purchase_date") or ""
-                        ).strip()
-                        st.session_state.voucher_preview_df = pd.DataFrame(merged)
-                        st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
-                        st.session_state["voucher_stash_bytes"] = voucher_up.getvalue()
-                        st.session_state["voucher_stash_name"] = voucher_up.name
-                        st.success(
-                            f"解析しました（{len(merged)} 商品行）。内容を確認して確定してください。"
-                        )
-            except Exception as e:
-                st.warning(str(e))
-
-    st.text_input(
-        "仕入先（証憑・上書き可）",
-        key="voucher_supplier_edit",
-        placeholder="仕入先・取引先",
-    )
-    st.text_input(
-        "仕入日（YYYY-MM-DD・上書き可）",
-        key="voucher_date_edit",
-        placeholder="例: 2026-04-15",
-    )
-    st.radio(
-        "証憑取込の消費税（税込計算）",
-        options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
-        horizontal=True,
-        key="voucher_consumption_tax_choice",
-    )
-
-    base_df = st.session_state.get("voucher_preview_df")
-    if base_df is not None and not base_df.empty:
-        edited_df = st.data_editor(
-            base_df,
-            num_rows="dynamic",
-            key=VOUCHER_DATA_EDITOR_KEY,
-            use_container_width=True,
+        voucher_up = st.file_uploader(
+            "証憑ファイル（画像 / PDF / Excel / Word）",
+            type=["jpg", "jpeg", "png", "pdf", "xlsx", "docx"],
+            key="voucher_file_uploader",
         )
         if st.button(
-            "この内容で台帳に確定反映",
-            type="primary",
-            key="voucher_confirm_btn",
+            "証憑を解析",
+            key="voucher_analyze_btn",
+            disabled=voucher_up is None,
         ):
-            _confirm_voucher_import(
-                edited_df,
-                str(st.session_state.get("voucher_supplier_edit", "") or ""),
-                str(st.session_state.get("voucher_date_edit", "") or ""),
-                str(
-                    st.session_state.get("voucher_consumption_tax_choice", "10%")
-                    or "10%"
-                ),
+            with st.spinner("証憑を解析しています…"):
+                try:
+                    raw = analyze_voucher_upload_bytes(
+                        voucher_up.getvalue(), voucher_up.name
+                    )
+                    d = _parse_json_from_model(raw)
+                    items = d.get("items")
+                    if not isinstance(items, list) or not items:
+                        st.error(
+                            "items が見つかりませんでした。ファイル内容を確認してください。"
+                        )
+                    else:
+                        merged = _merge_voucher_items_for_preview(
+                            [x for x in items if isinstance(x, dict)]
+                        )
+                        if not merged:
+                            st.error("有効な商品行がありません。")
+                        else:
+                            st.session_state.voucher_supplier_edit = str(
+                                d.get("supplier_name") or ""
+                            ).strip()
+                            st.session_state.voucher_date_edit = str(
+                                d.get("purchase_date") or ""
+                            ).strip()
+                            st.session_state.voucher_preview_df = pd.DataFrame(merged)
+                            st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+                            st.session_state["voucher_stash_bytes"] = voucher_up.getvalue()
+                            st.session_state["voucher_stash_name"] = voucher_up.name
+                            st.success(
+                                f"解析しました（{len(merged)} 商品行）。内容を確認して確定してください。"
+                            )
+                except Exception as e:
+                    st.warning(str(e))
+
+        st.text_input(
+            "仕入先（証憑・上書き可）",
+            key="voucher_supplier_edit",
+            placeholder="仕入先・取引先",
+        )
+        st.text_input(
+            "仕入日（YYYY-MM-DD・上書き可）",
+            key="voucher_date_edit",
+            placeholder="例: 2026-04-15",
+        )
+        st.radio(
+            "証憑取込の消費税（税込計算）",
+            options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
+            horizontal=True,
+            key="voucher_consumption_tax_choice",
+        )
+
+        base_df = st.session_state.get("voucher_preview_df")
+        if base_df is not None and not base_df.empty:
+            edited_df = st.data_editor(
+                base_df,
+                num_rows="dynamic",
+                key=VOUCHER_DATA_EDITOR_KEY,
+                use_container_width=True,
             )
-        if st.button("プレビューをクリア", key="voucher_clear_preview_btn"):
-            st.session_state.pop("voucher_preview_df", None)
-            st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
-            st.session_state.pop("voucher_stash_bytes", None)
-            st.session_state.pop("voucher_stash_name", None)
-            st.rerun()
+            if st.button(
+                "この内容で台帳に確定反映",
+                type="primary",
+                key="voucher_confirm_btn",
+            ):
+                _confirm_voucher_import(
+                    edited_df,
+                    str(st.session_state.get("voucher_supplier_edit", "") or ""),
+                    str(st.session_state.get("voucher_date_edit", "") or ""),
+                    str(
+                        st.session_state.get("voucher_consumption_tax_choice", "10%")
+                        or "10%"
+                    ),
+                )
+            if st.button("プレビューをクリア", key="voucher_clear_preview_btn"):
+                st.session_state.pop("voucher_preview_df", None)
+                st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+                st.session_state.pop("voucher_stash_bytes", None)
+                st.session_state.pop("voucher_stash_name", None)
+                st.rerun()
 
 
 def _open_inventory_workbook():
@@ -2874,17 +2874,9 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     if supplier_filter:
         ad_sup = ad_sup[ad_sup[COL_SUPPLIER].astype(str).isin(supplier_filter)]
     stock_cogs_total = 0
-    if COL_STOCK_STATUS in ad_sup.columns:
-        _mstk = (
-            ad_sup[COL_STOCK_STATUS]
-            .astype(str)
-            .map(_normalize_stock_status)
-            == STATUS_IN_STOCK
-        )
+    if COL_PRICE_EXCL in ad_sup.columns:
         stock_cogs_total = _finite_int(
-            _series_to_numeric_loose(ad_sup.loc[_mstk, COL_PRICE_EXCL])
-            .fillna(0)
-            .sum(),
+            _series_to_numeric_loose(ad_sup[COL_PRICE_EXCL]).fillna(0).sum(),
             0,
         )
     gp_sold_period = 0
@@ -2901,12 +2893,13 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         )
     st.markdown("##### ライフサイクル指標")
     st.caption(
-        "在庫総額は **日付は問わず**（仕入先フィルタのみ適用）で在庫中の原価税抜を合算します。"
+        "税抜原価の総額は **日付は問わず**（仕入先フィルタのみ適用）で、在庫中・販売済を問わず "
+        f"**{COL_PRICE_EXCL}** 列を合算します。"
         "確定粗利は **From〜To と仕入先フィルタ内** の販売済行の粗利列の合計です。"
     )
     _lc1, _lc2 = st.columns(2)
     with _lc1:
-        st.metric("在庫総額（在庫中・税抜原価）", f"¥{stock_cogs_total:,}")
+        st.metric("税抜原価総額（ステータス不問）", f"¥{stock_cogs_total:,}")
     with _lc2:
         st.metric("確定粗利（期間内・販売済・税抜）", f"¥{gp_sold_period:,}")
 
