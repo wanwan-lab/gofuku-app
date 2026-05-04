@@ -8,9 +8,11 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   GAS_UPLOAD_URL           … 画像を Google ドライブに保存する Web アプリ（GAS）の URL
   GAS_API_KEY                … GAS Web アプリ呼び出し用の共有キー（payload の apiKey に付与）
   GOOGLE_DRIVE_FOLDER_ID     … 保存先フォルダID（GAS に渡す）
-  GOOGLE_SPREADSHEET_ID      … 記録用スプレッドシートID
   google_service_account     … サービスアカウントJSONの各フィールド（[google_service_account] セクション）
     または GOOGLE_SERVICE_ACCOUNT_JSON … JSON文字列1本
+
+スプレッドシート運用時に追加で必須:
+  GOOGLE_SPREADSHEET_ID      … 記録用スプレッドシートID（``INVENTORY_SOURCE=csv`` のときは不要で、共有 ``inventory.csv`` を使用）
 
 任意:
   GEMINI_MODEL_NAME          … Gemini モデル ID（未設定時は下記 DEFAULT_GEMINI_MODEL）
@@ -19,15 +21,16 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   GAS_UPLOAD_TIMEOUT_SECONDS … GAS への POST タイムアウト秒（既定 300、1〜3600 にクランプ）
   FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED … GAS 未設定時に台帳の画像URL列へ入れるプレースホルダ URL
   APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
+  INVENTORY_SOURCE           … ``csv`` | ``sheet`` 。未指定時は **GOOGLE_SPREADSHEET_ID があるとき sheet**、無いとき **csv**（リポジトリ直下 ``inventory.csv`` または環境変数 ``GOFUKU_INVENTORY_CSV``）。
 
 ※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（既定は flash 系プレビュー）。
-※ サイドバーの **証憑から在庫反映** で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
+※ **登録（インプット）** ページの証憑取込で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
 ※ PDF/Excel/Word 取込には ``pypdf`` / ``pymupdf`` / ``openpyxl`` / ``python-docx`` を使用します（requirements.txt）。
 ※ アップロード画像は任意。ある場合のみ Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
-画面下部の「在庫一覧」で、同一スプレッドシートを表形式で読み書きし、
-入出庫の集計・仕入先・取引先別サマリー・月次グラフを表示できます。
+サイドバーで **登録（インプット）** / **在庫一覧** / **集計・分析（ダッシュボード）** を切り替えられます。
+在庫データは **共有の inventory.csv**（ローカル）または **Google スプレッドシート**（``INVENTORY_SOURCE`` で選択）に読み書きします。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
@@ -60,6 +63,7 @@ from typing import Any
 
 import altair as alt
 import numpy as np
+import plotly.express as px
 import google.generativeai as genai
 import gspread
 import pandas as pd
@@ -68,6 +72,10 @@ import requests
 import streamlit as st
 from google.oauth2 import service_account
 from PIL import Image, ImageOps
+
+from ledger_schema import *  # noqa: F403
+
+import inventory_csv
 
 # --- st.secrets のキー名（文字列リテラルの散在を避ける） ---
 SECRET_GEMINI_API_KEY = "GEMINI_API_KEY"
@@ -82,6 +90,7 @@ SECRET_GOOGLE_WORKSHEET_NAME = "GOOGLE_WORKSHEET_NAME"
 SECRET_GOOGLE_SERVICE_ACCOUNT_JSON = "GOOGLE_SERVICE_ACCOUNT_JSON"
 SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION = "google_service_account"
 SECRET_APP_PASSWORD = "APP_PASSWORD"
+SECRET_INVENTORY_SOURCE = "INVENTORY_SOURCE"
 SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED = "FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED"
 
 # --- secrets に無いときの既定（非機密のデフォルトのみ） ---
@@ -93,66 +102,6 @@ DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS = 300
 # --- 画像アップロード前処理 ---
 UPLOAD_JPEG_MAX_LONG_EDGE = 1280
 UPLOAD_JPEG_QUALITY = 80
-
-# --- スプレッドシート列 ---
-COL_DATETIME = "日時"
-COL_TYPE = "入出庫種別"
-COL_NAME = "商品名"
-COL_SUPPLIER = "仕入先・取引先"
-COL_QTY = "数量"
-COL_PRICE_EXCL = "仕入金額（税抜）"
-COL_PRICE_INCL = "仕入金額（税込）"
-# 旧スプレッドシート1行目に残る列名（load 時に列を落として新 EXPECTED に合わせる）
-LEGACY_COL_UNIT_PRICE = "仕入単価（税抜）"
-COL_PLANNED_SALE = "販売予定金額（税抜）"
-COL_PLANNED_SALE_INCL = "販売予定金額（税込）"
-COL_ACTUAL_SALE = "実売金額（税抜）"
-COL_ACTUAL_SALE_INCL = "実売金額（税込）"
-COL_GROSS_PROFIT = "粗利"
-COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
-COL_IMAGE_URL = "画像URL"
-COL_MEMO = "メモ"
-COL_MANAGEMENT_ID = "管理ID"
-COL_LAST_STOCKTAKE = "最後に確認した日付（棚卸日）"
-COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
-
-STATUS_IN_STOCK = "在庫中"
-STATUS_SOLD = "販売済"
-STOCK_STATUS_OPTIONS: tuple[str, ...] = (STATUS_IN_STOCK, STATUS_SOLD)
-
-
-def _movement_is_outbound(mv: str) -> bool:
-    """入出庫種別が出庫（販売・浮貸など）かどうか。"""
-    return (mv or "").strip().startswith("出庫")
-
-
-CONSUMPTION_TAX_RATE = 0.10
-CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
-    "10%": 0.10,
-    "8%": 0.08,
-    "非課税": 0.0,
-}
-
-EXPECTED_HEADERS: list[str] = [
-    COL_DATETIME,
-    COL_TYPE,
-    COL_NAME,
-    COL_SUPPLIER,
-    COL_QTY,
-    COL_PRICE_EXCL,
-    COL_PRICE_INCL,
-    COL_PLANNED_SALE,
-    COL_PLANNED_SALE_INCL,
-    COL_ACTUAL_SALE,
-    COL_ACTUAL_SALE_INCL,
-    COL_GROSS_PROFIT,
-    COL_STOCK_STATUS,
-    COL_MEMO,
-    COL_IMAGE_URL,
-    COL_MANAGEMENT_ID,
-    COL_LAST_STOCKTAKE,
-    COL_SALE_SOURCE_MGMT_ID,
-]
 
 SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
 TZ_JP = pytz.timezone("Asia/Tokyo")
@@ -361,6 +310,16 @@ def _secret_str(key: str, default: str = "") -> str:
         return default
     s = str(v).strip()
     return s if s else default
+
+
+def _uses_local_inventory_csv() -> bool:
+    """``INVENTORY_SOURCE=csv`` なら True。``sheet`` 明示なら False。未指定時はスプレッドシートIDが無ければ CSV。"""
+    v = _secret_str(SECRET_INVENTORY_SOURCE, "").lower()
+    if v == "csv":
+        return True
+    if v == "sheet":
+        return False
+    return not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID)
 
 
 def _secret_int(
@@ -1158,7 +1117,7 @@ def _confirm_voucher_import(
 ) -> None:
     """証憑プレビュー表の内容を 1点1行で台帳に追記する。"""
     if df is None or df.empty:
-        st.sidebar.error("反映する行がありません。")
+        st.error("反映する行がありません。")
         return
     rows_spec: list[tuple[str, int, int, str]] = []
     for _, row in df.iterrows():
@@ -1170,20 +1129,22 @@ def _confirm_voucher_import(
         cat = str(row.get("カテゴリ", "") or "").strip()
         rows_spec.append((name, q, up, cat))
     if not rows_spec:
-        st.sidebar.error("商品名が入っている行がありません。")
+        st.error("商品名が入っている行がありません。")
         return
     total_q = sum(q for _, q, _, _ in rows_spec)
-    ws = ensure_worksheet_header()
-    if ws is None:
-        st.sidebar.warning("スプレッドシート未設定のため保存できません。")
-        return
+    ws: Any = None
+    if not _uses_local_inventory_csv():
+        ws = ensure_worksheet_header()
+        if ws is None:
+            st.warning("スプレッドシート未設定のため保存できません。")
+            return
     tax_r = _consumption_tax_rate_from_choice_label(str(tax_choice_label))
     rec_dt = _voucher_record_datetime_jst(purchase_date_str)
     sup = (supplier or "").strip()
     try:
         ids = allocate_management_ids(ws, total_q)
     except Exception as e:
-        st.sidebar.error(f"管理IDの採番に失敗しました: {e}")
+        st.error(f"管理IDの採番に失敗しました: {e}")
         return
     idx = 0
     try:
@@ -1206,7 +1167,7 @@ def _confirm_voucher_import(
                     )
                     idx += 1
     except Exception as e:
-        st.sidebar.error(f"スプレッドシート更新に失敗しました: {e}")
+        st.error(f"台帳の更新に失敗しました: {e}")
         return
     st.session_state.pop("voucher_preview_df", None)
     st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
@@ -1217,30 +1178,32 @@ def _confirm_voucher_import(
     st.rerun()
 
 
-def _render_voucher_inventory_sidebar() -> None:
-    """サイドバーに証憑ファイルのアップロード・解析・プレビュー編集・確定反映を置く。"""
+def _render_voucher_inventory_panel() -> None:
+    """登録ページ内: 証憑ファイルのアップロード・解析・プレビュー編集・確定反映。"""
     _vflash = st.session_state.pop("_voucher_import_flash", None)
     if _vflash:
-        st.sidebar.success(_vflash)
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 証憑から在庫反映")
-    st.sidebar.caption(
+        st.success(_vflash)
+    st.markdown("### 証憑から在庫反映")
+    st.caption(
         "納品書・請求書・領収書を画像・PDF・Excel・Word から読み取り、入庫（購入）として台帳に反映します。"
         "PDF はテキスト優先、空ならページ画像として解析します。解析後は表で修正してから確定してください。"
     )
     if not _secret_str(SECRET_GEMINI_API_KEY):
-        st.sidebar.info(f"{SECRET_GEMINI_API_KEY} が未設定のため使えません。")
+        st.info(f"{SECRET_GEMINI_API_KEY} が未設定のため使えません。")
         return
-    if not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
-        st.sidebar.info("スプレッドシート未設定のため使えません。")
+    if not _uses_local_inventory_csv() and not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+        st.info(
+            "在庫の保存先が未設定です。`GOOGLE_SPREADSHEET_ID` を設定するか、"
+            "`INVENTORY_SOURCE = \"csv\"` で共有の inventory.csv を使ってください。"
+        )
         return
 
-    voucher_up = st.sidebar.file_uploader(
+    voucher_up = st.file_uploader(
         "証憑ファイル（画像 / PDF / Excel / Word）",
         type=["jpg", "png", "pdf", "xlsx", "docx"],
         key="voucher_file_uploader",
     )
-    if st.sidebar.button(
+    if st.button(
         "証憑を解析",
         key="voucher_analyze_btn",
         disabled=voucher_up is None,
@@ -1253,7 +1216,7 @@ def _render_voucher_inventory_sidebar() -> None:
                 d = _parse_json_from_model(raw)
                 items = d.get("items")
                 if not isinstance(items, list) or not items:
-                    st.sidebar.error(
+                    st.error(
                         "items が見つかりませんでした。ファイル内容を確認してください。"
                     )
                 else:
@@ -1261,7 +1224,7 @@ def _render_voucher_inventory_sidebar() -> None:
                         [x for x in items if isinstance(x, dict)]
                     )
                     if not merged:
-                        st.sidebar.error("有効な商品行がありません。")
+                        st.error("有効な商品行がありません。")
                     else:
                         st.session_state.voucher_supplier_edit = str(
                             d.get("supplier_name") or ""
@@ -1271,23 +1234,23 @@ def _render_voucher_inventory_sidebar() -> None:
                         ).strip()
                         st.session_state.voucher_preview_df = pd.DataFrame(merged)
                         st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
-                        st.sidebar.success(
+                        st.success(
                             f"解析しました（{len(merged)} 商品行）。内容を確認して確定してください。"
                         )
             except Exception as e:
-                st.sidebar.warning(str(e))
+                st.warning(str(e))
 
-    st.sidebar.text_input(
+    st.text_input(
         "仕入先（証憑・上書き可）",
         key="voucher_supplier_edit",
         placeholder="仕入先・取引先",
     )
-    st.sidebar.text_input(
+    st.text_input(
         "仕入日（YYYY-MM-DD・上書き可）",
         key="voucher_date_edit",
         placeholder="例: 2026-04-15",
     )
-    st.sidebar.radio(
+    st.radio(
         "証憑取込の消費税（税込計算）",
         options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
         horizontal=True,
@@ -1296,13 +1259,13 @@ def _render_voucher_inventory_sidebar() -> None:
 
     base_df = st.session_state.get("voucher_preview_df")
     if base_df is not None and not base_df.empty:
-        edited_df = st.sidebar.data_editor(
+        edited_df = st.data_editor(
             base_df,
             num_rows="dynamic",
             key=VOUCHER_DATA_EDITOR_KEY,
             use_container_width=True,
         )
-        if st.sidebar.button(
+        if st.button(
             "この内容で台帳に確定反映",
             type="primary",
             key="voucher_confirm_btn",
@@ -1316,7 +1279,7 @@ def _render_voucher_inventory_sidebar() -> None:
                     or "10%"
                 ),
             )
-        if st.sidebar.button("プレビューをクリア", key="voucher_clear_preview_btn"):
+        if st.button("プレビューをクリア", key="voucher_clear_preview_btn"):
             st.session_state.pop("voucher_preview_df", None)
             st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
             st.rerun()
@@ -1641,9 +1604,33 @@ def _parse_max_management_serial(rows: list[Any], col_idx: int) -> int:
     return mx
 
 
+def _max_management_serial_from_dataframe(df: pd.DataFrame) -> int:
+    """DataFrame の管理ID列から最大シリアルを返す。"""
+    mx = 0
+    if df is None or df.empty or COL_MANAGEMENT_ID not in df.columns:
+        return mx
+    for v in df[COL_MANAGEMENT_ID].astype(str):
+        s = v.strip()
+        if not s:
+            continue
+        m = re.fullmatch(r"(?i)G(\d+)", s)
+        if m:
+            mx = max(mx, int(m.group(1)))
+            continue
+        if s.isdigit():
+            mx = max(mx, int(s))
+    return mx
+
+
 def allocate_management_ids(ws: Any, count: int) -> list[str]:
-    """管理ID（G########）を count 件、シート現状から連番で採番する。"""
+    """管理ID（G########）を count 件、CSV またはシート現状から連番で採番する。"""
     if count <= 0:
+        return []
+    if _uses_local_inventory_csv():
+        df = inventory_csv.read_df()
+        mx = _max_management_serial_from_dataframe(df)
+        return [f"G{mx + i + 1:08d}" for i in range(count)]
+    if ws is None:
         return []
     try:
         raw = ws.get_all_values()
@@ -1674,10 +1661,6 @@ def append_sheet_row(
     sale_source_management_id: str = "",
 ):
     """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。"""
-    ws = ensure_worksheet_header()
-    if ws is None:
-        st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
-        return
     now = (record_datetime or "").strip() or jst_now_str()
     cogs = _finite_int(line_price_excl_yen, 0)
     qty_i = 1
@@ -1711,28 +1694,40 @@ def append_sheet_row(
         stt,
     )
     gross_cell = 0 if gp is None else _finite_int(gp, 0)
+    row_vals: list[Any] = [
+        now,
+        movement,
+        product_name,
+        supplier,
+        1,
+        line_price_excl_yen,
+        line_price_incl_yen,
+        planned_unit_cell,
+        planned_incl_cell,
+        actual_unit_cell,
+        actual_incl_cell,
+        gross_cell,
+        stt,
+        memo,
+        image_url,
+        management_id,
+        "",
+        (sale_source_management_id or "").strip(),
+    ]
+    if _uses_local_inventory_csv():
+        df = inventory_csv.read_df()
+        new_row = dict(zip(EXPECTED_HEADERS, row_vals))
+        df2 = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        df2 = _recalc_gross_profit_dataframe(df2)
+        inventory_csv.write_df(df2.reindex(columns=EXPECTED_HEADERS))
+        return
+    ws = ensure_worksheet_header()
+    if ws is None:
+        st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
+        return
     try:
         ws.append_row(
-            [
-                now,
-                movement,
-                product_name,
-                supplier,
-                1,
-                line_price_excl_yen,
-                line_price_incl_yen,
-                planned_unit_cell,
-                planned_incl_cell,
-                actual_unit_cell,
-                actual_incl_cell,
-                gross_cell,
-                stt,
-                memo,
-                image_url,
-                management_id,
-                "",
-                (sale_source_management_id or "").strip(),
-            ],
+            row_vals,
             value_input_option="USER_ENTERED",
         )
         try:
@@ -1745,6 +1740,8 @@ def append_sheet_row(
 
 def load_inventory_dataframe() -> pd.DataFrame | None:
     """1行目をヘッダー、2行目以降をデータとして読み込み、列は EXPECTED_HEADERS に揃える。"""
+    if _uses_local_inventory_csv():
+        return inventory_csv.read_df()
     ws = _get_or_create_inventory_worksheet()
     if ws is None:
         return None
@@ -1774,11 +1771,12 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
 
 
 def _ledger_hint_dataframe() -> pd.DataFrame | None:
-    """登録画面の台帳照合用に在庫シートを読む（失敗時は None）。"""
-    if not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+    """登録画面の台帳照合用に在庫を読む（失敗時は None）。"""
+    if not _uses_local_inventory_csv() and not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
         return None
     try:
-        return load_inventory_dataframe()
+        df = load_inventory_dataframe()
+        return df
     except Exception:
         return None
 
@@ -1851,13 +1849,18 @@ def _cell_value_for_sheet(v: Any) -> Any:
 
 
 def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
-    """編集後の DataFrame の内容でワークシートをクリアし、ヘッダー＋全行を書き直す。"""
+    """編集後の DataFrame で inventory.csv またはワークシートを全置換する。"""
+    out = _recalc_gross_profit_dataframe(
+        df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
+    )
+    if _uses_local_inventory_csv():
+        inventory_csv.write_df(out)
+        return
     ws = _get_or_create_inventory_worksheet()
     if ws is None:
         raise RuntimeError(
             f"スプレッドシートに接続できません。{SECRET_GOOGLE_SPREADSHEET_ID} とサービスアカウントを確認してください。"
         )
-    out = _recalc_gross_profit_dataframe(df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy())
     values: list[list[Any]] = [EXPECTED_HEADERS]
     if not out.empty:
         for row in out[EXPECTED_HEADERS].to_numpy(dtype=object):
@@ -2522,12 +2525,99 @@ def _render_inventory_price_summary(df: pd.DataFrame) -> None:
     m4.metric("想定粗利（税抜・合計）", f"¥{total_margin:,}")
 
 
-def render_inventory_manager() -> None:
-    st.divider()
-    st.markdown("##### 在庫一覧")
+def _product_keyword_category(name: str) -> str:
+    """ダッシュボード用の簡易カテゴリ（商品名のキーワードから推定）。"""
+    s = str(name or "")
+    if re.search("振袖", s):
+        return "振袖"
+    if re.search("訪問着", s):
+        return "訪問着"
+    if re.search("帯", s):
+        return "帯"
+    if re.search("長襦袢|襦袢", s):
+        return "長襦袢・襦袢"
+    return "その他"
+
+
+def render_analytics_dashboard_page() -> None:
+    """集計・分析: メトリクス・Plotly・既存の月次ダッシュボード。"""
+    st.subheader("集計・分析（ダッシュボード）")
     st.caption(
-        "スプレッドシートの全データを編集できます。行の追加・削除は表から操作し、"
-        "表の直下の「台帳を更新する」でシートを上書き保存します。"
+        "共有の **inventory.csv**（`INVENTORY_SOURCE=csv`）または **Google スプレッドシート**から読み込んだ最新データを集計します。"
+    )
+    if not _uses_local_inventory_csv() and not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+        st.info(
+            "`GOOGLE_SPREADSHEET_ID` を設定するか、`INVENTORY_SOURCE = \"csv\"` で CSV を使ってください。"
+        )
+        return
+    try:
+        df_raw = load_inventory_dataframe()
+    except Exception as e:
+        st.error(f"読み込みに失敗しました: {e}")
+        return
+    if df_raw is None:
+        st.warning("台帳を開けませんでした。サービスアカウントと共有設定を確認してください。")
+        return
+    if df_raw.empty:
+        st.info("集計する行がありません。")
+        return
+
+    calc = _recalc_gross_profit_dataframe(df_raw.copy())
+    if COL_STOCK_STATUS not in calc.columns:
+        st.warning("ステータス列がないため在庫中の集計ができません。")
+        render_ledger_dashboard(calc)
+        return
+
+    mask_stock = calc[COL_STOCK_STATUS].astype(str).str.strip() == STATUS_IN_STOCK
+    sub = calc.loc[mask_stock].copy()
+    cg = _series_to_numeric_loose(sub[COL_PRICE_EXCL]).fillna(0).clip(lower=0)
+    total_inv = int(cg.sum())
+    n_lines = int(len(sub))
+    gp_s = _series_to_numeric_loose(sub[COL_GROSS_PROFIT]).fillna(0)
+    ratios: list[float] = []
+    for i in range(len(sub)):
+        c = float(cg.iloc[i])
+        g = float(gp_s.iloc[i])
+        if c > 0:
+            ratios.append(100.0 * g / c)
+    avg_ratio = float(np.mean(ratios)) if ratios else None
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("在庫中 総額（仕入・税抜）", f"¥{total_inv:,}")
+    k2.metric("在庫中 行数（点数）", f"{n_lines:,}")
+    k3.metric(
+        "在庫中 平均粗利率（粗利÷原価）",
+        f"{avg_ratio:.1f} %" if avg_ratio is not None else "—",
+    )
+
+    st.markdown("##### カテゴリー別 在庫原価（税抜）の構成比")
+    st.caption("商品名に含まれるキーワードで振り分けたうえで、在庫中の仕入金額（税抜）を合算しています。")
+    sub["_category"] = sub[COL_NAME].astype(str).map(_product_keyword_category)
+    sub["_px"] = _series_to_numeric_loose(sub[COL_PRICE_EXCL]).fillna(0)
+    pie_df = sub.groupby("_category", dropna=False)["_px"].sum().reset_index()
+    pie_df.columns = ["カテゴリー", "金額税抜"]
+    if pie_df["金額税抜"].sum() > 0:
+        fig = px.pie(
+            pie_df,
+            names="カテゴリー",
+            values="金額税抜",
+            hole=0.35,
+            title="在庫中の原価シェア（簡易カテゴリ）",
+        )
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption("在庫中で原価が入っている行がありません。")
+
+    st.divider()
+    render_ledger_dashboard(calc)
+
+
+def render_inventory_list_page() -> None:
+    st.subheader("在庫一覧")
+    st.caption(
+        "共有の **inventory.csv** または **スプレッドシート**の全データを編集できます。行の追加・削除は表から操作し、"
+        "「台帳を更新する」で保存します。"
         "棚卸し用の「最後に確認した日付（棚卸日）」は **YYYY-MM-DD** 推奨です（例: 今日なら "
         f"{_today_jst_date().isoformat()}）。"
         "下の表は常に **全行** を表示します（未確認だけの一覧は展開パネルで参照し、保存で行が消えないようにしています）。"
@@ -2536,15 +2626,21 @@ def render_inventory_manager() -> None:
     if msg := st.session_state.pop("_ledger_saved_flash", None):
         st.success(msg)
 
-    if not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+    if not _uses_local_inventory_csv() and not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
         st.info(
-            f"{SECRET_GOOGLE_SPREADSHEET_ID} を設定すると、台帳の表示・編集ができます。"
+            f"{SECRET_GOOGLE_SPREADSHEET_ID} を設定するか、`INVENTORY_SOURCE = \"csv\"` で "
+            "共有の inventory.csv を有効にしてください。"
         )
         return
 
     r1, _ = st.columns([1, 2])
     with r1:
-        if st.button("スプレッドシートから再読込", key="ledger_reload_from_sheet"):
+        _reload_label = (
+            "inventory.csv から再読込"
+            if _uses_local_inventory_csv()
+            else "スプレッドシートから再読込"
+        )
+        if st.button(_reload_label, key="ledger_reload_from_sheet"):
             st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
             st.rerun()
 
@@ -2555,7 +2651,7 @@ def render_inventory_manager() -> None:
         return
 
     if df_sheet is None:
-        st.warning("スプレッドシートを開けませんでした。サービスアカウントと共有設定を確認してください。")
+        st.warning("台帳を開けませんでした。サービスアカウントと共有設定を確認してください。")
         return
 
     n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
@@ -2669,7 +2765,7 @@ def render_inventory_manager() -> None:
             ed_bulk[COL_LAST_STOCKTAKE] = ""
         m_b = _mask_ledger_stocktake_unverified(ed_bulk)
         ed_bulk.loc[m_b, COL_LAST_STOCKTAKE] = _today_jst_date().isoformat()
-        with st.spinner("スプレッドシートに書き込んでいます…"):
+        with st.spinner("台帳を保存しています…"):
             try:
                 overwrite_inventory_worksheet_from_dataframe(ed_bulk)
             except Exception as e:
@@ -2684,7 +2780,7 @@ def render_inventory_manager() -> None:
     _render_inventory_price_summary(edited)
 
     if st.button("台帳を更新する", type="primary", key="ledger_save_overwrite"):
-        with st.spinner("スプレッドシートに書き込んでいます…"):
+        with st.spinner("台帳を保存しています…"):
             try:
                 overwrite_inventory_worksheet_from_dataframe(edited)
             except Exception as e:
@@ -2693,8 +2789,6 @@ def render_inventory_manager() -> None:
         st.session_state["_ledger_saved_flash"] = "台帳を更新しました。"
         st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
         st.rerun()
-
-    render_ledger_dashboard(edited)
 
 
 def _init_registration_form_session_state() -> None:
@@ -2741,10 +2835,27 @@ def _init_registration_form_session_state() -> None:
 
 def main():
     st.set_page_config(page_title="商品在庫・販売", layout="wide")
+    _nav_opts = ("登録（インプット）", "在庫一覧", "集計・分析（ダッシュボード）")
+    if "nav_page" not in st.session_state:
+        st.session_state.nav_page = _nav_opts[0]
+    with st.sidebar:
+        st.markdown("### メニュー")
+        page = st.radio("ページ", _nav_opts, key="nav_page")
     st.title("商品在庫・販売管理")
-    st.caption("写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・スプレッドシート記録ができます。")
+    st.caption(
+        "写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・"
+        "**inventory.csv** またはスプレッドシートへの記録ができます。"
+    )
+    if page == "在庫一覧":
+        render_inventory_list_page()
+        return
+    if page == "集計・分析（ダッシュボード）":
+        render_analytics_dashboard_page()
+        return
+
     _init_voucher_sidebar_state()
-    _render_voucher_inventory_sidebar()
+    _render_voucher_inventory_panel()
+    st.divider()
     st.subheader("台帳登録")
 
     _init_registration_form_session_state()
@@ -2919,7 +3030,7 @@ def main():
                 key="ledger_pick_supplier",
                 on_change=_on_ledger_pick_supplier,
             )
-    elif _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+    elif _uses_local_inventory_csv() or _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
         st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
 
     st.markdown("##### 必須入力項目")
@@ -3144,7 +3255,7 @@ def main():
     )
 
     confirm = st.button(
-        "確定（スプレッドシート記録・写真は任意でドライブ保存）",
+        "確定（台帳に記録・写真は任意でドライブ保存）",
         type="primary",
     )
 
@@ -3211,13 +3322,22 @@ def main():
                             urls = [shared_url] * n_save
 
             if ready_for_sheet:
-                ws0 = ensure_worksheet_header()
-                if ws0 is None:
+                ws0 = (
+                    None
+                    if _uses_local_inventory_csv()
+                    else ensure_worksheet_header()
+                )
+                if not _uses_local_inventory_csv() and ws0 is None:
                     st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
                 else:
                     try:
                         ids = allocate_management_ids(ws0, n_save)
-                        with st.spinner("スプレッドシートに記録しています…"):
+                        _spin_msg = (
+                            "inventory.csv に記録しています…"
+                            if _uses_local_inventory_csv()
+                            else "スプレッドシートに記録しています…"
+                        )
+                        with st.spinner(_spin_msg):
                             for i in range(n_save):
                                 append_sheet_row(
                                     movement,
@@ -3236,7 +3356,7 @@ def main():
                                     sale_source_management_id=_sale_src_save,
                                 )
                     except Exception as e:
-                        st.error(f"スプレッドシート更新に失敗しました: {e}")
+                        st.error(f"台帳の更新に失敗しました: {e}")
                         if any(urls):
                             st.warning(
                                 "一部の画像はドライブに保存済みの可能性があります。台帳の内容を確認してください。"
@@ -3276,8 +3396,6 @@ def main():
                         if len(_link_urls) > 8:
                             st.caption(f"ほか {len(_link_urls) - 8} 件の画像URLは台帳の「{COL_IMAGE_URL}」列を参照してください。")
                         st.balloons()
-
-    render_inventory_manager()
 
 
 if __name__ == "__main__":
