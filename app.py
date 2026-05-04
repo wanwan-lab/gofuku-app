@@ -114,6 +114,10 @@ STATUS_IN_STOCK = "在庫中"
 STATUS_SOLD = "販売済"
 STOCK_STATUS_OPTIONS: tuple[str, ...] = (STATUS_IN_STOCK, STATUS_SOLD)
 
+# 登録画面「数量」の number_input 専用キー。
+# 旧実装で max_value=1・disabled が付いていた端末では、同一キーのままだと数量が増やせないことがあるため分離する。
+REGISTRATION_QTY_WIDGET_KEY = "registration_qty_input"
+
 
 def _movement_is_outbound(mv: str) -> bool:
     """入出庫種別が出庫（販売・浮貸など）かどうか。"""
@@ -564,10 +568,12 @@ def _apply_gemini_json_to_session(
     """Gemini の JSON をフォーム用 session_state に反映する（英日キー両対応）。"""
     r = result
     st.session_state.pop("_gemini_match_management_id", None)
-    st.session_state.field_qty = _coerce_positive_int(
+    _qty_g = _coerce_positive_int(
         r.get("quantity") or r.get("数量") or r.get("qty") or 1,
         default=1,
     )
+    st.session_state.field_qty = _qty_g
+    st.session_state[REGISTRATION_QTY_WIDGET_KEY] = _qty_g
 
     m = r.get("match")
     row_hit: pd.Series | None = None
@@ -1364,25 +1370,31 @@ def _confirm_voucher_import(
     idx = 0
     try:
         with st.spinner("台帳に書き込んでいます…"):
+            _v_dt = jst_now_str()
+            batch_rows: list[list[Any]] = []
             for name, q, up, cat in rows_spec:
                 memo = f"証憑取込 category={cat}" if cat else "証憑取込"
                 incl = price_incl_tax(up, tax_r)
                 for _ in range(q):
-                    append_sheet_row(
-                        "入庫（購入）",
-                        name,
-                        sup,
-                        up,
-                        incl,
-                        "",
-                        ids[idx],
-                        memo,
-                        record_datetime=rec_dt,
-                        consumption_tax_rate=tax_r,
-                        voucher_recorded_at=recorded_at,
-                        voucher_evidence_url=evidence_url,
+                    batch_rows.append(
+                        _inventory_row_values_for_append(
+                            _v_dt,
+                            rec_dt,
+                            "入庫（購入）",
+                            name,
+                            sup,
+                            up,
+                            incl,
+                            "",
+                            ids[idx],
+                            memo,
+                            consumption_tax_rate=tax_r,
+                            voucher_recorded_at=recorded_at,
+                            voucher_evidence_url=evidence_url,
+                        )
                     )
                     idx += 1
+            _append_inventory_data_rows(batch_rows)
     except Exception as e:
         st.error(f"台帳の更新に失敗しました: {e}")
         return
@@ -1846,7 +1858,9 @@ def allocate_management_ids(ws: Any, count: int) -> list[str]:
     return [f"G{mx + i + 1:08d}" for i in range(count)]
 
 
-def append_sheet_row(
+def _inventory_row_values_for_append(
+    dt_a: str,
+    dt_purchase: str,
     purchase_movement: str,
     product_name: str,
     supplier: str,
@@ -1854,8 +1868,7 @@ def append_sheet_row(
     line_price_incl_yen: int,
     image_url: str,
     management_id: str,
-    memo: str = "",
-    record_datetime: str | None = None,
+    memo: str,
     *,
     planned_sale_unit_excl_yen: int = 0,
     actual_sale_unit_excl_yen: int = 0,
@@ -1864,13 +1877,8 @@ def append_sheet_row(
     sale_source_management_id: str = "",
     voucher_recorded_at: str = "",
     voucher_evidence_url: str = "",
-):
-    """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。
-
-    A列「日時」は **追記実行の JST**。仕入の暦は「仕入日時」に ``record_datetime``（EXIF 等）を渡す。
-    """
-    dt_a = jst_now_str()
-    dt_purchase = ((record_datetime or "").strip() or dt_a)
+) -> list[Any]:
+    """台帳 EXPECTED_HEADERS 順の1行分セル値を組み立てる（追記用）。"""
     cogs = _finite_int(line_price_excl_yen, 0)
     qty_i = 1
     pl_u = _finite_int(planned_sale_unit_excl_yen, 0)
@@ -1904,7 +1912,7 @@ def append_sheet_row(
     )
     gross_cell = 0 if gp is None else _finite_int(gp, 0)
     pm = (purchase_movement or "").strip()
-    row_vals: list[Any] = [
+    return [
         dt_a,
         product_name,
         supplier,
@@ -1933,28 +1941,91 @@ def append_sheet_row(
             else ("出庫（販売）" if stt == STATUS_SOLD else "")
         ),
     ]
+
+
+def _append_inventory_data_rows(rows: list[list[Any]]) -> None:
+    """台帳に複数行をまとめて追記する（CSV は1回の再計算・書き込み、シートは append_rows 1回）。
+
+    連続で数十行追記するとき、行ごとの append + 書式 API を繰り返すと失敗や取りこぼしの原因になるため一括にする。
+    """
+    if not rows:
+        return
     if _uses_local_inventory_csv():
         df = _inventory_csv_read_df()
-        new_row = dict(zip(EXPECTED_HEADERS, row_vals))
-        df2 = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        df2 = _recalc_gross_profit_dataframe(df2)
-        _inventory_csv_write_df(df2.reindex(columns=EXPECTED_HEADERS))
+        for rv in rows:
+            new_row = dict(zip(EXPECTED_HEADERS, rv))
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        df = _recalc_gross_profit_dataframe(df)
+        _inventory_csv_write_df(df.reindex(columns=EXPECTED_HEADERS))
         return
     ws = ensure_worksheet_header()
     if ws is None:
-        st.warning("スプレッドシート未設定のため、行の追記をスキップしました。")
-        return
-    try:
-        ws.append_row(
-            row_vals,
-            value_input_option="USER_ENTERED",
+        raise RuntimeError(
+            "スプレッドシートに接続できません。"
+            f"{SECRET_GOOGLE_SPREADSHEET_ID} とサービスアカウント権限を確認してください。"
         )
+    try:
+        try:
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
+        except Exception:
+            try:
+                ws.resize(rows=int(ws.row_count) + len(rows) + 200)
+            except Exception:
+                pass
+            ws.append_rows(rows, value_input_option="USER_ENTERED")
         try:
             _apply_inventory_amount_number_formats(ws)
         except Exception:
             pass
     except Exception as e:
         raise RuntimeError(f"スプレッドシート追記に失敗しました: {e}") from e
+
+
+def append_sheet_row(
+    purchase_movement: str,
+    product_name: str,
+    supplier: str,
+    line_price_excl_yen: int,
+    line_price_incl_yen: int,
+    image_url: str,
+    management_id: str,
+    memo: str = "",
+    record_datetime: str | None = None,
+    *,
+    planned_sale_unit_excl_yen: int = 0,
+    actual_sale_unit_excl_yen: int = 0,
+    stock_status: str = STATUS_IN_STOCK,
+    consumption_tax_rate: float | None = None,
+    sale_source_management_id: str = "",
+    voucher_recorded_at: str = "",
+    voucher_evidence_url: str = "",
+):
+    """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。
+
+    A列「日時」は **追記実行の JST**。仕入の暦は「仕入日時」に ``record_datetime``（EXIF 等）を渡す。
+    """
+    dt_a = jst_now_str()
+    dt_purchase = ((record_datetime or "").strip() or dt_a)
+    row_vals = _inventory_row_values_for_append(
+        dt_a,
+        dt_purchase,
+        purchase_movement,
+        product_name,
+        supplier,
+        line_price_excl_yen,
+        line_price_incl_yen,
+        image_url,
+        management_id,
+        memo,
+        planned_sale_unit_excl_yen=planned_sale_unit_excl_yen,
+        actual_sale_unit_excl_yen=actual_sale_unit_excl_yen,
+        stock_status=stock_status,
+        consumption_tax_rate=consumption_tax_rate,
+        sale_source_management_id=sale_source_management_id,
+        voucher_recorded_at=voucher_recorded_at,
+        voucher_evidence_url=voucher_evidence_url,
+    )
+    _append_inventory_data_rows([row_vals])
 
 
 def _sheet_header_row_to_expected_list(header: list[str], row: list[Any]) -> list[str]:
@@ -3316,6 +3387,10 @@ def _init_registration_form_session_state() -> None:
         st.session_state.field_supplier = ""
     if "field_qty" not in st.session_state:
         st.session_state.field_qty = 1
+    if REGISTRATION_QTY_WIDGET_KEY not in st.session_state:
+        st.session_state[REGISTRATION_QTY_WIDGET_KEY] = int(
+            st.session_state.get("field_qty", 1)
+        )
     if "ai_kind" not in st.session_state:
         st.session_state.ai_kind = ""
     if "ai_features" not in st.session_state:
@@ -3426,6 +3501,7 @@ def main():
             st.session_state.field_product_name = ""
             st.session_state.field_supplier = ""
             st.session_state.field_qty = 1
+            st.session_state[REGISTRATION_QTY_WIDGET_KEY] = 1
             st.session_state.ai_kind = ""
             st.session_state.ai_features = ""
             st.session_state.ai_parse_ran = False
@@ -3592,13 +3668,14 @@ def main():
         "数量（点数）",
         min_value=1,
         step=1,
-        key="field_qty",
+        key=REGISTRATION_QTY_WIDGET_KEY,
         help=(
             "台帳は **1点1行** で保存します。行数は常にこの数量と同じです。"
             "出庫（販売）で数量が2以上のときは、**販売元管理ID** を同じ件数で入力してください（カンマ・読点・空白・改行で区切り可）。"
             "入庫・出庫（浮貸）では写真は1枚まで・複数点のときは **同じ画像URL** を各行に入れます。"
         ),
     )
+    st.session_state.field_qty = int(quantity)
     if movement == "出庫（販売）":
         st.caption(
             "数量が **2以上** のときは **販売元管理ID** を **数量と同じ件数** で入力してください（例: `G00000001, G00000002`）。"
@@ -4049,23 +4126,29 @@ def main():
                                 else "スプレッドシートに記録しています…"
                             )
                             with st.spinner(_spin_msg):
+                                _reg_row_dt = jst_now_str()
+                                _reg_batch: list[list[Any]] = []
                                 for i in range(n_save):
-                                    append_sheet_row(
-                                        movement,
-                                        product_name.strip(),
-                                        supplier.strip(),
-                                        _lex_one,
-                                        _lin_one,
-                                        urls[i],
-                                        ids[i],
-                                        memo_s,
-                                        record_datetime=_record_dt,
-                                        planned_sale_unit_excl_yen=_plan2,
-                                        actual_sale_unit_excl_yen=_act_ex2,
-                                        stock_status=_stat2,
-                                        consumption_tax_rate=_tax_r2,
-                                        sale_source_management_id=_sale_src_save,
+                                    _reg_batch.append(
+                                        _inventory_row_values_for_append(
+                                            _reg_row_dt,
+                                            _record_dt,
+                                            movement,
+                                            product_name.strip(),
+                                            supplier.strip(),
+                                            _lex_one,
+                                            _lin_one,
+                                            urls[i],
+                                            ids[i],
+                                            memo_s,
+                                            planned_sale_unit_excl_yen=_plan2,
+                                            actual_sale_unit_excl_yen=_act_ex2,
+                                            stock_status=_stat2,
+                                            consumption_tax_rate=_tax_r2,
+                                            sale_source_management_id=_sale_src_save,
+                                        )
                                     )
+                                _append_inventory_data_rows(_reg_batch)
                         except Exception as e:
                             st.error(f"台帳の更新に失敗しました: {e}")
                             if any(urls):
