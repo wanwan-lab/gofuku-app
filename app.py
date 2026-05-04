@@ -31,6 +31,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 サイドバーで **登録（インプット）** / **在庫一覧** / **集計・分析（ダッシュボード）** を切り替えられます。
 在庫データは **共有の inventory.csv**（ローカル）または **Google スプレッドシート**（``INVENTORY_SOURCE`` で選択）に読み書きします。
+列定義・CSV 入出力は **app.py 内に内包**しており、補助用の ``ledger_schema`` / ``inventory_csv`` モジュールは不要です。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
@@ -56,9 +57,11 @@ import difflib
 import io
 import json
 import math
+import os
 import re
 import uuid
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import altair as alt
@@ -72,9 +75,92 @@ import streamlit as st
 from google.oauth2 import service_account
 from PIL import Image, ImageOps
 
-from ledger_schema import *  # noqa: F403
+# --- スプレッドシート列・税率（app 単体で完結：サブモジュール未コミットでも Cloud で動く） ---
+COL_DATETIME = "日時"
+COL_TYPE = "入出庫種別"
+COL_NAME = "商品名"
+COL_SUPPLIER = "仕入先・取引先"
+COL_QTY = "数量"
+COL_PRICE_EXCL = "仕入金額（税抜）"
+COL_PRICE_INCL = "仕入金額（税込）"
+LEGACY_COL_UNIT_PRICE = "仕入単価（税抜）"
+COL_PLANNED_SALE = "販売予定金額（税抜）"
+COL_PLANNED_SALE_INCL = "販売予定金額（税込）"
+COL_ACTUAL_SALE = "実売金額（税抜）"
+COL_ACTUAL_SALE_INCL = "実売金額（税込）"
+COL_GROSS_PROFIT = "粗利"
+COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
+COL_IMAGE_URL = "画像URL"
+COL_MEMO = "メモ"
+COL_MANAGEMENT_ID = "管理ID"
+COL_LAST_STOCKTAKE = "最後に確認した日付（棚卸日）"
+COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
 
-import inventory_csv
+STATUS_IN_STOCK = "在庫中"
+STATUS_SOLD = "販売済"
+STOCK_STATUS_OPTIONS: tuple[str, ...] = (STATUS_IN_STOCK, STATUS_SOLD)
+
+
+def _movement_is_outbound(mv: str) -> bool:
+    """入出庫種別が出庫（販売・浮貸など）かどうか。"""
+    return (mv or "").strip().startswith("出庫")
+
+
+CONSUMPTION_TAX_RATE = 0.10
+CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
+    "10%": 0.10,
+    "8%": 0.08,
+    "非課税": 0.0,
+}
+
+EXPECTED_HEADERS: list[str] = [
+    COL_DATETIME,
+    COL_TYPE,
+    COL_NAME,
+    COL_SUPPLIER,
+    COL_QTY,
+    COL_PRICE_EXCL,
+    COL_PRICE_INCL,
+    COL_PLANNED_SALE,
+    COL_PLANNED_SALE_INCL,
+    COL_ACTUAL_SALE,
+    COL_ACTUAL_SALE_INCL,
+    COL_GROSS_PROFIT,
+    COL_STOCK_STATUS,
+    COL_MEMO,
+    COL_IMAGE_URL,
+    COL_MANAGEMENT_ID,
+    COL_LAST_STOCKTAKE,
+    COL_SALE_SOURCE_MGMT_ID,
+]
+
+_INVENTORY_CSV_DEFAULT_NAME = "inventory.csv"
+
+
+def _inventory_csv_path() -> Path:
+    raw = (os.environ.get("GOFUKU_INVENTORY_CSV") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path(__file__).resolve().parent / _INVENTORY_CSV_DEFAULT_NAME
+
+
+def _inventory_csv_read_df() -> pd.DataFrame:
+    path = _inventory_csv_path()
+    if not path.exists():
+        return pd.DataFrame(columns=EXPECTED_HEADERS)
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    for c in EXPECTED_HEADERS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[EXPECTED_HEADERS].copy()
+
+
+def _inventory_csv_write_df(df: pd.DataFrame) -> None:
+    path = _inventory_csv_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
+    out.to_csv(path, index=False, encoding="utf-8-sig")
+
 
 # --- st.secrets のキー名（文字列リテラルの散在を避ける） ---
 SECRET_GEMINI_API_KEY = "GEMINI_API_KEY"
@@ -1626,7 +1712,7 @@ def allocate_management_ids(ws: Any, count: int) -> list[str]:
     if count <= 0:
         return []
     if _uses_local_inventory_csv():
-        df = inventory_csv.read_df()
+        df = _inventory_csv_read_df()
         mx = _max_management_serial_from_dataframe(df)
         return [f"G{mx + i + 1:08d}" for i in range(count)]
     if ws is None:
@@ -1714,11 +1800,11 @@ def append_sheet_row(
         (sale_source_management_id or "").strip(),
     ]
     if _uses_local_inventory_csv():
-        df = inventory_csv.read_df()
+        df = _inventory_csv_read_df()
         new_row = dict(zip(EXPECTED_HEADERS, row_vals))
         df2 = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         df2 = _recalc_gross_profit_dataframe(df2)
-        inventory_csv.write_df(df2.reindex(columns=EXPECTED_HEADERS))
+        _inventory_csv_write_df(df2.reindex(columns=EXPECTED_HEADERS))
         return
     ws = ensure_worksheet_header()
     if ws is None:
@@ -1740,7 +1826,7 @@ def append_sheet_row(
 def load_inventory_dataframe() -> pd.DataFrame | None:
     """1行目をヘッダー、2行目以降をデータとして読み込み、列は EXPECTED_HEADERS に揃える。"""
     if _uses_local_inventory_csv():
-        return inventory_csv.read_df()
+        return _inventory_csv_read_df()
     ws = _get_or_create_inventory_worksheet()
     if ws is None:
         return None
@@ -1853,7 +1939,7 @@ def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
         df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
     )
     if _uses_local_inventory_csv():
-        inventory_csv.write_df(out)
+        _inventory_csv_write_df(out)
         return
     ws = _get_or_create_inventory_worksheet()
     if ws is None:
