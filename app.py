@@ -14,12 +14,15 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 任意:
   GEMINI_MODEL_NAME          … Gemini モデル ID（未設定時は下記 DEFAULT_GEMINI_MODEL）
+  GEMINI_VOUCHER_MODEL_NAME  … 証憑（納品書等）画像解析専用モデル（未設定時は GEMINI_MODEL_NAME と同じ既定）
   GOOGLE_WORKSHEET_NAME      … ワークシート名（未設定時は DEFAULT_WORKSHEET_NAME）
   GAS_UPLOAD_TIMEOUT_SECONDS … GAS への POST タイムアウト秒（既定 300、1〜3600 にクランプ）
   FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED … GAS 未設定時に台帳の画像URL列へ入れるプレースホルダ URL
   APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
 
 ※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（既定は flash 系プレビュー）。
+※ サイドバーの **証憑から在庫反映** で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
+※ PDF/Excel/Word 取込には ``pypdf`` / ``pymupdf`` / ``openpyxl`` / ``python-docx`` を使用します（requirements.txt）。
 ※ アップロード画像は任意。ある場合のみ Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
@@ -69,6 +72,7 @@ from PIL import Image, ImageOps
 # --- st.secrets のキー名（文字列リテラルの散在を避ける） ---
 SECRET_GEMINI_API_KEY = "GEMINI_API_KEY"
 SECRET_GEMINI_MODEL_NAME = "GEMINI_MODEL_NAME"
+SECRET_GEMINI_VOUCHER_MODEL_NAME = "GEMINI_VOUCHER_MODEL_NAME"
 SECRET_GAS_UPLOAD_URL = "GAS_UPLOAD_URL"
 SECRET_GAS_API_KEY = "GAS_API_KEY"
 SECRET_GAS_UPLOAD_TIMEOUT_SECONDS = "GAS_UPLOAD_TIMEOUT_SECONDS"
@@ -153,7 +157,29 @@ EXPECTED_HEADERS: list[str] = [
 SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
 TZ_JP = pytz.timezone("Asia/Tokyo")
 LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
+VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
+
+# 証憑取込（Gemini への共通指示・JSON 仕様）
+VOUCHER_EXTRACTION_RULES = """注意点:
+- 商品名が曖昧な場合（例：着物一式）は、入力内の他の情報から「振袖」や「訪問着」などのカテゴリーを推測し、items[].category と name の両方に反映できるよう整理してください。
+- 手書きの修正や合計金額がある場合は、最新の数値を優先してください。
+- 出力は、プログラムで解析可能な純粋な JSON オブジェクトのみとしてください（説明文・Markdown・コードフェンスは禁止）。"""
+
+VOUCHER_JSON_SPEC = """JSON の構造（キーは次のみ。値の型を守ること）:
+{
+  "supplier_name": "仕入先名（文字列。読めなければ空文字）",
+  "purchase_date": "YYYY-MM-DD（暦日のみ。読めなければ空文字）",
+  "items": [
+    {
+      "name": "商品名",
+      "quantity": 整数（1以上。読めなければ1）,
+      "unit_price": 1点または当該明細行の税抜単価・金額（円の整数。読めなければ null）,
+      "category": "推定区分（振袖・訪問着・帯など。不明なら空文字）"
+    }
+  ]
+}
+unit_price は原則として税抜の円整数。明細が税込のみのときは税抜に換算して整数で入れてください。"""
 
 
 def check_password() -> bool:
@@ -370,6 +396,12 @@ def _fallback_image_url_when_gas_unconfigured() -> str:
 
 def _gemini_model_name() -> str:
     return _secret_str(SECRET_GEMINI_MODEL_NAME, DEFAULT_GEMINI_MODEL)
+
+
+def _gemini_voucher_model_name() -> str:
+    """証憑画像解析用モデル。専用キーが空なら通常の Gemini モデル名にフォールバック。"""
+    v = _secret_str(SECRET_GEMINI_VOUCHER_MODEL_NAME, "")
+    return v if v else _gemini_model_name()
 
 
 def _load_service_account_info() -> dict[str, Any]:
@@ -828,6 +860,466 @@ def analyze_image_with_gemini(
   不要・該当なしのときは "match" キー自体を省略してもよい。"""
     response = model.generate_content([prompt, image_data])
     return response.text or ""
+
+
+def _voucher_configure_model():
+    api_key = _secret_str(SECRET_GEMINI_API_KEY)
+    if not api_key:
+        raise RuntimeError(
+            f"{SECRET_GEMINI_API_KEY} が設定されていません。`.streamlit/secrets.toml` を確認してください。"
+        )
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(_gemini_voucher_model_name())
+
+
+def analyze_voucher_document_with_gemini_images(images: list[Any]) -> str:
+    """証憑のページ画像（1枚以上）を Gemini に渡し、supplier_name / purchase_date / items の JSON 文字列を返す。"""
+    if not images:
+        raise ValueError("画像がありません。")
+    model = _voucher_configure_model()
+    n = len(images)
+    multi = (
+        "複数のページ画像が順に渡されています。全体を通して一つの証憑として読み取ってください。"
+        if n > 1
+        else ""
+    )
+    prompt = f"""内部システムプロンプト:
+あなたはプロの会計士です。提供された呉服店向け証憑（納品書・請求書・領収書）のページ画像を解析し、在庫管理に必要なデータを抽出してください。
+{multi}
+
+{VOUCHER_EXTRACTION_RULES}
+
+{VOUCHER_JSON_SPEC}"""
+    response = model.generate_content([prompt, *images])
+    return response.text or ""
+
+
+def analyze_voucher_document_with_gemini(image_data) -> str:
+    """単一の証憑画像を Gemini に渡す（後方互換・内部は複数画像 API と共通）。"""
+    return analyze_voucher_document_with_gemini_images([image_data])
+
+
+def analyze_voucher_document_with_gemini_text(
+    *, source_instruction: str, document_body: str
+) -> str:
+    """テキスト（PDF抽出・Markdown表・Word全文など）から同一 JSON 形式で抽出する。"""
+    model = _voucher_configure_model()
+    body = (document_body or "").strip()
+    max_chars = 600_000
+    if len(body) > max_chars:
+        body = body[:max_chars] + "\n\n（長文のため先頭のみ。末尾を省略しました）"
+    prompt = f"""内部システムプロンプト:
+あなたはプロの会計士です。呉服店向け証憑（納品書・請求書・領収書）に関する次の入力から、在庫管理に必要なデータを抽出してください。
+
+{source_instruction}
+
+{VOUCHER_EXTRACTION_RULES}
+
+{VOUCHER_JSON_SPEC}
+
+--- 入力ここから ---
+{body}
+--- 入力ここまで ---"""
+    response = model.generate_content(prompt)
+    return response.text or ""
+
+
+def _voucher_upload_suffix(filename: str) -> str:
+    parts = (filename or "").rsplit(".", 1)
+    return parts[-1].lower() if len(parts) == 2 else ""
+
+
+def _voucher_extract_pdf_text(pdf_bytes: bytes) -> str:
+    """pypdf で PDF からプレーンテキストを抽出する。"""
+    from pypdf import PdfReader
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as e:
+        raise ValueError(f"PDF を開けませんでした: {e}") from e
+    if getattr(reader, "is_encrypted", False):
+        try:
+            auth = reader.decrypt("")
+        except Exception as e:
+            raise ValueError("パスワード付きPDFには未対応です。") from e
+        if auth == 0:
+            raise ValueError("パスワード付きPDFには未対応です。")
+    chunks: list[str] = []
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        chunks.append(t)
+    return "\n".join(chunks).strip()
+
+
+def _voucher_pdf_pages_to_images(
+    pdf_bytes: bytes, *, max_pages: int = 15, zoom: float = 2.0
+) -> list[Image.Image]:
+    """スキャン PDF 等をページ画像にレンダリングする（pymupdf）。"""
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        n = min(doc.page_count, max_pages)
+        if n <= 0:
+            raise ValueError("PDF にページがありません。")
+        out: list[Image.Image] = []
+        for i in range(n):
+            page = doc.load_page(i)
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            out.append(
+                Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            )
+        return out
+    finally:
+        doc.close()
+
+
+def _dataframe_to_markdown_table(df: pd.DataFrame, *, max_rows: int = 500) -> str:
+    """pandas DataFrame を簡易 Markdown 表にする（外部パッケージ不要）。"""
+    df2 = df.fillna("").head(max_rows).copy()
+    cols = [str(c).replace("|", "/") for c in df2.columns]
+    header = "| " + " | ".join(cols) + " |"
+    sep = "| " + " | ".join("---" for _ in cols) + " |"
+    lines = [header, sep]
+    for _, row in df2.iterrows():
+        cells = [
+            str(v).replace("|", "\\|").replace("\n", " ").strip()
+            for v in row.tolist()
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _voucher_excel_bytes_to_markdown(xlsx_bytes: bytes) -> str:
+    """Excel を全シート読み、Markdown 形式のテキストにまとめる。"""
+    bio = io.BytesIO(xlsx_bytes)
+    try:
+        xl = pd.ExcelFile(bio, engine="openpyxl")
+    except Exception as e:
+        raise ValueError(
+            f"Excel（.xlsx）の読み込みに失敗しました。openpyxl 対応形式か確認してください: {e}"
+        ) from e
+    parts: list[str] = []
+    for sheet in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name=sheet, header=0, engine="openpyxl")
+        if df.empty:
+            parts.append(f"## シート: {sheet}\n\n（データ行なし）\n")
+        else:
+            parts.append(
+                f"## シート: {sheet}\n\n{_dataframe_to_markdown_table(df)}\n"
+            )
+    text = "\n".join(parts).strip()
+    if not text:
+        raise ValueError("Excel に読み取れるシートがありません。")
+    return text
+
+
+def _voucher_docx_bytes_to_text(docx_bytes: bytes) -> str:
+    """Word（.docx）から段落および表セルのテキストを抽出する。"""
+    from docx import Document
+
+    doc = Document(io.BytesIO(docx_bytes))
+    paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+    table_lines: list[str] = []
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [
+                cell.text.strip().replace("\n", " ") for cell in row.cells
+            ]
+            table_lines.append("\t".join(cells))
+    blocks = paras + table_lines
+    return "\n".join(blocks).strip()
+
+
+class _VoucherRawBytesUpload:
+    """``_gemini_input_image_from_upload`` 用の最小インターフェース。"""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def analyze_voucher_upload_bytes(raw: bytes, filename: str) -> str:
+    """アップロード種別に応じて分岐し、Gemini から JSON 文字列を返す。"""
+    suf = _voucher_upload_suffix(filename)
+    if suf in ("jpg", "jpeg", "png", "webp"):
+        img = _gemini_input_image_from_upload(_VoucherRawBytesUpload(raw))
+        return analyze_voucher_document_with_gemini(img)
+    if suf == "pdf":
+        text = _voucher_extract_pdf_text(raw)
+        if text:
+            return analyze_voucher_document_with_gemini_text(
+                source_instruction=(
+                    "以下は PDF からテキスト抽出した内容です。"
+                    "この請求・納品・領収に相当する情報から在庫データを抽出してください。"
+                ),
+                document_body=text,
+            )
+        imgs = _voucher_pdf_pages_to_images(raw)
+        return analyze_voucher_document_with_gemini_images(imgs)
+    if suf == "xlsx":
+        md = _voucher_excel_bytes_to_markdown(raw)
+        return analyze_voucher_document_with_gemini_text(
+            source_instruction=(
+                "以下は Excel（.xlsx）を Markdown 表に変換したものです。"
+                "この表から仕入・納品に相当する在庫情報を抽出してください。"
+            ),
+            document_body=md,
+        )
+    if suf == "docx":
+        t = _voucher_docx_bytes_to_text(raw)
+        if not t:
+            raise ValueError("Word 文書からテキストを抽出できませんでした。")
+        return analyze_voucher_document_with_gemini_text(
+            source_instruction=(
+                "以下は Word（.docx）から抽出した全文です。"
+                "この文書内の請求・納品・領収に相当する情報から在庫データを抽出してください。"
+            ),
+            document_body=t,
+        )
+    raise ValueError(
+        f"未対応の拡張子です（.jpg / .png / .pdf / .xlsx / .docx のみ）: .{suf}"
+    )
+
+
+def _merge_voucher_items_for_preview(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一商品名（大文字小文字・前後空白無視）の数量を合算し、後から現れる単価で上書き（手書き修正の優先に近づける）。"""
+    order: dict[str, dict[str, Any]] = {}
+    key_order: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        q = _coerce_positive_int(it.get("quantity"), 1)
+        up = _coerce_unit_price_yen(it.get("unit_price"))
+        if up is None:
+            up = _coerce_unit_price_yen(it.get("unit_price_excl"))
+        cat = str(it.get("category") or "").strip()
+        if key not in order:
+            order[key] = {"商品名": name, "数量": q, "単価（税抜）": up, "カテゴリ": cat}
+            key_order.append(key)
+        else:
+            row = order[key]
+            row["数量"] = int(row["数量"]) + q
+            if up is not None:
+                row["単価（税抜）"] = int(up)
+            if cat:
+                row["カテゴリ"] = cat
+    out: list[dict[str, Any]] = []
+    for k in key_order:
+        r = order[k]
+        up = r["単価（税抜）"]
+        if up is None:
+            up = 1
+        out.append(
+            {
+                "商品名": r["商品名"],
+                "数量": max(1, int(r["数量"])),
+                "単価（税抜）": max(1, int(up)),
+                "カテゴリ": str(r.get("カテゴリ") or ""),
+            }
+        )
+    return out
+
+
+def _voucher_record_datetime_jst(purchase_date_str: str) -> str:
+    """証憑の仕入日を台帳の日時列用に整形。YYYY-MM-DD のときはその日の JST 正午、それ以外は現在 JST。"""
+    s = (purchase_date_str or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return f"{s} 12:00:00"
+    return jst_now_str()
+
+
+def _init_voucher_sidebar_state() -> None:
+    if "voucher_supplier_edit" not in st.session_state:
+        st.session_state.voucher_supplier_edit = ""
+    if "voucher_date_edit" not in st.session_state:
+        st.session_state.voucher_date_edit = ""
+    if "voucher_consumption_tax_choice" not in st.session_state:
+        st.session_state.voucher_consumption_tax_choice = "10%"
+
+
+def _confirm_voucher_import(
+    df: pd.DataFrame | None,
+    supplier: str,
+    purchase_date_str: str,
+    tax_choice_label: str,
+) -> None:
+    """証憑プレビュー表の内容を 1点1行で台帳に追記する。"""
+    if df is None or df.empty:
+        st.sidebar.error("反映する行がありません。")
+        return
+    rows_spec: list[tuple[str, int, int, str]] = []
+    for _, row in df.iterrows():
+        name = str(row.get("商品名", "") or "").strip()
+        if not name:
+            continue
+        q = max(1, _finite_int(row.get("数量"), 1))
+        up = max(1, _finite_int(row.get("単価（税抜）"), 1))
+        cat = str(row.get("カテゴリ", "") or "").strip()
+        rows_spec.append((name, q, up, cat))
+    if not rows_spec:
+        st.sidebar.error("商品名が入っている行がありません。")
+        return
+    total_q = sum(q for _, q, _, _ in rows_spec)
+    ws = ensure_worksheet_header()
+    if ws is None:
+        st.sidebar.warning("スプレッドシート未設定のため保存できません。")
+        return
+    tax_r = _consumption_tax_rate_from_choice_label(str(tax_choice_label))
+    rec_dt = _voucher_record_datetime_jst(purchase_date_str)
+    sup = (supplier or "").strip()
+    try:
+        ids = allocate_management_ids(ws, total_q)
+    except Exception as e:
+        st.sidebar.error(f"管理IDの採番に失敗しました: {e}")
+        return
+    idx = 0
+    try:
+        with st.spinner("台帳に書き込んでいます…"):
+            for name, q, up, cat in rows_spec:
+                memo = f"証憑取込 category={cat}" if cat else "証憑取込"
+                incl = price_incl_tax(up, tax_r)
+                for _ in range(q):
+                    append_sheet_row(
+                        "入庫（購入）",
+                        name,
+                        sup,
+                        up,
+                        incl,
+                        "",
+                        ids[idx],
+                        memo,
+                        record_datetime=rec_dt,
+                        consumption_tax_rate=tax_r,
+                    )
+                    idx += 1
+    except Exception as e:
+        st.sidebar.error(f"スプレッドシート更新に失敗しました: {e}")
+        return
+    st.session_state.pop("voucher_preview_df", None)
+    st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+    st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+    st.session_state["_voucher_import_flash"] = (
+        f"証憑取込を記録しました（{total_q} 行・1点1行）。"
+    )
+    st.rerun()
+
+
+def _render_voucher_inventory_sidebar() -> None:
+    """サイドバーに証憑ファイルのアップロード・解析・プレビュー編集・確定反映を置く。"""
+    _vflash = st.session_state.pop("_voucher_import_flash", None)
+    if _vflash:
+        st.sidebar.success(_vflash)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 証憑から在庫反映")
+    st.sidebar.caption(
+        "納品書・請求書・領収書を画像・PDF・Excel・Word から読み取り、入庫（購入）として台帳に反映します。"
+        "PDF はテキスト優先、空ならページ画像として解析します。解析後は表で修正してから確定してください。"
+    )
+    if not _secret_str(SECRET_GEMINI_API_KEY):
+        st.sidebar.info(f"{SECRET_GEMINI_API_KEY} が未設定のため使えません。")
+        return
+    if not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+        st.sidebar.info("スプレッドシート未設定のため使えません。")
+        return
+
+    voucher_up = st.sidebar.file_uploader(
+        "証憑ファイル（画像 / PDF / Excel / Word）",
+        type=["jpg", "png", "pdf", "xlsx", "docx"],
+        key="voucher_file_uploader",
+    )
+    if st.sidebar.button(
+        "証憑を解析",
+        key="voucher_analyze_btn",
+        disabled=voucher_up is None,
+    ):
+        with st.spinner("証憑を解析しています…"):
+            try:
+                raw = analyze_voucher_upload_bytes(
+                    voucher_up.getvalue(), voucher_up.name
+                )
+                d = _parse_json_from_model(raw)
+                items = d.get("items")
+                if not isinstance(items, list) or not items:
+                    st.sidebar.error(
+                        "items が見つかりませんでした。ファイル内容を確認してください。"
+                    )
+                else:
+                    merged = _merge_voucher_items_for_preview(
+                        [x for x in items if isinstance(x, dict)]
+                    )
+                    if not merged:
+                        st.sidebar.error("有効な商品行がありません。")
+                    else:
+                        st.session_state.voucher_supplier_edit = str(
+                            d.get("supplier_name") or ""
+                        ).strip()
+                        st.session_state.voucher_date_edit = str(
+                            d.get("purchase_date") or ""
+                        ).strip()
+                        st.session_state.voucher_preview_df = pd.DataFrame(merged)
+                        st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+                        st.sidebar.success(
+                            f"解析しました（{len(merged)} 商品行）。内容を確認して確定してください。"
+                        )
+            except Exception as e:
+                st.sidebar.warning(str(e))
+
+    st.sidebar.text_input(
+        "仕入先（証憑・上書き可）",
+        key="voucher_supplier_edit",
+        placeholder="仕入先・取引先",
+    )
+    st.sidebar.text_input(
+        "仕入日（YYYY-MM-DD・上書き可）",
+        key="voucher_date_edit",
+        placeholder="例: 2026-04-15",
+    )
+    st.sidebar.radio(
+        "証憑取込の消費税（税込計算）",
+        options=list(CONSUMPTION_TAX_CHOICE_TO_RATE.keys()),
+        horizontal=True,
+        key="voucher_consumption_tax_choice",
+    )
+
+    base_df = st.session_state.get("voucher_preview_df")
+    if base_df is not None and not base_df.empty:
+        edited_df = st.sidebar.data_editor(
+            base_df,
+            num_rows="dynamic",
+            key=VOUCHER_DATA_EDITOR_KEY,
+            use_container_width=True,
+        )
+        if st.sidebar.button(
+            "この内容で台帳に確定反映",
+            type="primary",
+            key="voucher_confirm_btn",
+        ):
+            _confirm_voucher_import(
+                edited_df,
+                str(st.session_state.get("voucher_supplier_edit", "") or ""),
+                str(st.session_state.get("voucher_date_edit", "") or ""),
+                str(
+                    st.session_state.get("voucher_consumption_tax_choice", "10%")
+                    or "10%"
+                ),
+            )
+        if st.sidebar.button("プレビューをクリア", key="voucher_clear_preview_btn"):
+            st.session_state.pop("voucher_preview_df", None)
+            st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+            st.rerun()
 
 
 def _open_inventory_workbook():
@@ -2251,6 +2743,8 @@ def main():
     st.set_page_config(page_title="商品在庫・販売", layout="wide")
     st.title("商品在庫・販売管理")
     st.caption("写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・スプレッドシート記録ができます。")
+    _init_voucher_sidebar_state()
+    _render_voucher_inventory_sidebar()
     st.subheader("台帳登録")
 
     _init_registration_form_session_state()
