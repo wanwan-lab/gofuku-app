@@ -36,7 +36,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
-  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID | 証憑記録日時 | 証憑URL
+  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID | 浮貸日時 | 証憑記録日時 | 証憑URL
   | 仕入日時 | 入庫種別 | 販売日時 | 出庫種別
   ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
@@ -50,7 +50,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※金額列（仕入〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
   ※粗利は税抜ベースで「販売済」なら（実売金額（税抜）×数量）−原価、「在庫中」なら（販売予定金額（税抜）×数量）−原価。台帳保存時に再計算します。
   ※「最後に確認した日付（棚卸日）」は棚卸作業用の任意列です（YYYY-MM-DD 推奨）。1人棚卸しの進捗把握に使います。
-  ※「販売元管理ID」は登録画面で **出庫（販売）** を選んだときに必須となり、**在庫中の行の管理ID（G########）** を指定します。数量が1のときは1件、2以上のときは **数量と同じ件数** をカンマ等で区切って入力し、各IDの行を順に **販売済** に更新します（新規行は追加しません）。
+  ※「販売元管理ID」は **販売管理** タブで **在庫中の行の管理ID（G########）** を指定します。出庫（販売）または出庫（浮貸）で **販売済** にするときは実売が必須で、各IDの行を順に更新します（新規行は追加しません）。出庫（浮貸）で **在庫中** のままにするときは **浮貸日時** 列に確定時の JST（または手入力）を記録します。
   ※「証憑記録日時」は証憑取込の **確定ボタンを押した JST 時刻**（recorded_at に相当）。「証憑URL」はその証憑を GAS 経由で Drive に保存したときの表示 URL（evidence_url）です。
   ※台帳一覧から手動で在庫行を販売済に編集する場合は、**販売日時**・**出庫種別**・実売・ステータスを整合させてください（保存時に変更があった行の「日時」は自動で更新されます）。
 """
@@ -101,6 +101,7 @@ COL_MEMO = "メモ"
 COL_MANAGEMENT_ID = "管理ID"
 COL_LAST_STOCKTAKE = "最後に確認した日付（棚卸日）"
 COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
+COL_LOAN_DATETIME = "浮貸日時"
 # 証憑取込（recorded_at / evidence_url に相当）
 COL_VOUCHER_RECORDED_AT = "証憑記録日時"
 COL_VOUCHER_EVIDENCE_URL = "証憑URL"
@@ -150,6 +151,7 @@ EXPECTED_HEADERS: list[str] = [
     COL_MANAGEMENT_ID,
     COL_LAST_STOCKTAKE,
     COL_SALE_SOURCE_MGMT_ID,
+    COL_LOAN_DATETIME,
     COL_VOUCHER_RECORDED_AT,
     COL_VOUCHER_EVIDENCE_URL,
     COL_PURCHASE_DATETIME,
@@ -1913,6 +1915,7 @@ def _inventory_row_values_for_append(
     stock_status: str = STATUS_IN_STOCK,
     consumption_tax_rate: float | None = None,
     sale_source_management_id: str = "",
+    loan_datetime: str = "",
     voucher_recorded_at: str = "",
     voucher_evidence_url: str = "",
 ) -> list[Any]:
@@ -1968,6 +1971,7 @@ def _inventory_row_values_for_append(
         management_id,
         "",
         (sale_source_management_id or "").strip(),
+        (loan_datetime or "").strip(),
         (voucher_recorded_at or "").strip(),
         (voucher_evidence_url or "").strip(),
         dt_purchase,
@@ -2035,6 +2039,7 @@ def append_sheet_row(
     stock_status: str = STATUS_IN_STOCK,
     consumption_tax_rate: float | None = None,
     sale_source_management_id: str = "",
+    loan_datetime: str = "",
     voucher_recorded_at: str = "",
     voucher_evidence_url: str = "",
 ):
@@ -2060,6 +2065,7 @@ def append_sheet_row(
         stock_status=stock_status,
         consumption_tax_rate=consumption_tax_rate,
         sale_source_management_id=sale_source_management_id,
+        loan_datetime=loan_datetime,
         voucher_recorded_at=voucher_recorded_at,
         voucher_evidence_url=voucher_evidence_url,
     )
@@ -2335,8 +2341,9 @@ def apply_outbound_sale_to_ledger_by_management_id(
     update_sale_voucher: bool = False,
     sale_voucher_recorded_at: str = "",
     sale_voucher_evidence_url: str = "",
+    sale_outbound_type: str = "出庫（販売）",
 ) -> None:
-    """出庫（販売）: 管理IDの在庫中の1行を更新し、新規行は追加しない。A列「日時」は確定実行の JST に更新する。"""
+    """在庫中の1行を販売済に更新（新規行なし）。A列「日時」は確定実行の JST。出庫種別は ``sale_outbound_type``（例: 出庫（販売）／出庫（浮貸））。"""
     sid = (source_management_id or "").strip()
     if not sid:
         raise ValueError("販売元管理ID（管理ID）が空です。")
@@ -2374,7 +2381,8 @@ def apply_outbound_sale_to_ledger_by_management_id(
     if COL_SALE_DATETIME in df_src.columns:
         df_src.loc[msk, COL_SALE_DATETIME] = now_exec
     if COL_SALE_OUTBOUND_TYPE in df_src.columns:
-        df_src.loc[msk, COL_SALE_OUTBOUND_TYPE] = "出庫（販売）"
+        _ot = (sale_outbound_type or "").strip() or "出庫（販売）"
+        df_src.loc[msk, COL_SALE_OUTBOUND_TYPE] = _ot
     df_src.loc[msk, COL_DATETIME] = now_exec
     df_src.loc[msk, COL_STOCK_STATUS] = STATUS_SOLD
     df_src.loc[msk, COL_ACTUAL_SALE] = av
@@ -2392,6 +2400,53 @@ def apply_outbound_sale_to_ledger_by_management_id(
             sale_voucher_recorded_at or ""
         ).strip()
         df_src.loc[msk, COL_VOUCHER_EVIDENCE_URL] = sale_voucher_evidence_url.strip()
+    df_src = _recalc_gross_profit_dataframe(df_src)
+    overwrite_inventory_worksheet_from_dataframe(df_src)
+
+
+def apply_outbound_loan_in_stock_datetime_by_management_id(
+    source_management_id: str,
+    *,
+    loan_datetime_jst: str | None = None,
+    new_image_url: str = "",
+    memo_suffix: str = "",
+) -> None:
+    """出庫（浮貸）かつ在庫中のまま: 該当行の **浮貸日時** を記録し、出庫種別を記録。新規行は追加しない。"""
+    sid = (source_management_id or "").strip()
+    if not sid:
+        raise ValueError("管理IDが空です。")
+    df_src = load_inventory_dataframe()
+    if df_src is None or df_src.empty:
+        raise RuntimeError("台帳を読み込めませんでした。")
+    df_src = df_src.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
+    _ledger_df_loosen_numeric_columns_for_assignment(df_src)
+    msk = df_src[COL_MANAGEMENT_ID].astype(str).str.strip() == sid
+    if not msk.any():
+        raise RuntimeError(f"管理ID {sid} の行が台帳に見つかりません。")
+    if int(msk.sum()) != 1:
+        raise RuntimeError(f"管理ID {sid} が複数行に重複しています。")
+    cur_st = _normalize_stock_status(
+        str(df_src.loc[msk, COL_STOCK_STATUS].iloc[0])
+    )
+    if cur_st != STATUS_IN_STOCK:
+        raise RuntimeError(
+            f"管理ID {sid} は「{cur_st}」のため、浮貸（在庫中）の記録対象外です（在庫中の行のみ）。"
+        )
+    loan_dt = (loan_datetime_jst or "").strip() or jst_now_str()
+    now_exec = jst_now_str()
+    if COL_LOAN_DATETIME in df_src.columns:
+        df_src.loc[msk, COL_LOAN_DATETIME] = loan_dt
+    if COL_SALE_OUTBOUND_TYPE in df_src.columns:
+        df_src.loc[msk, COL_SALE_OUTBOUND_TYPE] = "出庫（浮貸）"
+    df_src.loc[msk, COL_DATETIME] = now_exec
+    cur_img = str(df_src.loc[msk, COL_IMAGE_URL].iloc[0] or "").strip()
+    nu = (new_image_url or "").strip()
+    if not cur_img and nu:
+        df_src.loc[msk, COL_IMAGE_URL] = nu
+    if (memo_suffix or "").strip():
+        old_memo = str(df_src.loc[msk, COL_MEMO].iloc[0] or "").strip()
+        tag = (memo_suffix or "").strip()
+        df_src.loc[msk, COL_MEMO] = (old_memo + "\n" if old_memo else "") + tag
     df_src = _recalc_gross_profit_dataframe(df_src)
     overwrite_inventory_worksheet_from_dataframe(df_src)
 
@@ -3664,6 +3719,8 @@ def _init_registration_form_session_state() -> None:
         st.session_state[SALES_TAB_QTY_WIDGET_KEY] = 1
     if "sales_tab_memo" not in st.session_state:
         st.session_state.sales_tab_memo = ""
+    if "sales_tab_loan_datetime_manual" not in st.session_state:
+        st.session_state.sales_tab_loan_datetime_manual = ""
     st.session_state.pop("field_price_excl", None)
 
 
@@ -3834,13 +3891,34 @@ def _render_sales_management_tab(
     uploaded,
     df_ledger_hint: pd.DataFrame | None,
 ) -> None:
-    """販売管理タブ: 販売元管理ID・実売の入力と在庫行のみの販売済更新。"""
+    """販売管理タブ: 出庫（販売）／出庫（浮貸）と管理ID・実売または浮貸日時の更新。"""
     st.markdown("##### 販売管理")
     st.caption(
-        "在庫中の行を **販売元管理ID** で指定し、**実売金額（税抜・1点あたり）** を入力して確定すると、"
-        "**新規行は追加せず** 該当行を **販売済** に更新します（販売日時は確定実行の JST）。"
+        "**出庫（販売）** … 在庫行を **販売済** にし、実売と販売日時（確定の JST）を記録します（新規行なし）。"
+        "**出庫（浮貸）** … **在庫中** のままなら **浮貸日時** 列へ日時を記録し、**販売済** を選ぶ場合は **出庫（販売）と同様** に在庫行を販売済へ更新します（出庫種別はいずれも記録）。"
         "写真は任意（上の共通アップローダ）。"
     )
+    outbound_kind = st.radio(
+        "出庫区分",
+        ("出庫（販売）", "出庫（浮貸）"),
+        horizontal=True,
+        key="sales_tab_outbound_kind",
+    )
+    loan_target_status: str | None = None
+    if outbound_kind == "出庫（浮貸）":
+        loan_target_status = st.radio(
+            "出庫（浮貸）の結果ステータス",
+            (STATUS_IN_STOCK, STATUS_SOLD),
+            horizontal=True,
+            key="sales_tab_loan_stock_status",
+        )
+    _loan_keep_stock = (
+        outbound_kind == "出庫（浮貸）" and loan_target_status == STATUS_IN_STOCK
+    )
+    _loan_as_sale = (
+        outbound_kind == "出庫（浮貸）" and loan_target_status == STATUS_SOLD
+    )
+    _plain_sale = outbound_kind == "出庫（販売）"
     c1, c2 = st.columns(2)
     with c1:
         do_match = st.button(
@@ -3854,6 +3932,7 @@ def _render_sales_management_tab(
             st.session_state[SALES_TAB_QTY_WIDGET_KEY] = 1
             st.session_state.field_actual_sale_excl = 0
             st.session_state.sales_tab_memo = ""
+            st.session_state.sales_tab_loan_datetime_manual = ""
             st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
             st.session_state.pop("_sale_link_management_id", None)
             st.session_state.pop("_sale_link_warn", None)
@@ -3911,17 +3990,27 @@ def _render_sales_management_tab(
         placeholder="例: G00000001 または G00000001, G00000002",
     )
     sales_qty = st.number_input(
-        "数量（販売点数・管理IDの件数と一致）",
+        "数量（対象点数・管理IDの件数と一致）",
         min_value=1,
         step=1,
         key=SALES_TAB_QTY_WIDGET_KEY,
     )
+    if _loan_keep_stock:
+        st.text_input(
+            "浮貸日時（空欄＝確定ボタン押下の JST）",
+            key="sales_tab_loan_datetime_manual",
+            help="在庫中のまま出庫（浮貸）を記録するとき、**浮貸日時** 列に入る値です。未入力なら確定実行の JST を記録します。",
+        )
     st.number_input(
         "実売金額（税抜・1点あたり）",
         min_value=0,
         step=1,
         key="field_actual_sale_excl",
-        help="確定時は **1円以上** が必要です。複数点のときは各行に同じ単価が入ります。",
+        disabled=_loan_keep_stock,
+        help=(
+            "出庫（販売）または出庫（浮貸）で **販売済** のとき必須（1円以上）。"
+            "出庫（浮貸）で **在庫中** のときは不要です。"
+        ),
     )
     memo_sales = st.text_area(
         "販売メモ（任意・台帳のメモに追記）",
@@ -3978,7 +4067,30 @@ def _render_sales_management_tab(
     _tax_preview = float(CONSUMPTION_TAX_RATE)
     _plex = _pin = _aex = _ain = 0
     _gp_preview: int | None = None
-    if _sale_pv_agg:
+    if _loan_keep_stock and _sale_pv_agg:
+        _cogs_preview = sum(_finite_int(x.get(COL_PRICE_EXCL), 0) for x in _pv_ok_rows)
+        _tr0 = _pv_ok_rows[0]
+        _tax_preview = _infer_tax_rate_from_main_line(
+            _finite_int(_tr0.get(COL_PRICE_EXCL), 0),
+            _finite_int(_tr0.get(COL_PRICE_INCL), 0),
+        )
+        _plex = sum(_finite_int(x.get(COL_PLANNED_SALE), 0) for x in _pv_ok_rows)
+        _pin = price_incl_tax(_plex, _tax_preview) if _plex > 0 else 0
+        _aex = _ain = 0
+        _gp_acc = 0
+        _gp_any = False
+        for _xr in _pv_ok_rows:
+            _cgx = _finite_int(_xr.get(COL_PRICE_EXCL), 0)
+            _plx_u = _finite_int(_xr.get(COL_PLANNED_SALE), 0)
+            _plex1, _, _, _ = _planned_actual_line_amounts(
+                1, _plx_u, 0, STATUS_IN_STOCK, _tax_preview
+            )
+            _gpx = _compute_gross_profit_row(_cgx, _plex1, 0, STATUS_IN_STOCK)
+            if _gpx is not None:
+                _gp_acc += int(_gpx)
+                _gp_any = True
+        _gp_preview = _gp_acc if _gp_any else None
+    elif _sale_pv_agg and not _loan_keep_stock:
         _cogs_preview = sum(_finite_int(x.get(COL_PRICE_EXCL), 0) for x in _pv_ok_rows)
         _tr0 = _pv_ok_rows[0]
         _tax_preview = _infer_tax_rate_from_main_line(
@@ -4000,7 +4112,24 @@ def _render_sales_management_tab(
                 _gp_acc += int(_gpx)
                 _gp_any = True
         _gp_preview = _gp_acc if _gp_any else None
-    elif len(_pv_ok_rows) == 1:
+    elif _loan_keep_stock and len(_pv_ok_rows) == 1:
+        _tr_pv = _pv_ok_rows[0]
+        _cogs_preview = _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0)
+        _pl_u_gp = _finite_int(_tr_pv.get(COL_PLANNED_SALE), 0)
+        _tax_preview = _infer_tax_rate_from_main_line(
+            _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0),
+            _finite_int(_tr_pv.get(COL_PRICE_INCL), 0),
+        )
+        _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
+            1, _pl_u_gp, 0, STATUS_IN_STOCK, _tax_preview
+        )
+        _gp_preview = _compute_gross_profit_row(
+            _cogs_preview,
+            _plex,
+            0,
+            STATUS_IN_STOCK,
+        )
+    elif len(_pv_ok_rows) == 1 and not _loan_keep_stock:
         _tr_pv = _pv_ok_rows[0]
         _cogs_preview = _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0)
         _pl_u_gp = _finite_int(_tr_pv.get(COL_PLANNED_SALE), 0)
@@ -4053,12 +4182,17 @@ def _render_sales_management_tab(
             "粗利（税抜・プレビュー）",
             "—" if _gp_preview is None else f"¥{int(_gp_preview):,}",
         )
+    if _loan_keep_stock:
+        st.caption(
+            f"在庫中のまま出庫（浮貸）を確定すると、各行の **{COL_LOAN_DATETIME}** に日時が入ります（手入力が空なら確定の JST）。"
+        )
 
-    confirm_sale = st.button(
-        "販売を確定（在庫行のみ更新・新規行なし）",
-        type="primary",
-        key="sales_tab_confirm_btn",
+    _confirm_lbl = (
+        "浮貸を確定（在庫中のまま・浮貸日時のみ）"
+        if _loan_keep_stock
+        else "販売を確定（在庫行のみ更新・新規行なし）"
     )
+    confirm_sale = st.button(_confirm_lbl, type="primary", key="sales_tab_confirm_btn")
 
     if confirm_sale:
         _sale_src_save = str(
@@ -4069,23 +4203,24 @@ def _render_sales_management_tab(
         _ids_sale_val = _split_management_ids_from_field(_sale_src_save)
         memo_s = (memo_sales or "").strip()
         validation_ok = True
+        _need_actual = _plain_sale or _loan_as_sale
         if not _sale_src_save:
-            st.error("**販売元管理ID** の入力が必須です。")
+            st.error("**管理ID**（販売元管理ID欄）の入力が必須です。")
             validation_ok = False
-        elif _act_ex2 < 1:
+        elif _need_actual and _act_ex2 < 1:
             st.error("**実売金額（税抜）** を1円以上で入力してください。")
             validation_ok = False
         elif df_ledger_hint is None:
-            st.error("台帳を読み込めないため、販売反映できません。")
+            st.error("台帳を読み込めないため、反映できません。")
             validation_ok = False
         elif len(_ids_sale_val) != _q_sv:
             st.error(
-                "**販売元管理ID** を **数量と同じ件数** で入力してください。"
+                "**管理ID** を **数量と同じ件数** で入力してください。"
                 f"（数量 **{_q_sv}** に対し **{len(_ids_sale_val)}** 件と読み取りました。）"
             )
             validation_ok = False
         elif len(set(_ids_sale_val)) != len(_ids_sale_val):
-            st.error("販売元管理IDに **重複** があります。")
+            st.error("管理IDに **重複** があります。")
             validation_ok = False
         else:
             for _sid_v in _ids_sale_val:
@@ -4113,7 +4248,7 @@ def _render_sales_management_tab(
                         data0, mime0 = prepare_upload_image_jpeg(raw0)
                     except Exception as e:
                         st.error(f"画像の処理に失敗しました: {e}")
-                        st.warning("画像なしで台帳の販売反映のみ続行します。")
+                        st.warning("画像なしで台帳の反映のみ続行します。")
                     else:
                         safe_base = re.sub(
                             r"[^\w\-_.]", "_", uploaded.name.rsplit(".", 1)[0]
@@ -4123,32 +4258,62 @@ def _render_sales_management_tab(
                             urls[0] = upload_image_to_drive(fname0, mime0, data0)
                         except Exception as e:
                             st.error(f"ドライブ保存に失敗しました: {e}")
-                            st.warning("画像URLは付けずに販売反映のみ続行します。")
+                            st.warning("画像URLは付けずに反映のみ続行します。")
             if not _uses_local_inventory_csv() and not _secret_str(
                 SECRET_GOOGLE_SPREADSHEET_ID
             ):
-                st.warning("台帳の保存先が未設定のため、販売反映をスキップしました。")
+                st.warning("台帳の保存先が未設定のため、反映をスキップしました。")
             else:
                 try:
                     _n_ids = len(_ids_sale_val)
-                    _spin_sale = (
-                        "該当の在庫行を販売済に更新しています…"
-                        if _n_ids <= 1
-                        else f"在庫行 **{_n_ids} 件** を順に販売済に更新しています…"
-                    )
-                    with st.spinner(_spin_sale):
-                        for _sid_save in _ids_sale_val:
-                            apply_outbound_sale_to_ledger_by_management_id(
-                                _sid_save,
-                                actual_sale_unit_excl_yen=_act_ex2,
-                                new_image_url=(urls[0] if urls else "") or "",
-                                memo_suffix=memo_s,
-                            )
+                    if _loan_keep_stock:
+                        _loan_manual = str(
+                            st.session_state.get("sales_tab_loan_datetime_manual", "")
+                            or ""
+                        ).strip()
+                        _spin = (
+                            "浮貸日時を記録しています…"
+                            if _n_ids <= 1
+                            else f"在庫行 **{_n_ids} 件** に浮貸日時を記録しています…"
+                        )
+                        with st.spinner(_spin):
+                            for _sid_save in _ids_sale_val:
+                                apply_outbound_loan_in_stock_datetime_by_management_id(
+                                    _sid_save,
+                                    loan_datetime_jst=_loan_manual or None,
+                                    new_image_url=(urls[0] if urls else "") or "",
+                                    memo_suffix=memo_s,
+                                )
+                    else:
+                        _ot = "出庫（販売）" if _plain_sale else "出庫（浮貸）"
+                        _spin_sale = (
+                            "該当の在庫行を販売済に更新しています…"
+                            if _n_ids <= 1
+                            else f"在庫行 **{_n_ids} 件** を順に販売済に更新しています…"
+                        )
+                        with st.spinner(_spin_sale):
+                            for _sid_save in _ids_sale_val:
+                                apply_outbound_sale_to_ledger_by_management_id(
+                                    _sid_save,
+                                    actual_sale_unit_excl_yen=_act_ex2,
+                                    new_image_url=(urls[0] if urls else "") or "",
+                                    memo_suffix=memo_s,
+                                    sale_outbound_type=_ot,
+                                )
                 except Exception as e:
                     st.error(f"台帳の更新に失敗しました: {e}")
                 else:
                     st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-                    if len(_ids_sale_val) <= 1:
+                    if _loan_keep_stock:
+                        if len(_ids_sale_val) <= 1:
+                            st.success(
+                                f"管理ID **{_ids_sale_val[0]}** に **{COL_LOAN_DATETIME}** を記録しました（在庫中のまま）。"
+                            )
+                        else:
+                            st.success(
+                                f"**{len(_ids_sale_val)} 件** に {COL_LOAN_DATETIME} を記録しました（管理ID: {'、'.join(_ids_sale_val)}）。"
+                            )
+                    elif len(_ids_sale_val) <= 1:
                         _sid_one = _ids_sale_val[0]
                         st.success(
                             f"管理ID **{_sid_one}** の行を販売済に更新しました（実売 ¥{_act_ex2:,}・販売日時は確定実行の JST）。"
@@ -4221,7 +4386,7 @@ def main():
 
         movement = st.radio(
             "区分（仕入れ・在庫の増減）",
-            ("入庫（購入）", "入庫（返品）", "出庫（浮貸）"),
+            ("入庫（購入）", "入庫（返品）"),
             horizontal=True,
             key="tab_purchase_movement",
         )
@@ -4347,8 +4512,8 @@ def main():
     
         st.markdown("##### 必須入力項目")
         st.caption(
-            "このタブの確定は **在庫中** の新規行のみを追加します。"
-            "販売済への更新は **販売管理** タブで行ってください。"
+            "このタブの確定は **在庫中** の新規行のみを追加します（入庫（購入）／入庫（返品））。"
+            "**出庫（浮貸）・出庫（販売）** は **販売管理** タブで行ってください。"
         )
         product_name = st.text_input("商品名（必須）", key="field_product_name")
         supplier = st.text_input("仕入先・取引先（必須）", key="field_supplier")
@@ -4394,11 +4559,7 @@ def main():
             ),
         )
         st.session_state.field_qty = int(quantity)
-        if _movement_is_outbound(movement):
-            st.caption(
-                "出庫（浮貸）では仕入と同様、数量分の **新規行** を台帳に追記します。"
-            )
-    
+
         line_excl_yen = st.number_input(
             "仕入金額（税抜・必須）",
             min_value=1,
