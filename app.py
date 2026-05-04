@@ -26,16 +26,17 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 ※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（既定は flash 系プレビュー）。
 ※ **登録（インプット）** ページの証憑取込で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
 ※ PDF/Excel/Word 取込には ``pypdf`` / ``pymupdf`` / ``openpyxl`` / ``python-docx`` を使用します（requirements.txt）。
-※ アップロード画像は任意。ある場合のみ Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
+※ アップロード画像は任意。商品写真は Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
+※ 証憑ファイルを台帳に確定反映するとき、Drive 保存用には画像のみ長辺最大2000px・JPEG品質75に再圧縮します（PDF/xlsx/docx は原本のまま）。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
 サイドバーで **登録（インプット）** / **在庫一覧** / **集計・分析（ダッシュボード）** を切り替えられます。
 在庫データは **共有の inventory.csv**（ローカル）または **Google スプレッドシート**（``INVENTORY_SOURCE`` で選択）に読み書きします。
-列定義・CSV 入出力は **app.py 内に内包**しており、補助用の ``ledger_schema`` / ``inventory_csv`` モジュールは不要です。
+列定義・CSV 入出力は **app.py 内に内包**しています。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
-  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID
+  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID | 証憑記録日時 | 証憑URL
   ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
@@ -48,6 +49,8 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※粗利は税抜ベースで「販売済」なら（実売金額（税抜）×数量）−原価、「在庫中」なら（販売予定金額（税抜）×数量）−原価。台帳保存時に再計算します。
   ※「最後に確認した日付（棚卸日）」は棚卸作業用の任意列です（YYYY-MM-DD 推奨）。1人棚卸しの進捗把握に使います。
   ※「販売元管理ID」は出庫（販売）などで、**売れた在庫行の入庫時管理ID（G########）** を紐付ける任意列です（追跡・照合用）。
+  ※「証憑記録日時」は証憑取込の **確定ボタンを押した JST 時刻**（recorded_at に相当）。「証憑URL」はその証憑を GAS 経由で Drive に保存したときの表示 URL（evidence_url）です。
+  ※出庫（販売）で既存在庫のステータスを更新する場合は、従来どおり「台帳への手動登録」で区分を出庫にし販売元管理IDを指定してください。
 """
 
 from __future__ import annotations
@@ -95,6 +98,9 @@ COL_MEMO = "メモ"
 COL_MANAGEMENT_ID = "管理ID"
 COL_LAST_STOCKTAKE = "最後に確認した日付（棚卸日）"
 COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
+# 証憑取込（recorded_at / evidence_url に相当）
+COL_VOUCHER_RECORDED_AT = "証憑記録日時"
+COL_VOUCHER_EVIDENCE_URL = "証憑URL"
 
 STATUS_IN_STOCK = "在庫中"
 STATUS_SOLD = "販売済"
@@ -132,6 +138,8 @@ EXPECTED_HEADERS: list[str] = [
     COL_MANAGEMENT_ID,
     COL_LAST_STOCKTAKE,
     COL_SALE_SOURCE_MGMT_ID,
+    COL_VOUCHER_RECORDED_AT,
+    COL_VOUCHER_EVIDENCE_URL,
 ]
 
 _INVENTORY_CSV_DEFAULT_NAME = "inventory.csv"
@@ -187,6 +195,10 @@ DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS = 300
 # --- 画像アップロード前処理 ---
 UPLOAD_JPEG_MAX_LONG_EDGE = 1280
 UPLOAD_JPEG_QUALITY = 80
+
+# --- 証憑ファイルを Google ドライブへ送る直前の軽量化（画像のみ） ---
+VOUCHER_DRIVE_JPEG_MAX_LONG_EDGE = 2000
+VOUCHER_DRIVE_JPEG_QUALITY = 75
 
 SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
 TZ_JP = pytz.timezone("Asia/Tokyo")
@@ -973,6 +985,75 @@ def _voucher_upload_suffix(filename: str) -> str:
     return parts[-1].lower() if len(parts) == 2 else ""
 
 
+def prepare_voucher_file_for_drive_storage(
+    raw: bytes, original_filename: str
+) -> tuple[bytes, str, str]:
+    """証憑を Drive 保存用に整形する。JPG/PNG 等は長辺最大2000px・JPEG quality=75。PDF/xlsx/docx は原本のまま。
+
+    Returns:
+        (保存バイナリ, mime_type, 拡張子に使う文字列 ``.jpg`` 等)
+    """
+    suf = _voucher_upload_suffix(original_filename)
+    if suf in ("jpg", "jpeg", "png", "webp"):
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img)
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.getchannel("A"))
+        img = bg
+        img = _resize_long_edge_max(img, VOUCHER_DRIVE_JPEG_MAX_LONG_EDGE)
+        buf = io.BytesIO()
+        img.save(
+            buf,
+            format="JPEG",
+            quality=VOUCHER_DRIVE_JPEG_QUALITY,
+            optimize=True,
+            progressive=True,
+        )
+        return buf.getvalue(), "image/jpeg", ".jpg"
+    mime_map = {
+        "pdf": "application/pdf",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    mime = mime_map.get(suf, "application/octet-stream")
+    ext = f".{suf}" if suf else ""
+    return raw, mime, ext
+
+
+def _voucher_drive_safe_filename(
+    purchase_date: str, supplier: str, original_filename: str, ext_with_dot: str
+) -> str:
+    """``[仕入日]_[仕入先]_[元ファイル名].拡子`` 形式（ファイル名向けに禁則文字を除去）。"""
+    d = (purchase_date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        d = jst_now().strftime("%Y-%m-%d")
+    d_part = d.replace("-", "")
+    sup = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", (supplier or "").strip())[:50].strip(
+        "_"
+    ) or "unknown"
+    base = Path(str(original_filename)).name
+    stem = Path(base).stem
+    safe_stem = re.sub(
+        r'[^\w\-_.\u3040-\u30ff\u4e00-\u9fff]', "_", stem
+    ).strip("._")[:100] or "voucher"
+    ext = (
+        ext_with_dot
+        if ext_with_dot.startswith(".")
+        else (f".{ext_with_dot}" if ext_with_dot else "")
+    )
+    return f"{d_part}_{sup}_{safe_stem}{ext}"
+
+
+def _gas_evidence_upload_ready() -> bool:
+    """証憑を Google ドライブ（GAS 経由）に送るのに必要な secrets が揃っているか。"""
+    return bool(
+        _secret_str(SECRET_GAS_UPLOAD_URL)
+        and _secret_str(SECRET_GAS_API_KEY)
+        and _secret_str(SECRET_GOOGLE_DRIVE_FOLDER_ID)
+    )
+
+
 def _voucher_extract_pdf_text(pdf_bytes: bytes) -> str:
     """pypdf で PDF からプレーンテキストを抽出する。"""
     from pypdf import PdfReader
@@ -1226,6 +1307,36 @@ def _confirm_voucher_import(
     tax_r = _consumption_tax_rate_from_choice_label(str(tax_choice_label))
     rec_dt = _voucher_record_datetime_jst(purchase_date_str)
     sup = (supplier or "").strip()
+    recorded_at = jst_now_str()
+    evidence_url = ""
+    stash_b = st.session_state.get("voucher_stash_bytes")
+    stash_name = str(st.session_state.get("voucher_stash_name") or "voucher")
+    if stash_b is not None:
+        if _gas_evidence_upload_ready():
+            try:
+                blob, mime, ext_dot = prepare_voucher_file_for_drive_storage(
+                    bytes(stash_b), stash_name
+                )
+                fname = _voucher_drive_safe_filename(
+                    purchase_date_str, sup, stash_name, ext_dot
+                )
+                evidence_url = upload_image_to_drive(fname, mime, blob)
+                fb = _fallback_image_url_when_gas_unconfigured()
+                if not (evidence_url or "").strip() or (evidence_url or "").strip() == (
+                    fb or ""
+                ).strip():
+                    evidence_url = ""
+                    st.warning(
+                        "ドライブの表示 URL を取得できませんでした。台帳には証憑URLなしで記録します。"
+                    )
+            except Exception as e:
+                st.error(f"証憑の Google ドライブ保存に失敗しました: {e}")
+                return
+        else:
+            st.warning(
+                "GAS_UPLOAD_URL / GAS_API_KEY / GOOGLE_DRIVE_FOLDER_ID が未設定のため、"
+                "証憑ファイルは Drive に保存されません（台帳のみ反映）。"
+            )
     try:
         ids = allocate_management_ids(ws, total_q)
     except Exception as e:
@@ -1249,6 +1360,8 @@ def _confirm_voucher_import(
                         memo,
                         record_datetime=rec_dt,
                         consumption_tax_rate=tax_r,
+                        voucher_recorded_at=recorded_at,
+                        voucher_evidence_url=evidence_url,
                     )
                     idx += 1
     except Exception as e:
@@ -1256,10 +1369,14 @@ def _confirm_voucher_import(
         return
     st.session_state.pop("voucher_preview_df", None)
     st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+    st.session_state.pop("voucher_stash_bytes", None)
+    st.session_state.pop("voucher_stash_name", None)
     st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-    st.session_state["_voucher_import_flash"] = (
-        f"証憑取込を記録しました（{total_q} 行・1点1行）。"
-    )
+    _ev = (evidence_url or "").strip()
+    _msg = f"証憑取込を記録しました（{total_q} 行・1点1行）。証憑記録日時: {recorded_at}"
+    if _ev:
+        _msg += " 証憑を Drive に保存済みです。"
+    st.session_state["_voucher_import_flash"] = _msg
     st.rerun()
 
 
@@ -1285,7 +1402,7 @@ def _render_voucher_inventory_panel() -> None:
 
     voucher_up = st.file_uploader(
         "証憑ファイル（画像 / PDF / Excel / Word）",
-        type=["jpg", "png", "pdf", "xlsx", "docx"],
+        type=["jpg", "jpeg", "png", "pdf", "xlsx", "docx"],
         key="voucher_file_uploader",
     )
     if st.button(
@@ -1319,6 +1436,8 @@ def _render_voucher_inventory_panel() -> None:
                         ).strip()
                         st.session_state.voucher_preview_df = pd.DataFrame(merged)
                         st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+                        st.session_state["voucher_stash_bytes"] = voucher_up.getvalue()
+                        st.session_state["voucher_stash_name"] = voucher_up.name
                         st.success(
                             f"解析しました（{len(merged)} 商品行）。内容を確認して確定してください。"
                         )
@@ -1367,6 +1486,8 @@ def _render_voucher_inventory_panel() -> None:
         if st.button("プレビューをクリア", key="voucher_clear_preview_btn"):
             st.session_state.pop("voucher_preview_df", None)
             st.session_state.pop(VOUCHER_DATA_EDITOR_KEY, None)
+            st.session_state.pop("voucher_stash_bytes", None)
+            st.session_state.pop("voucher_stash_name", None)
             st.rerun()
 
 
@@ -1744,6 +1865,8 @@ def append_sheet_row(
     stock_status: str = STATUS_IN_STOCK,
     consumption_tax_rate: float | None = None,
     sale_source_management_id: str = "",
+    voucher_recorded_at: str = "",
+    voucher_evidence_url: str = "",
 ):
     """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。"""
     now = (record_datetime or "").strip() or jst_now_str()
@@ -1798,6 +1921,8 @@ def append_sheet_row(
         management_id,
         "",
         (sale_source_management_id or "").strip(),
+        (voucher_recorded_at or "").strip(),
+        (voucher_evidence_url or "").strip(),
     ]
     if _uses_local_inventory_csv():
         df = _inventory_csv_read_df()
@@ -1921,9 +2046,12 @@ def _on_sale_pick_source_id() -> None:
 
 
 def _cell_value_for_sheet(v: Any) -> Any:
+    """スプレッドシート1セル向けに欠損を正規化する。数値の NaN は 0、それ以外の欠損は空文字。"""
     try:
         if pd.api.types.is_scalar(v) and pd.isna(v):
-            return 0
+            if isinstance(v, (float, np.floating)):
+                return 0
+            return ""
         if isinstance(v, (float, np.floating)) and (
             not math.isfinite(float(v)) or pd.isna(v)
         ):
@@ -2047,6 +2175,39 @@ def _apply_ledger_sort(
         return out
     out = out.sort_values(by=sort_cols, ascending=ascending, na_position="last")
     return out.drop(columns=[c for c in out.columns if c.startswith("_sort_dt")], errors="ignore")
+
+
+def _evidence_url_column_all_http_or_blank(s: pd.Series) -> bool:
+    """証憑URL列を LinkColumn にできるか（空・欠損・http(s) のみ）。"""
+    for v in s:
+        if v is None or pd.isna(v):
+            continue
+        t = str(v).strip()
+        if not t or t.lower() in ("nan", "none", "<na>", "nat"):
+            continue
+        if not (t.startswith("http://") or t.startswith("https://")):
+            return False
+    return True
+
+
+def _normalize_evidence_urls_for_link_editor(df: pd.DataFrame, col: str) -> bool:
+    """証憑URL列を LinkColumn 向けに正規化（空相当→None）。LinkColumn を使うなら True。"""
+    if col not in df.columns:
+        return False
+    if not _evidence_url_column_all_http_or_blank(df[col]):
+        return False
+    norm: list[str | None] = []
+    for v in df[col]:
+        if v is None or pd.isna(v):
+            norm.append(None)
+            continue
+        t = str(v).strip()
+        if not t or t.lower() in ("nan", "none", "<na>", "nat"):
+            norm.append(None)
+        else:
+            norm.append(t)
+    df[col] = norm
+    return True
 
 
 def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
@@ -2734,6 +2895,9 @@ def render_inventory_list_page() -> None:
     st.caption(
         "共有の **inventory.csv** または **スプレッドシート**の全データを編集できます。行の追加・削除は表から操作し、"
         "「台帳を更新する」で保存します。"
+        "「証憑記録日時」は証憑取込の確定時刻、「証憑URL」は Drive 上の証憑です（"
+        "台帳内の値がすべて空または http(s) のときはリンク列として表示されクリックで開けます。"
+        "http 以外の文字が混ざる行がある場合はテキスト列のままです）。"
         "棚卸し用の「最後に確認した日付（棚卸日）」は **YYYY-MM-DD** 推奨です（例: 今日なら "
         f"{_today_jst_date().isoformat()}）。"
         "下の表は常に **全行** を表示します（未確認だけの一覧は展開パネルで参照し、保存で行が消えないようにしています）。"
@@ -2838,6 +3002,10 @@ def render_inventory_list_page() -> None:
         sec_ord == "昇順",
     )
 
+    _ledger_evidence_link_mode = _normalize_evidence_urls_for_link_editor(
+        df_sorted, COL_VOUCHER_EVIDENCE_URL
+    )
+
     _ledger_col_cfg: dict[str, Any] = {}
     if COL_MANAGEMENT_ID in df_sorted.columns:
         _ledger_col_cfg[COL_MANAGEMENT_ID] = st.column_config.TextColumn(
@@ -2861,6 +3029,24 @@ def render_inventory_list_page() -> None:
             COL_SALE_SOURCE_MGMT_ID,
             help="出庫（販売）などで売れた在庫行の入庫時管理ID（G########）。登録画面の販売管理からも入力できます。",
         )
+    if COL_VOUCHER_RECORDED_AT in df_sorted.columns:
+        _ledger_col_cfg[COL_VOUCHER_RECORDED_AT] = st.column_config.TextColumn(
+            COL_VOUCHER_RECORDED_AT,
+            help="証憑を台帳に反映した日時（JST・recorded_at に相当）。",
+        )
+    if COL_VOUCHER_EVIDENCE_URL in df_sorted.columns:
+        if _ledger_evidence_link_mode:
+            _ledger_col_cfg[COL_VOUCHER_EVIDENCE_URL] = st.column_config.LinkColumn(
+                COL_VOUCHER_EVIDENCE_URL,
+                help="Google ドライブの証憑 URL。アイコンをクリックするとブラウザで開きます。",
+                disabled=True,
+                display_text=":material/open_in_new:",
+            )
+        else:
+            _ledger_col_cfg[COL_VOUCHER_EVIDENCE_URL] = st.column_config.TextColumn(
+                COL_VOUCHER_EVIDENCE_URL,
+                help="http(s) 以外の文字が混ざる行があるためテキスト表示です。URL をコピーしてブラウザで開いてください。",
+            )
 
     _editor_kw: dict[str, Any] = {
         "num_rows": "dynamic",
