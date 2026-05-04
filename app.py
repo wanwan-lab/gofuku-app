@@ -37,9 +37,11 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
   | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID | 証憑記録日時 | 証憑URL
+  | 仕入日時 | 入庫種別 | 販売日時 | 出庫種別
   ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
+  ※「日時」「入出庫種別」は **仕入登録時の値のまま** 保持し、販売反映では上書きしません（仕入の記録）。**販売日時** は販売確定ボタンを押した **JST の実行時刻**、**出庫種別** は出庫（販売）等を記録します。**仕入日時**・**入庫種別** は仕入時に日時・区分と同内容で埋めます（未設定の既存行は販売反映時に日時・区分から補完）。
   ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
   ※「仕入金額（税抜）」「仕入金額（税込）」は **1点あたりの行合計**（台帳の各行は数量1）です。
   ※旧シートに「仕入単価（税抜）」列が残っている場合は、読み込み時にその列を除いて新しい列構成に揃えます。
@@ -50,7 +52,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※「最後に確認した日付（棚卸日）」は棚卸作業用の任意列です（YYYY-MM-DD 推奨）。1人棚卸しの進捗把握に使います。
   ※「販売元管理ID」は登録画面で **出庫（販売）** を選んだときに必須となり、**在庫中の行の管理ID（G########）** と一致する行を特定してその1行を **販売済** に更新します（新規行は追加しません）。
   ※「証憑記録日時」は証憑取込の **確定ボタンを押した JST 時刻**（recorded_at に相当）。「証憑URL」はその証憑を GAS 経由で Drive に保存したときの表示 URL（evidence_url）です。
-  ※台帳一覧から手動で在庫行を販売済に編集する場合も、入出庫種別とステータスが矛盾しないよう **出庫（販売）** と **販売済** を揃えることを推奨します。
+  ※台帳一覧から手動で在庫行を販売済に編集する場合は、**販売日時**・**出庫種別**・実売・ステータスを整合させてください（「日時」は仕入のまま）。
 """
 
 from __future__ import annotations
@@ -63,7 +65,7 @@ import math
 import os
 import re
 import uuid
-from datetime import date, datetime, time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +103,11 @@ COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
 # 証憑取込（recorded_at / evidence_url に相当）
 COL_VOUCHER_RECORDED_AT = "証憑記録日時"
 COL_VOUCHER_EVIDENCE_URL = "証憑URL"
+# 仕入と販売を同一行で分離（日時・入出庫種別は仕入登録のまま。販売は下記に記録）
+COL_PURCHASE_DATETIME = "仕入日時"
+COL_PURCHASE_MOVEMENT = "入庫種別"
+COL_SALE_DATETIME = "販売日時"
+COL_SALE_OUTBOUND_TYPE = "出庫種別"
 
 STATUS_IN_STOCK = "在庫中"
 STATUS_SOLD = "販売済"
@@ -140,6 +147,10 @@ EXPECTED_HEADERS: list[str] = [
     COL_SALE_SOURCE_MGMT_ID,
     COL_VOUCHER_RECORDED_AT,
     COL_VOUCHER_EVIDENCE_URL,
+    COL_PURCHASE_DATETIME,
+    COL_PURCHASE_MOVEMENT,
+    COL_SALE_DATETIME,
+    COL_SALE_OUTBOUND_TYPE,
 ]
 
 _INVENTORY_CSV_DEFAULT_NAME = "inventory.csv"
@@ -305,13 +316,6 @@ def jst_now() -> datetime:
 def jst_now_str() -> str:
     """スプレッドシート用の日時文字列（JST・秒まで）。"""
     return jst_now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _jst_datetime_str_from_date(d: date, *, hour: int = 12, minute: int = 0) -> str:
-    """販売日などの暦日だけが決まっているとき、JST のその日 ``hour:minute:00`` を台帳日時文字列にする。"""
-    naive = datetime.combine(d, time(hour, minute, 0))
-    aware = TZ_JP.localize(naive)
-    return aware.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def capture_datetime_jst_from_bytes(raw: bytes) -> str | None:
@@ -1325,7 +1329,7 @@ def _confirm_voucher_import(
                     bytes(stash_b), stash_name
                 )
                 fname = _voucher_drive_safe_filename(
-                    purchase_date_str, sup, stash_name, ext_dot
+                    recorded_at[:10], sup, stash_name, ext_dot
                 )
                 evidence_url = upload_image_to_drive(fname, mime, blob)
                 fb = _fallback_image_url_when_gas_unconfigured()
@@ -1930,6 +1934,14 @@ def append_sheet_row(
         (sale_source_management_id or "").strip(),
         (voucher_recorded_at or "").strip(),
         (voucher_evidence_url or "").strip(),
+        now,
+        movement,
+        (now if stt == STATUS_SOLD else ""),
+        (
+            movement
+            if stt == STATUS_SOLD and _movement_is_outbound(movement)
+            else ("出庫（販売）" if stt == STATUS_SOLD else "")
+        ),
     ]
     if _uses_local_inventory_csv():
         df = _inventory_csv_read_df()
@@ -2131,14 +2143,13 @@ def apply_outbound_sale_to_ledger_by_management_id(
     source_management_id: str,
     *,
     actual_sale_unit_excl_yen: int,
-    sale_datetime_jst_str: str,
     new_image_url: str = "",
     memo_suffix: str = "",
     update_sale_voucher: bool = False,
     sale_voucher_recorded_at: str = "",
     sale_voucher_evidence_url: str = "",
 ) -> None:
-    """出庫（販売）: 管理IDの在庫中の1行を更新し、新規行は追加しない。台帳全体を再保存する。"""
+    """出庫（販売）: 管理IDの在庫中の1行を更新し、新規行は追加しない。仕入の「日時」「入出庫種別」は保持し、販売は販売日時・出庫種別に記録する。"""
     sid = (source_management_id or "").strip()
     if not sid:
         raise ValueError("販売元管理ID（管理ID）が空です。")
@@ -2163,9 +2174,23 @@ def apply_outbound_sale_to_ledger_by_management_id(
     if av < 1:
         raise RuntimeError("実売金額（税抜）は1円以上にしてください。")
 
-    rec_dt = (sale_datetime_jst_str or "").strip() or jst_now_str()
-    df_src.loc[msk, COL_DATETIME] = rec_dt
-    df_src.loc[msk, COL_TYPE] = "出庫（販売）"
+    now_exec = jst_now_str()
+    if COL_PURCHASE_DATETIME in df_src.columns:
+        cp = str(df_src.loc[msk, COL_PURCHASE_DATETIME].iloc[0] or "").strip()
+        if not cp:
+            df_src.loc[msk, COL_PURCHASE_DATETIME] = str(
+                df_src.loc[msk, COL_DATETIME].iloc[0] or ""
+            )
+    if COL_PURCHASE_MOVEMENT in df_src.columns:
+        cm = str(df_src.loc[msk, COL_PURCHASE_MOVEMENT].iloc[0] or "").strip()
+        if not cm:
+            df_src.loc[msk, COL_PURCHASE_MOVEMENT] = str(
+                df_src.loc[msk, COL_TYPE].iloc[0] or ""
+            )
+    if COL_SALE_DATETIME in df_src.columns:
+        df_src.loc[msk, COL_SALE_DATETIME] = now_exec
+    if COL_SALE_OUTBOUND_TYPE in df_src.columns:
+        df_src.loc[msk, COL_SALE_OUTBOUND_TYPE] = "出庫（販売）"
     df_src.loc[msk, COL_STOCK_STATUS] = STATUS_SOLD
     df_src.loc[msk, COL_ACTUAL_SALE] = av
     df_src.loc[msk, COL_SALE_SOURCE_MGMT_ID] = ""
@@ -2259,12 +2284,24 @@ def _normalize_evidence_urls_for_link_editor(df: pd.DataFrame, col: str) -> bool
     return True
 
 
+def _ledger_dashboard_axis_datetime(df: pd.DataFrame) -> pd.Series:
+    """ダッシュボードの期間・月次軸に使う日時。販売済は **販売日時**（空なら日時）を優先。"""
+    base = pd.to_datetime(df[COL_DATETIME], errors="coerce")
+    if COL_SALE_DATETIME not in df.columns or COL_STOCK_STATUS not in df.columns:
+        return base
+    st = df[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
+    sold = st == STATUS_SOLD
+    sd = pd.to_datetime(df[COL_SALE_DATETIME], errors="coerce")
+    alt = sd.combine_first(base)
+    return base.where(~sold, alt)
+
+
 def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     """入出庫判定・行金額・年月などの派生列を付与したコピーを返す。
 
     1点1行ライフサイクル前提: **在庫中** かつ **入庫** だけを仕入（入庫）側に計上し、
     **販売済** かつ実売がある行は **実売行計（税抜・税込）** を売上（出庫）側に計上する
-    （区分が「出庫（販売）」に更新された行で、仕入金額を二重に出庫しない）。
+    （「日時」は仕入のままでも、販売済＋実売で売上を計上。仕入金額を二重に出庫しない）。
     **在庫中** のまま **出庫**（浮貸など別レコード）の行は、従来どおり仕入列ベースで出庫に含める。
     """
     d = df.copy()
@@ -2326,15 +2363,16 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
         + line_in.where(m_float_out, 0.0).fillna(0)
     ).astype(float)
 
-    d["_ym"] = d[COL_DATETIME].dt.to_period("M").astype(str)
-    d["_year"] = d[COL_DATETIME].dt.year
-    d["_month"] = d[COL_DATETIME].dt.month
+    axis_dt = _ledger_dashboard_axis_datetime(d)
+    d["_ym"] = axis_dt.dt.to_period("M").astype(str)
+    d["_year"] = axis_dt.dt.year
+    d["_month"] = axis_dt.dt.month
     return d
 
 
 def _ledger_dashboard_date_bounds(df: pd.DataFrame) -> tuple[date, date]:
-    """台帳の日時列から From/To の既定値（JST 日付）。有効な日付が無いときは今日（JST）。"""
-    s = pd.to_datetime(df[COL_DATETIME], errors="coerce").dropna()
+    """ダッシュボード用の日付範囲既定値（販売済は販売日時軸を含む）。"""
+    s = _ledger_dashboard_axis_datetime(df).dropna()
     if s.empty:
         t = jst_now().date()
         return t, t
@@ -2353,12 +2391,13 @@ def _altair_y_scale_positive(s: pd.Series) -> alt.Scale:
 
 def render_ledger_dashboard(df: pd.DataFrame) -> None:
     """在庫台帳 DataFrame から入出庫集計・仕入先・取引先別・グラフを表示する。"""
-    st.subheader("集計・ダッシュボード")
+    st.subheader("集計")
     st.caption(
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
         f"金額はシートの「{COL_PRICE_EXCL}」「{COL_PRICE_INCL}」列を行合計として集計します。"
         f"仕入先・取引先別の粗利は「{COL_GROSS_PROFIT}」列を合算しています（税抜・台帳保存時の値）。"
         "出庫（販売）は **在庫行の更新** のみのため、入庫／出庫の数量・金額は **在庫中＝仕入**、**販売済＝実売** を二重計上しないよう派生列で計上しています。"
+        "期間フィルタと月次の軸は **販売済は販売日時**（未入力の旧行は日時にフォールバック）、在庫中は **日時** です。"
         "（税抜の仕入金額が空で税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
         "カンマ区切り・円記号付きの数値も読み取ります。）"
     )
@@ -2413,7 +2452,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         st.warning("開始日が終了日より後です。入れ替えて集計します。")
         dfb, dtb = dtb, dfb
 
-    row_ts = pd.to_datetime(ad_f[COL_DATETIME], errors="coerce")
+    row_ts = _ledger_dashboard_axis_datetime(ad_f)
     row_day = row_ts.dt.normalize()
     from_ts = pd.Timestamp(datetime.combine(dfb, datetime.min.time()))
     to_ts = pd.Timestamp(datetime.combine(dtb, datetime.min.time()))
@@ -2949,7 +2988,7 @@ def _render_inventory_category_pie(pie_df: pd.DataFrame) -> None:
 
 def render_analytics_dashboard_page() -> None:
     """集計・分析: メトリクス・Plotly・既存の月次ダッシュボード。"""
-    st.subheader("集計・分析（ダッシュボード）")
+    st.subheader("分析")
     st.caption(
         "共有の **inventory.csv**（`INVENTORY_SOURCE=csv`）または **Google スプレッドシート**から読み込んだ最新データを集計します。"
     )
@@ -3584,16 +3623,8 @@ def main():
     st.caption(
         "実売・ステータス・**販売元管理ID**（売れた在庫の **管理ID** と同一。在庫中の行を特定します）をまとめて扱います。"
         "販売元の写真照合は、上の **クイック検索（写真から検索）** の **販売元を写真で照合** ボタンを使います（同じ1枚の写真）。"
-        "区分が **出庫（販売）** で確定すると、**新規行は追加せず** 該当管理IDの行だけを **販売済** に更新します（実売・日時・入出庫種別を上書き）。"
+        "区分が **出庫（販売）** で確定すると、**新規行は追加せず** 該当管理IDの行を **販売済** に更新し、**販売日時・出庫種別** に確定実行の情報を記録します（仕入の「日時」「入出庫種別」は変えません）。"
     )
-    if movement == "出庫（販売）":
-        st.date_input(
-            "販売日（JST・台帳の「日時」列に記録）",
-            value=_today_jst_date(),
-            key="field_sale_date_jst",
-            help="確定時にこの日の JST 12:00 を日時として保存します（必要なら台帳一覧で後から修正可）。",
-        )
-
     _swarn = st.session_state.pop("_sale_link_warn", None)
     if _swarn:
         st.warning(_swarn)
@@ -3833,12 +3864,6 @@ def main():
                             "台帳の保存先が未設定のため、販売反映をスキップしました。"
                         )
                     else:
-                        _sale_d = st.session_state.get(
-                            "field_sale_date_jst", _today_jst_date()
-                        )
-                        if not isinstance(_sale_d, date):
-                            _sale_d = _today_jst_date()
-                        _sale_dt_str = _jst_datetime_str_from_date(_sale_d)
                         try:
                             with st.spinner(
                                 "該当の在庫行を販売済に更新しています（新規行は追加しません）…"
@@ -3846,7 +3871,6 @@ def main():
                                 apply_outbound_sale_to_ledger_by_management_id(
                                     _sale_src_save,
                                     actual_sale_unit_excl_yen=_act_ex2,
-                                    sale_datetime_jst_str=_sale_dt_str,
                                     new_image_url=(urls[0] if urls else "") or "",
                                     memo_suffix=memo_s,
                                 )
@@ -3859,7 +3883,7 @@ def main():
                         else:
                             st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
                             st.success(
-                                f"管理ID **{_sale_src_save}** の行を販売済に更新しました（実売 ¥{_act_ex2:,}・日時 {_sale_dt_str}）。"
+                                f"管理ID **{_sale_src_save}** の行を販売済に更新しました（実売 ¥{_act_ex2:,}・販売日時は確定実行の JST 時刻を記録）。"
                             )
                             _link_urls = list(dict.fromkeys(u for u in urls if u))
                             for _uurl in _link_urls[:8]:
