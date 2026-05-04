@@ -3326,8 +3326,197 @@ def render_analytics_dashboard_page() -> None:
     render_ledger_dashboard(calc)
 
 
+def _inject_prominent_main_tabs_style() -> None:
+    """メインエリアの ``st.tabs`` ラベルを大きく太字にする（登録・在庫一覧で共通）。"""
+    st.markdown(
+        """
+        <style>
+        section.main [data-testid="stTabs"] button {
+            font-size: clamp(1.1rem, 2.2vw, 1.45rem) !important;
+            font-weight: 700 !important;
+            line-height: 1.35 !important;
+            padding-top: 0.65rem !important;
+            padding-bottom: 0.65rem !important;
+            letter-spacing: 0.02em !important;
+        }
+        section.main [data-testid="stTabs"] [role="tablist"] {
+            gap: 0.35rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _google_drive_file_id_from_url(url: str) -> str | None:
+    u = (url or "").strip()
+    if not u:
+        return None
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]{10,})", u, re.I)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"[?&]id=([a-zA-Z0-9_-]{10,})", u, re.I)
+    if m2:
+        return m2.group(1)
+    m3 = re.search(r"googleusercontent\.com/d/([a-zA-Z0-9_-]{10,})", u, re.I)
+    if m3:
+        return m3.group(1)
+    return None
+
+
+def _render_inventory_gallery_thumbnail(image_url: str, *, width: int, sold: bool) -> None:
+    """ギャラリー用。Drive 直リンクは ``st.image(URL)`` が効かないことが多いため、取得して JPEG 化して表示する。"""
+    iu = (image_url or "").strip()
+    if not (iu.startswith("http://") or iu.startswith("https://")):
+        st.caption("（画像なし）")
+        return
+    _w = max(120, min(480, int(width)))
+    sz = min(1200, _w * 4)
+    fid = _google_drive_file_id_from_url(iu)
+    candidates: list[str] = []
+    if fid:
+        candidates.append(f"https://drive.google.com/thumbnail?id={fid}&sz=w{sz}")
+        candidates.append(
+            f"https://drive.usercontent.google.com/download?id={fid}&export=view"
+        )
+    candidates.append(iu)
+
+    ua = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+    timeout = 20.0
+    for cand in candidates:
+        try:
+            r = requests.get(cand, timeout=timeout, headers=ua, allow_redirects=True)
+        except Exception:
+            continue
+        if r.status_code != 200 or not r.content or len(r.content) < 32:
+            continue
+        low512 = r.content[:512].lower()
+        if b"<html" in low512 or b"<!doctype" in low512:
+            continue
+        try:
+            im = Image.open(io.BytesIO(r.content))
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((_w * 2, _w * 2), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+            st.image(buf.getvalue(), width=_w, use_container_width=False)
+            return
+        except Exception:
+            try:
+                st.image(r.content, width=_w, use_container_width=False)
+                return
+            except Exception:
+                continue
+    st.caption("（ブラウザで開くと表示できる画像です）")
+    st.link_button("画像を開く", iu, use_container_width=True)
+
+
+def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> None:
+    """在庫一覧の表形式: data_editor と保存ボタン。"""
+    _ledger_evidence_link_mode = _normalize_evidence_urls_for_link_editor(
+        df_sorted, COL_VOUCHER_EVIDENCE_URL
+    )
+
+    _ledger_col_cfg: dict[str, Any] = {}
+    if COL_MANAGEMENT_ID in df_sorted.columns:
+        _ledger_col_cfg[COL_MANAGEMENT_ID] = st.column_config.TextColumn(
+            COL_MANAGEMENT_ID,
+            disabled=True,
+            help="1点1行の自動採番（シリアル）。通常は手入力しません。",
+        )
+    if COL_STOCK_STATUS in df_sorted.columns:
+        _ledger_col_cfg[COL_STOCK_STATUS] = st.column_config.SelectboxColumn(
+            COL_STOCK_STATUS,
+            options=list(STOCK_STATUS_OPTIONS),
+            help="在庫中＝未販売想定、販売済＝実売価格で粗利を計算します。",
+        )
+    if COL_LAST_STOCKTAKE in df_sorted.columns:
+        _ledger_col_cfg[COL_LAST_STOCKTAKE] = st.column_config.TextColumn(
+            COL_LAST_STOCKTAKE,
+            help=f"棚卸・実地確認した日（日本時間の暦日推奨）。例: {_today_jst_date().isoformat()}",
+        )
+    if COL_SALE_SOURCE_MGMT_ID in df_sorted.columns:
+        _ledger_col_cfg[COL_SALE_SOURCE_MGMT_ID] = st.column_config.TextColumn(
+            COL_SALE_SOURCE_MGMT_ID,
+            help="出庫（販売）などで売れた在庫行の入庫時管理ID（G########）。登録画面の販売管理からも入力できます。",
+        )
+    if COL_VOUCHER_RECORDED_AT in df_sorted.columns:
+        _ledger_col_cfg[COL_VOUCHER_RECORDED_AT] = st.column_config.TextColumn(
+            COL_VOUCHER_RECORDED_AT,
+            help="証憑を台帳に反映した日時（JST・recorded_at に相当）。",
+        )
+    if COL_VOUCHER_EVIDENCE_URL in df_sorted.columns:
+        if _ledger_evidence_link_mode:
+            _ledger_col_cfg[COL_VOUCHER_EVIDENCE_URL] = st.column_config.LinkColumn(
+                COL_VOUCHER_EVIDENCE_URL,
+                help="Google ドライブの証憑 URL。アイコンをクリックするとブラウザで開きます。",
+                disabled=True,
+                display_text=":material/open_in_new:",
+            )
+        else:
+            _ledger_col_cfg[COL_VOUCHER_EVIDENCE_URL] = st.column_config.TextColumn(
+                COL_VOUCHER_EVIDENCE_URL,
+                help="http(s) 以外の文字が混ざる行があるためテキスト表示です。URL をコピーしてブラウザで開いてください。",
+            )
+
+    _editor_kw: dict[str, Any] = {
+        "num_rows": "dynamic",
+        "key": LEDGER_DATA_EDITOR_KEY,
+        "use_container_width": True,
+        "hide_index": True,
+    }
+    if _ledger_col_cfg:
+        _editor_kw["column_config"] = _ledger_col_cfg
+    edited = st.data_editor(df_sorted, **_editor_kw)
+
+    if st.button(
+        "在庫中かつ棚卸日が未入力の行に、今日の日付（JST）を一括入力してすぐ保存",
+        key="ledger_bulk_stocktake_today_save",
+    ):
+        ed_bulk = edited.copy()
+        if COL_LAST_STOCKTAKE not in ed_bulk.columns:
+            ed_bulk[COL_LAST_STOCKTAKE] = ""
+        m_b = _mask_ledger_stocktake_unverified(ed_bulk)
+        ed_bulk.loc[m_b, COL_LAST_STOCKTAKE] = _today_jst_date().isoformat()
+        with st.spinner("台帳を保存しています…"):
+            try:
+                overwrite_inventory_worksheet_from_dataframe(
+                    ed_bulk.reset_index(drop=True),
+                    previous_df=edited.reset_index(drop=True),
+                )
+            except Exception as e:
+                st.error(str(e))
+            else:
+                st.session_state["_ledger_saved_flash"] = (
+                    "棚卸日（今日・JST）を未確認の在庫中に一括入力し、台帳を保存しました。"
+                )
+                st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+                st.rerun()
+
+    _render_inventory_price_summary(edited)
+
+    if st.button("台帳を更新する", type="primary", key="ledger_save_overwrite"):
+        with st.spinner("台帳を保存しています…"):
+            try:
+                overwrite_inventory_worksheet_from_dataframe(
+                    edited.reset_index(drop=True),
+                    previous_df=df_sorted.reset_index(drop=True),
+                )
+            except Exception as e:
+                st.error(str(e))
+                return
+        st.session_state["_ledger_saved_flash"] = "台帳を更新しました。"
+        st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+        st.rerun()
+
+
 def render_inventory_list_page() -> None:
-    st.subheader("在庫一覧")
+    st.markdown("## 在庫一覧")
     st.caption(
         "共有の **inventory.csv** または **スプレッドシート**の全データを編集できます。行の追加・削除は表から操作し、"
         "「台帳を更新する」で保存します。"
@@ -3441,18 +3630,19 @@ def render_inventory_list_page() -> None:
 
     df_sorted_calc = _recalc_gross_profit_dataframe(df_sorted.copy())
 
-    st.markdown("##### 一覧の表示")
-    view_mode = st.radio(
-        "表示形式",
-        ("表形式（編集可）", "ギャラリー（カタログ）"),
-        horizontal=True,
-        key="inv_list_view_mode",
+    _inject_prominent_main_tabs_style()
+    st.markdown("## 表示形式")
+    st.caption(
+        "**上の大きなタブ** で切り替えます。**表形式** で編集・保存、**ギャラリー** で接客用の一覧（閲覧専用）です。"
+    )
+    tab_ledger_table, tab_ledger_gallery = st.tabs(
+        ("表形式（編集・保存）", "ギャラリー（カタログ）"),
     )
 
-    if view_mode.startswith("ギャラリー"):
+    with tab_ledger_gallery:
+        st.markdown("### ギャラリー（カタログ）")
         st.caption(
-            "ギャラリーは **閲覧専用** です（画像は幅200pxで読み込み負荷を抑えています）。"
-            "編集・保存は **表形式** に切り替えてください。"
+            "Google ドライブの画像 URL はサーバー側で取得して表示します（表示できない場合は **画像を開く** からブラウザで確認できます）。"
         )
         g1, g2, g3 = st.columns([2, 2, 1])
         with g1:
@@ -3523,23 +3713,18 @@ def render_inventory_list_page() -> None:
                         if sold:
                             st.caption("販売済")
                         iu = str(row.get(COL_IMAGE_URL, "") or "").strip()
-                        _img_w = 160 if sold else 200
-                        if iu.startswith("http://") or iu.startswith("https://"):
-                            st.image(
-                                iu,
-                                width=_img_w,
-                                use_container_width=False,
-                            )
-                        else:
-                            st.caption("（画像なし）")
+                        _img_w = 200 if sold else 240
+                        _render_inventory_gallery_thumbnail(
+                            iu, width=_img_w, sold=sold
+                        )
                         st.markdown(
-                            f'<p style="opacity:{"0.5" if sold else "1"};margin:0;">'
+                            f'<p style="opacity:{"0.55" if sold else "1"};margin:0.2rem 0 0 0;font-size:1.05rem;">'
                             f"<b>{mid}</b></p>",
                             unsafe_allow_html=True,
                         )
                         nm = str(row.get(COL_NAME, "") or "").strip() or "—"
                         st.markdown(
-                            f'<p style="opacity:{"0.5" if sold else "1"};margin:0;font-size:0.9rem;">'
+                            f'<p style="opacity:{"0.55" if sold else "1"};margin:0;font-size:0.98rem;">'
                             f"{(nm if len(nm) <= 96 else nm[:93] + '…')}</p>",
                             unsafe_allow_html=True,
                         )
@@ -3554,7 +3739,7 @@ def render_inventory_list_page() -> None:
                             else "販売予定（税抜） —"
                         )
                         st.markdown(
-                            f'<p style="opacity:{"0.5" if sold else "1"};margin:0;font-size:0.85rem;">'
+                            f'<p style="opacity:{"0.55" if sold else "1"};margin:0;font-size:0.95rem;">'
                             f"{_pl_lbl}</p>",
                             unsafe_allow_html=True,
                         )
@@ -3565,103 +3750,10 @@ def render_inventory_list_page() -> None:
                             use_container_width=True,
                         ):
                             _inventory_gallery_detail_dialog(rd)
-        return
 
-    _ledger_evidence_link_mode = _normalize_evidence_urls_for_link_editor(
-        df_sorted, COL_VOUCHER_EVIDENCE_URL
-    )
-
-    _ledger_col_cfg: dict[str, Any] = {}
-    if COL_MANAGEMENT_ID in df_sorted.columns:
-        _ledger_col_cfg[COL_MANAGEMENT_ID] = st.column_config.TextColumn(
-            COL_MANAGEMENT_ID,
-            disabled=True,
-            help="1点1行の自動採番（シリアル）。通常は手入力しません。",
-        )
-    if COL_STOCK_STATUS in df_sorted.columns:
-        _ledger_col_cfg[COL_STOCK_STATUS] = st.column_config.SelectboxColumn(
-            COL_STOCK_STATUS,
-            options=list(STOCK_STATUS_OPTIONS),
-            help="在庫中＝未販売想定、販売済＝実売価格で粗利を計算します。",
-        )
-    if COL_LAST_STOCKTAKE in df_sorted.columns:
-        _ledger_col_cfg[COL_LAST_STOCKTAKE] = st.column_config.TextColumn(
-            COL_LAST_STOCKTAKE,
-            help=f"棚卸・実地確認した日（日本時間の暦日推奨）。例: {_today_jst_date().isoformat()}",
-        )
-    if COL_SALE_SOURCE_MGMT_ID in df_sorted.columns:
-        _ledger_col_cfg[COL_SALE_SOURCE_MGMT_ID] = st.column_config.TextColumn(
-            COL_SALE_SOURCE_MGMT_ID,
-            help="出庫（販売）などで売れた在庫行の入庫時管理ID（G########）。登録画面の販売管理からも入力できます。",
-        )
-    if COL_VOUCHER_RECORDED_AT in df_sorted.columns:
-        _ledger_col_cfg[COL_VOUCHER_RECORDED_AT] = st.column_config.TextColumn(
-            COL_VOUCHER_RECORDED_AT,
-            help="証憑を台帳に反映した日時（JST・recorded_at に相当）。",
-        )
-    if COL_VOUCHER_EVIDENCE_URL in df_sorted.columns:
-        if _ledger_evidence_link_mode:
-            _ledger_col_cfg[COL_VOUCHER_EVIDENCE_URL] = st.column_config.LinkColumn(
-                COL_VOUCHER_EVIDENCE_URL,
-                help="Google ドライブの証憑 URL。アイコンをクリックするとブラウザで開きます。",
-                disabled=True,
-                display_text=":material/open_in_new:",
-            )
-        else:
-            _ledger_col_cfg[COL_VOUCHER_EVIDENCE_URL] = st.column_config.TextColumn(
-                COL_VOUCHER_EVIDENCE_URL,
-                help="http(s) 以外の文字が混ざる行があるためテキスト表示です。URL をコピーしてブラウザで開いてください。",
-            )
-
-    _editor_kw: dict[str, Any] = {
-        "num_rows": "dynamic",
-        "key": LEDGER_DATA_EDITOR_KEY,
-        "use_container_width": True,
-        "hide_index": True,
-    }
-    if _ledger_col_cfg:
-        _editor_kw["column_config"] = _ledger_col_cfg
-    edited = st.data_editor(df_sorted, **_editor_kw)
-
-    if st.button(
-        "在庫中かつ棚卸日が未入力の行に、今日の日付（JST）を一括入力してすぐ保存",
-        key="ledger_bulk_stocktake_today_save",
-    ):
-        ed_bulk = edited.copy()
-        if COL_LAST_STOCKTAKE not in ed_bulk.columns:
-            ed_bulk[COL_LAST_STOCKTAKE] = ""
-        m_b = _mask_ledger_stocktake_unverified(ed_bulk)
-        ed_bulk.loc[m_b, COL_LAST_STOCKTAKE] = _today_jst_date().isoformat()
-        with st.spinner("台帳を保存しています…"):
-            try:
-                overwrite_inventory_worksheet_from_dataframe(
-                    ed_bulk.reset_index(drop=True),
-                    previous_df=edited.reset_index(drop=True),
-                )
-            except Exception as e:
-                st.error(str(e))
-            else:
-                st.session_state["_ledger_saved_flash"] = (
-                    "棚卸日（今日・JST）を未確認の在庫中に一括入力し、台帳を保存しました。"
-                )
-                st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-                st.rerun()
-
-    _render_inventory_price_summary(edited)
-
-    if st.button("台帳を更新する", type="primary", key="ledger_save_overwrite"):
-        with st.spinner("台帳を保存しています…"):
-            try:
-                overwrite_inventory_worksheet_from_dataframe(
-                    edited.reset_index(drop=True),
-                    previous_df=df_sorted.reset_index(drop=True),
-                )
-            except Exception as e:
-                st.error(str(e))
-                return
-        st.session_state["_ledger_saved_flash"] = "台帳を更新しました。"
-        st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-        st.rerun()
+    with tab_ledger_table:
+        st.markdown("### 表形式（編集・保存）")
+        _render_inventory_ledger_data_editor_section(df_sorted)
 
 
 def _init_registration_form_session_state() -> None:
@@ -4353,9 +4445,9 @@ def main():
     _init_voucher_sidebar_state()
     df_ledger_hint = _ledger_hint_dataframe()
 
-    st.subheader("台帳登録")
+    st.markdown("## 台帳登録")
     st.caption(
-        "仕入れ・販売・棚卸しはタブで切り替えます。"
+        "仕入れ・販売・棚卸しは **下の大きなタブ** で切り替えます。"
         "下の **1枚の写真** は全タブ共通です（AI 解析は長辺最大"
         f"{UPLOAD_JPEG_MAX_LONG_EDGE}px・品質{UPLOAD_JPEG_QUALITY}％、"
         f"仕入れ確定で Drive 保存するときは長辺{PURCHASE_DRIVE_JPEG_MAX_LONG_EDGE}px・品質{PURCHASE_DRIVE_JPEG_QUALITY}％に変換します）。"
@@ -4371,6 +4463,7 @@ def main():
         "台帳の日時は写真の EXIF 撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
     )
 
+    _inject_prominent_main_tabs_style()
     tab_purchase, tab_sales, tab_stock = st.tabs(
         ("仕入れ登録", "販売管理", "棚卸しスキャン")
     )
