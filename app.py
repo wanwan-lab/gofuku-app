@@ -2109,11 +2109,43 @@ def _ledger_in_stock_management_ids(df: pd.DataFrame, *, max_n: int = 600) -> li
     return sorted(set(s.tolist()), key=lambda x: (x.casefold(), x))[:max_n]
 
 
+def _sync_planned_sale_from_ledger_in_stock_match() -> None:
+    """在庫中の台帳行で、入力中の商品名（＋仕入先が入っていれば一致）に合わせ販売予定（税抜・1点）を反映する。"""
+    try:
+        df = load_inventory_dataframe()
+    except Exception:
+        return
+    if df is None or df.empty or COL_PLANNED_SALE not in df.columns:
+        return
+    pn = str(st.session_state.get("field_product_name", "") or "").strip()
+    if not pn:
+        return
+    sub = df.loc[_mask_ledger_in_stock(df)]
+    if sub.empty:
+        return
+    m = sub[COL_NAME].astype(str).str.strip() == pn
+    su = str(st.session_state.get("field_supplier", "") or "").strip()
+    if su and COL_SUPPLIER in sub.columns:
+        m = m & (sub[COL_SUPPLIER].astype(str).str.strip() == su)
+    hit = sub.loc[m]
+    if hit.empty:
+        return
+    if COL_MANAGEMENT_ID in hit.columns:
+        hit = hit.sort_values(
+            COL_MANAGEMENT_ID,
+            key=lambda s: s.astype(str).str.strip(),
+            na_position="last",
+        )
+    pl = _finite_int(hit.iloc[0].get(COL_PLANNED_SALE), 0)
+    st.session_state.field_planned_sale_excl = max(0, int(pl))
+
+
 def _on_ledger_pick_product_name() -> None:
     v = st.session_state.get("ledger_pick_product_name", "")
     if v and v != LEDGER_PICK_PLACEHOLDER:
         st.session_state.field_product_name = v
         st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+        _sync_planned_sale_from_ledger_in_stock_match()
 
 
 def _on_ledger_pick_supplier() -> None:
@@ -2121,6 +2153,7 @@ def _on_ledger_pick_supplier() -> None:
     if v and v != LEDGER_PICK_PLACEHOLDER:
         st.session_state.field_supplier = v
         st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+        _sync_planned_sale_from_ledger_in_stock_match()
 
 
 def _on_sale_pick_source_id() -> None:
@@ -3581,6 +3614,7 @@ def main():
         st.markdown("##### 台帳から入力補助（任意）")
         st.caption(
             "絞り込み欄に文字を入れると候補が絞られます。プルダウンで選ぶと下の入力欄に反映されます（あとから手修正も可能です）。"
+            "在庫中の行に一致したときは **販売予定金額（税抜・任意）** にも、台帳の1点あたりの値を入れます（仕入先まで一致する行を優先）。"
         )
         hc1, hc2 = st.columns(2)
         with hc1:
@@ -3653,6 +3687,7 @@ def main():
                     COL_NAME,
                     COL_SUPPLIER,
                     COL_PRICE_EXCL,
+                    COL_PLANNED_SALE,
                     COL_LAST_STOCKTAKE,
                     COL_SALE_SOURCE_MGMT_ID,
                 )
@@ -3767,7 +3802,7 @@ def main():
         _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
         if _sale_id_opts:
             st.selectbox(
-                "在庫中の管理IDから販売元を選ぶ",
+                "在庫中の管理IDから販売した商品を選ぶ",
                 options=[LEDGER_PICK_PLACEHOLDER] + _sale_id_opts,
                 key="sale_pick_source_id",
                 on_change=_on_sale_pick_source_id,
