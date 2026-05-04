@@ -35,14 +35,14 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 列定義・CSV 入出力は **app.py 内に内包**しています。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
-  日時 | 入出庫種別 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
+  日時 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
   | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID | 証憑記録日時 | 証憑URL
   | 仕入日時 | 入庫種別 | 販売日時 | 出庫種別
   ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
-  ※「日時」「入出庫種別」は **仕入登録時の値のまま** 保持し、販売反映では上書きしません（仕入の記録）。**販売日時** は販売確定ボタンを押した **JST の実行時刻**、**出庫種別** は出庫（販売）等を記録します。**仕入日時**・**入庫種別** は仕入時に日時・区分と同内容で埋めます（未設定の既存行は販売反映時に日時・区分から補完）。
-  ※「日時」列への新規記入は **日本時間（JST / Asia/Tokyo）** で行い、画像に EXIF 撮影日時があればそれを JST として解釈して優先します。
+  ※「**日時**」列（A列）は **その行が最後に台帳へ保存された時点の JST 時刻**（登録・販売反映・一覧からの保存など）です。**仕入日時** は仕入の暦（EXIF 等を ``record_datetime`` に渡した値）、**入庫種別** は登録画面の区分（入庫（購入）等）です。**販売日時**・**出庫種別** は販売確定時に記録します。
+  ※旧シートの「入出庫種別」列は読み込み時に **入庫種別** へ移して無視します（ヘッダーは新列順に更新されます）。
   ※「仕入金額（税抜）」「仕入金額（税込）」は **1点あたりの行合計**（台帳の各行は数量1）です。
   ※旧シートに「仕入単価（税抜）」列が残っている場合は、読み込み時にその列を除いて新しい列構成に揃えます。
   ※新規登録画面では仕入金額（税込）の計算に使う消費税を **10% / 8% / 非課税** から選べます（既定は10%）。
@@ -50,9 +50,9 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※金額列（仕入〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
   ※粗利は税抜ベースで「販売済」なら（実売金額（税抜）×数量）−原価、「在庫中」なら（販売予定金額（税抜）×数量）−原価。台帳保存時に再計算します。
   ※「最後に確認した日付（棚卸日）」は棚卸作業用の任意列です（YYYY-MM-DD 推奨）。1人棚卸しの進捗把握に使います。
-  ※「販売元管理ID」は登録画面で **出庫（販売）** を選んだときに必須となり、**在庫中の行の管理ID（G########）** と一致する行を特定してその1行を **販売済** に更新します（新規行は追加しません）。
+  ※「販売元管理ID」は登録画面で **出庫（販売）** を選んだときに必須となり、**在庫中の行の管理ID（G########）** を指定します。数量が1のときは1件、2以上のときは **数量と同じ件数** をカンマ等で区切って入力し、各IDの行を順に **販売済** に更新します（新規行は追加しません）。
   ※「証憑記録日時」は証憑取込の **確定ボタンを押した JST 時刻**（recorded_at に相当）。「証憑URL」はその証憑を GAS 経由で Drive に保存したときの表示 URL（evidence_url）です。
-  ※台帳一覧から手動で在庫行を販売済に編集する場合は、**販売日時**・**出庫種別**・実売・ステータスを整合させてください（「日時」は仕入のまま）。
+  ※台帳一覧から手動で在庫行を販売済に編集する場合は、**販売日時**・**出庫種別**・実売・ステータスを整合させてください（保存時に変更があった行の「日時」は自動で更新されます）。
 """
 
 from __future__ import annotations
@@ -82,7 +82,8 @@ from PIL import Image, ImageOps
 
 # --- スプレッドシート列・税率（app 単体で完結：サブモジュール未コミットでも Cloud で動く） ---
 COL_DATETIME = "日時"
-COL_TYPE = "入出庫種別"
+# 旧シート互換（読み込み時のみ。列は台帳から廃止）
+LEGACY_COL_MOVEMENT_TYPE = "入出庫種別"
 COL_NAME = "商品名"
 COL_SUPPLIER = "仕入先・取引先"
 COL_QTY = "数量"
@@ -103,7 +104,7 @@ COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
 # 証憑取込（recorded_at / evidence_url に相当）
 COL_VOUCHER_RECORDED_AT = "証憑記録日時"
 COL_VOUCHER_EVIDENCE_URL = "証憑URL"
-# 仕入と販売を同一行で分離（日時・入出庫種別は仕入登録のまま。販売は下記に記録）
+# 仕入と販売を同一行で分離（「日時」は行の最終更新時刻。仕入の暦は下記の仕入日時・入庫種別）
 COL_PURCHASE_DATETIME = "仕入日時"
 COL_PURCHASE_MOVEMENT = "入庫種別"
 COL_SALE_DATETIME = "販売日時"
@@ -128,7 +129,6 @@ CONSUMPTION_TAX_CHOICE_TO_RATE: dict[str, float] = {
 
 EXPECTED_HEADERS: list[str] = [
     COL_DATETIME,
-    COL_TYPE,
     COL_NAME,
     COL_SUPPLIER,
     COL_QTY,
@@ -168,6 +168,14 @@ def _inventory_csv_read_df() -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=EXPECTED_HEADERS)
     df = pd.read_csv(path, encoding="utf-8-sig")
+    if LEGACY_COL_MOVEMENT_TYPE in df.columns:
+        if COL_PURCHASE_MOVEMENT not in df.columns:
+            df[COL_PURCHASE_MOVEMENT] = ""
+        m = df[COL_PURCHASE_MOVEMENT].fillna("").astype(str).str.strip() == ""
+        df.loc[m, COL_PURCHASE_MOVEMENT] = (
+            df.loc[m, LEGACY_COL_MOVEMENT_TYPE].fillna("").astype(str)
+        )
+        df = df.drop(columns=[LEGACY_COL_MOVEMENT_TYPE], errors="ignore")
     for c in EXPECTED_HEADERS:
         if c not in df.columns:
             df[c] = ""
@@ -1802,25 +1810,6 @@ def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _parse_max_management_serial(rows: list[Any], col_idx: int) -> int:
-    """管理ID列の最大連番（G######## または数字のみ）を返す。ヘッダー行は含めない。"""
-    mx = 0
-    for r in rows[1:]:
-        row = [("" if c is None else str(c)) for c in list(r)]
-        if col_idx >= len(row):
-            continue
-        s = str(row[col_idx]).strip()
-        if not s:
-            continue
-        m = re.fullmatch(r"(?i)G(\d+)", s)
-        if m:
-            mx = max(mx, int(m.group(1)))
-            continue
-        if s.isdigit():
-            mx = max(mx, int(s))
-    return mx
-
-
 def _max_management_serial_from_dataframe(df: pd.DataFrame) -> int:
     """DataFrame の管理ID列から最大シリアルを返す。"""
     mx = 0
@@ -1850,18 +1839,15 @@ def allocate_management_ids(ws: Any, count: int) -> list[str]:
     if ws is None:
         return []
     try:
-        raw = ws.get_all_values()
+        df_exist = load_inventory_dataframe()
     except Exception:
-        raw = []
-    if not raw:
-        raw = [EXPECTED_HEADERS]
-    idx = EXPECTED_HEADERS.index(COL_MANAGEMENT_ID)
-    mx = _parse_max_management_serial(raw, idx)
+        df_exist = None
+    mx = _max_management_serial_from_dataframe(df_exist) if df_exist is not None else 0
     return [f"G{mx + i + 1:08d}" for i in range(count)]
 
 
 def append_sheet_row(
-    movement: str,
+    purchase_movement: str,
     product_name: str,
     supplier: str,
     line_price_excl_yen: int,
@@ -1879,8 +1865,12 @@ def append_sheet_row(
     voucher_recorded_at: str = "",
     voucher_evidence_url: str = "",
 ):
-    """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。"""
-    now = (record_datetime or "").strip() or jst_now_str()
+    """1点1行で台帳に追記する（数量列は常に 1。仕入単価列は持たない）。
+
+    A列「日時」は **追記実行の JST**。仕入の暦は「仕入日時」に ``record_datetime``（EXIF 等）を渡す。
+    """
+    dt_a = jst_now_str()
+    dt_purchase = ((record_datetime or "").strip() or dt_a)
     cogs = _finite_int(line_price_excl_yen, 0)
     qty_i = 1
     pl_u = _finite_int(planned_sale_unit_excl_yen, 0)
@@ -1913,9 +1903,9 @@ def append_sheet_row(
         stt,
     )
     gross_cell = 0 if gp is None else _finite_int(gp, 0)
+    pm = (purchase_movement or "").strip()
     row_vals: list[Any] = [
-        now,
-        movement,
+        dt_a,
         product_name,
         supplier,
         1,
@@ -1934,12 +1924,12 @@ def append_sheet_row(
         (sale_source_management_id or "").strip(),
         (voucher_recorded_at or "").strip(),
         (voucher_evidence_url or "").strip(),
-        now,
-        movement,
-        (now if stt == STATUS_SOLD else ""),
+        dt_purchase,
+        pm,
+        (dt_a if stt == STATUS_SOLD else ""),
         (
-            movement
-            if stt == STATUS_SOLD and _movement_is_outbound(movement)
+            pm
+            if stt == STATUS_SOLD and _movement_is_outbound(pm)
             else ("出庫（販売）" if stt == STATUS_SOLD else "")
         ),
     ]
@@ -1967,6 +1957,24 @@ def append_sheet_row(
         raise RuntimeError(f"スプレッドシート追記に失敗しました: {e}") from e
 
 
+def _sheet_header_row_to_expected_list(header: list[str], row: list[Any]) -> list[str]:
+    """ヘッダー名でセルを対応付け、EXPECTED_HEADERS 順の1行にする。旧「入出庫種別」は入庫種別へ移す。"""
+    h = [("" if x is None else str(x)).strip() for x in header]
+    rlist = [("" if x is None else str(x)) for x in list(row)]
+    h2: list[str] = []
+    r2: list[str] = []
+    for i, nm in enumerate(h):
+        if nm == LEGACY_COL_UNIT_PRICE:
+            continue
+        h2.append(nm)
+        r2.append(rlist[i] if i < len(rlist) else "")
+    dd = dict(zip(h2, r2))
+    out: dict[str, str] = {c: str(dd.get(c, "") or "") for c in EXPECTED_HEADERS}
+    if LEGACY_COL_MOVEMENT_TYPE in dd and not (out.get(COL_PURCHASE_MOVEMENT) or "").strip():
+        out[COL_PURCHASE_MOVEMENT] = str(dd.get(LEGACY_COL_MOVEMENT_TYPE, "") or "")
+    return [out[c] for c in EXPECTED_HEADERS]
+
+
 def load_inventory_dataframe() -> pd.DataFrame | None:
     """1行目をヘッダー、2行目以降をデータとして読み込み、列は EXPECTED_HEADERS に揃える。"""
     if _uses_local_inventory_csv():
@@ -1982,20 +1990,7 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
         return pd.DataFrame(columns=EXPECTED_HEADERS)
     header0 = [("" if c is None else str(c)).strip() for c in raw[0]]
     rows = raw[1:]
-    n = len(EXPECTED_HEADERS)
-    drop_unit_j: int | None = None
-    if LEGACY_COL_UNIT_PRICE in header0:
-        drop_unit_j = header0.index(LEGACY_COL_UNIT_PRICE)
-
-    def pad(row: list[Any]) -> list[str]:
-        r = [("" if c is None else str(c)) for c in list(row)]
-        if drop_unit_j is not None and drop_unit_j < len(r):
-            r = r[:drop_unit_j] + r[drop_unit_j + 1 :]
-        if len(r) < n:
-            r.extend([""] * (n - len(r)))
-        return r[:n]
-
-    data_rows = [pad(r) for r in rows]
+    data_rows = [_sheet_header_row_to_expected_list(header0, list(r)) for r in rows]
     return pd.DataFrame(data_rows, columns=EXPECTED_HEADERS)
 
 
@@ -2064,6 +2059,39 @@ def _on_sale_pick_source_id() -> None:
         st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
 
 
+def _ledger_row_content_differs(
+    a: pd.Series, b: pd.Series, *, skip_cols: frozenset[str]
+) -> bool:
+    """同一行の表示内容に差があるか（日時列などは比較から除外）。"""
+    for c in EXPECTED_HEADERS:
+        if c in skip_cols:
+            continue
+        if c not in a.index or c not in b.index:
+            continue
+        if str(a.get(c, "")).strip() != str(b.get(c, "")).strip():
+            return True
+    return False
+
+
+def _stamp_row_datetime_on_changes(
+    before: pd.DataFrame, after: pd.DataFrame
+) -> pd.DataFrame:
+    """行順・行数が一致する前提で、内容が変わった行の「日時」を JST 現在にする。"""
+    out = after.copy()
+    if COL_DATETIME not in out.columns or before is None or before.empty or after.empty:
+        return out
+    ts = jst_now_str()
+    skip = frozenset({COL_DATETIME})
+    n = min(len(before), len(after))
+    loc_dt = out.columns.get_loc(COL_DATETIME)
+    for i in range(n):
+        if _ledger_row_content_differs(before.iloc[i], after.iloc[i], skip_cols=skip):
+            out.iloc[i, loc_dt] = ts
+    for i in range(n, len(after)):
+        out.iloc[i, loc_dt] = ts
+    return out
+
+
 def _cell_value_for_sheet(v: Any) -> Any:
     """スプレッドシート1セル向けに欠損を正規化する。数値の NaN は 0、それ以外の欠損は空文字。"""
     try:
@@ -2080,10 +2108,21 @@ def _cell_value_for_sheet(v: Any) -> Any:
     return v
 
 
-def overwrite_inventory_worksheet_from_dataframe(df: pd.DataFrame) -> None:
-    """編集後の DataFrame で inventory.csv またはワークシートを全置換する。"""
+def overwrite_inventory_worksheet_from_dataframe(
+    df: pd.DataFrame, *, previous_df: pd.DataFrame | None = None
+) -> None:
+    """編集後の DataFrame で inventory.csv またはワークシートを全置換する。
+
+    ``previous_df`` を渡したとき、同一行位置で内容が変わった行の **日時** を保存実行の JST に更新する。
+    """
+    work = df
+    if previous_df is not None and COL_DATETIME in df.columns:
+        work = _stamp_row_datetime_on_changes(
+            previous_df.reset_index(drop=True),
+            df.reset_index(drop=True),
+        )
     out = _recalc_gross_profit_dataframe(
-        df.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
+        work.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
     )
     if _uses_local_inventory_csv():
         _inventory_csv_write_df(out)
@@ -2139,6 +2178,12 @@ def lookup_ledger_row_by_management_id(
     return df.loc[m].iloc[0]
 
 
+def _split_management_ids_from_field(raw: str) -> list[str]:
+    """販売元管理ID欄をカンマ・読点・区切り文字・空白・改行で分割し、空を除いたリストを返す。"""
+    parts = re.split(r"[,、;；\s\n]+", (raw or "").strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
 def apply_outbound_sale_to_ledger_by_management_id(
     source_management_id: str,
     *,
@@ -2149,7 +2194,7 @@ def apply_outbound_sale_to_ledger_by_management_id(
     sale_voucher_recorded_at: str = "",
     sale_voucher_evidence_url: str = "",
 ) -> None:
-    """出庫（販売）: 管理IDの在庫中の1行を更新し、新規行は追加しない。仕入の「日時」「入出庫種別」は保持し、販売は販売日時・出庫種別に記録する。"""
+    """出庫（販売）: 管理IDの在庫中の1行を更新し、新規行は追加しない。A列「日時」は確定実行の JST に更新する。"""
     sid = (source_management_id or "").strip()
     if not sid:
         raise ValueError("販売元管理ID（管理ID）が空です。")
@@ -2175,22 +2220,20 @@ def apply_outbound_sale_to_ledger_by_management_id(
         raise RuntimeError("実売金額（税抜）は1円以上にしてください。")
 
     now_exec = jst_now_str()
+    _prev_row_dt = str(df_src.loc[msk, COL_DATETIME].iloc[0] or "")
     if COL_PURCHASE_DATETIME in df_src.columns:
         cp = str(df_src.loc[msk, COL_PURCHASE_DATETIME].iloc[0] or "").strip()
         if not cp:
-            df_src.loc[msk, COL_PURCHASE_DATETIME] = str(
-                df_src.loc[msk, COL_DATETIME].iloc[0] or ""
-            )
+            df_src.loc[msk, COL_PURCHASE_DATETIME] = _prev_row_dt
     if COL_PURCHASE_MOVEMENT in df_src.columns:
         cm = str(df_src.loc[msk, COL_PURCHASE_MOVEMENT].iloc[0] or "").strip()
         if not cm:
-            df_src.loc[msk, COL_PURCHASE_MOVEMENT] = str(
-                df_src.loc[msk, COL_TYPE].iloc[0] or ""
-            )
+            df_src.loc[msk, COL_PURCHASE_MOVEMENT] = "入庫（購入）"
     if COL_SALE_DATETIME in df_src.columns:
         df_src.loc[msk, COL_SALE_DATETIME] = now_exec
     if COL_SALE_OUTBOUND_TYPE in df_src.columns:
         df_src.loc[msk, COL_SALE_OUTBOUND_TYPE] = "出庫（販売）"
+    df_src.loc[msk, COL_DATETIME] = now_exec
     df_src.loc[msk, COL_STOCK_STATUS] = STATUS_SOLD
     df_src.loc[msk, COL_ACTUAL_SALE] = av
     df_src.loc[msk, COL_SALE_SOURCE_MGMT_ID] = ""
@@ -2301,7 +2344,7 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
 
     1点1行ライフサイクル前提: **在庫中** かつ **入庫** だけを仕入（入庫）側に計上し、
     **販売済** かつ実売がある行は **実売行計（税抜・税込）** を売上（出庫）側に計上する
-    （「日時」は仕入のままでも、販売済＋実売で売上を計上。仕入金額を二重に出庫しない）。
+    （「入庫種別」が空の在庫中は入庫扱い。販売済＋実売で売上を計上し、仕入金額を二重に出庫しない）。
     **在庫中** のまま **出庫**（浮貸など別レコード）の行は、従来どおり仕入列ベースで出庫に含める。
     """
     d = df.copy()
@@ -2311,13 +2354,19 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     qty = _series_to_numeric_loose(d[COL_QTY]).fillna(0)
     line_stored_ex = _series_to_numeric_loose(d[COL_PRICE_EXCL]).fillna(0)
     line_stored_in = _series_to_numeric_loose(d[COL_PRICE_INCL]).fillna(0)
-    movement = d[COL_TYPE].astype(str).str.strip()
-    is_in_mv = movement.str.startswith("入庫")
-    is_out_mv = movement.str.startswith("出庫")
     if COL_STOCK_STATUS in d.columns:
         st_col = d[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
     else:
         st_col = pd.Series(STATUS_IN_STOCK, index=d.index)
+    pur_mv = (
+        d[COL_PURCHASE_MOVEMENT].astype(str).str.strip()
+        if COL_PURCHASE_MOVEMENT in d.columns
+        else pd.Series("", index=d.index, dtype=str)
+    )
+    is_in_mv = pur_mv.str.startswith("入庫") | (
+        (pur_mv == "") & (st_col == STATUS_IN_STOCK)
+    )
+    is_out_pur = pur_mv.str.startswith("出庫")
     # 税抜・税込はいずれも行合計として解釈（仕入単価列は廃止）
     line_ex = line_stored_ex.astype(float)
     mask_ex_from_incl = (
@@ -2347,7 +2396,7 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     m_stock_in = is_in_mv & (st_col == STATUS_IN_STOCK)
     # 販売済は実売ベースで売上計上（区分がまだ入庫の旧行も、実売があればここに含める）
     m_sold_rev = (st_col == STATUS_SOLD) & (rev_ex > 0)
-    m_float_out = is_out_mv & (st_col == STATUS_IN_STOCK)
+    m_float_out = is_out_pur & (st_col == STATUS_IN_STOCK)
 
     d["_qty_in"] = qty.where(m_stock_in, 0.0).fillna(0).astype(float)
     d["_amt_ex_in"] = line_ex.where(m_stock_in, 0.0).fillna(0).astype(float)
@@ -3054,6 +3103,7 @@ def render_inventory_list_page() -> None:
     st.caption(
         "共有の **inventory.csv** または **スプレッドシート**の全データを編集できます。行の追加・削除は表から操作し、"
         "「台帳を更新する」で保存します。"
+        "「日時」は **保存時にセル内容が変わった行**（および表で追加した新規行）で **JST の現在時刻** に自動更新されます。"
         "「証憑記録日時」は証憑取込の確定時刻、「証憑URL」は Drive 上の証憑です（"
         "台帳内の値がすべて空または http(s) のときはリンク列として表示されクリックで開けます。"
         "http 以外の文字が混ざる行がある場合はテキスト列のままです）。"
@@ -3228,7 +3278,10 @@ def render_inventory_list_page() -> None:
         ed_bulk.loc[m_b, COL_LAST_STOCKTAKE] = _today_jst_date().isoformat()
         with st.spinner("台帳を保存しています…"):
             try:
-                overwrite_inventory_worksheet_from_dataframe(ed_bulk)
+                overwrite_inventory_worksheet_from_dataframe(
+                    ed_bulk.reset_index(drop=True),
+                    previous_df=edited.reset_index(drop=True),
+                )
             except Exception as e:
                 st.error(str(e))
             else:
@@ -3243,7 +3296,10 @@ def render_inventory_list_page() -> None:
     if st.button("台帳を更新する", type="primary", key="ledger_save_overwrite"):
         with st.spinner("台帳を保存しています…"):
             try:
-                overwrite_inventory_worksheet_from_dataframe(edited)
+                overwrite_inventory_worksheet_from_dataframe(
+                    edited.reset_index(drop=True),
+                    previous_df=df_sorted.reset_index(drop=True),
+                )
             except Exception as e:
                 st.error(str(e))
                 return
@@ -3349,8 +3405,6 @@ def main():
     )
     if movement == "出庫（販売）":
         st.session_state.field_stock_status = STATUS_SOLD
-    if _movement_is_outbound(movement):
-        st.session_state.field_qty = 1
 
     col_a, col_b, col_c = st.columns([1, 1, 1])
     with col_a:
@@ -3499,7 +3553,7 @@ def main():
     st.markdown("##### 必須入力項目")
     if movement == "出庫（販売）":
         st.caption(
-            "出庫（販売）では **販売元管理ID** と **実売金額（税抜）** が確定に必須です。"
+            "出庫（販売）では **販売元管理ID**（数量と同じ件数・区切り可）と **実売金額（税抜・1点あたり）** が確定に必須です。"
             "下の商品名・仕入先・仕入金額はプレビュー用で、台帳の在庫行の内容は上書きしません。"
         )
     product_name = st.text_input("商品名（必須）", key="field_product_name")
@@ -3534,28 +3588,25 @@ def main():
                 hide_index=True,
             )
 
-    _outbound_mv = _movement_is_outbound(movement)
-    if _outbound_mv:
+    quantity = st.number_input(
+        "数量（点数）",
+        min_value=1,
+        step=1,
+        key="field_qty",
+        help=(
+            "台帳は **1点1行** で保存します。行数は常にこの数量と同じです。"
+            "出庫（販売）で数量が2以上のときは、**販売元管理ID** を同じ件数で入力してください（カンマ・読点・空白・改行で区切り可）。"
+            "入庫・出庫（浮貸）では写真は1枚まで・複数点のときは **同じ画像URL** を各行に入れます。"
+        ),
+    )
+    if movement == "出庫（販売）":
         st.caption(
-            "区分が **出庫** のときは、数量は **1** に固定され、この欄は **変更できません**（台帳は1点1行）。"
+            "数量が **2以上** のときは **販売元管理ID** を **数量と同じ件数** で入力してください（例: `G00000001, G00000002`）。"
+            "各管理IDの在庫行が1件ずつ販売済に更新されます（実売・画像URL・メモは各行に同じ内容で反映します）。"
         )
-        st.number_input(
-            "数量（点数）",
-            min_value=1,
-            max_value=1,
-            step=1,
-            key="field_qty",
-            disabled=True,
-            help="出庫のため 1 のみです。区分を入庫に切り替えると数量を変更できます。",
-        )
-        quantity = 1
-    else:
-        quantity = st.number_input(
-            "数量（点数）",
-            min_value=1,
-            step=1,
-            key="field_qty",
-            help="台帳は **1点1行** で保存します。行数は常にこの数量と同じです（写真は1枚まで・複数点のときは同じ画像URLを各行に入れます）。",
+    elif _movement_is_outbound(movement):
+        st.caption(
+            "出庫（浮貸）では仕入と同様、数量分の **新規行** を台帳に追記します。"
         )
 
     line_excl_yen = st.number_input(
@@ -3577,7 +3628,7 @@ def main():
         str(st.session_state.get("field_consumption_tax_choice", "10%"))
     )
 
-    _q = 1 if _outbound_mv else int(quantity)
+    _q = int(quantity)
     _lex_inp = int(line_excl_yen)
     _n_save = _q
     _line_ex_one = _lex_inp
@@ -3589,7 +3640,7 @@ def main():
         _cap_rows = (
             f"確定時は **{_n_save} 行**（各行 数量1）。税抜合計（参考） ¥{_line_ex_one * _n_save:,}。"
         )
-        if not _outbound_mv and _n_save > 1:
+        if _n_save > 1:
             _cap_rows += (
                 "写真があるとき、数量が2以上なら **同じ画像URLを全行** に記録します。"
             )
@@ -3623,7 +3674,7 @@ def main():
     st.caption(
         "実売・ステータス・**販売元管理ID**（売れた在庫の **管理ID** と同一。在庫中の行を特定します）をまとめて扱います。"
         "販売元の写真照合は、上の **クイック検索（写真から検索）** の **販売元を写真で照合** ボタンを使います（同じ1枚の写真）。"
-        "区分が **出庫（販売）** で確定すると、**新規行は追加せず** 該当管理IDの行を **販売済** に更新し、**販売日時・出庫種別** に確定実行の情報を記録します（仕入の「日時」「入出庫種別」は変えません）。"
+        "区分が **出庫（販売）** で確定すると、**新規行は追加せず** 該当管理IDの行を **販売済** に更新し、**日時・販売日時・出庫種別** に確定実行の情報を記録します（仕入の暦は **仕入日時**・**入庫種別** を維持・補完）。"
     )
     _swarn = st.session_state.pop("_sale_link_warn", None)
     if _swarn:
@@ -3647,7 +3698,7 @@ def main():
     st.text_input(
         "販売元管理ID（手入力・例 G00000001）",
         key="field_sale_source_mgmt_id",
-        placeholder="売れた在庫行の管理ID",
+        placeholder="売れた在庫行の管理ID（数量2以上はカンマ等で複数）",
     )
 
     st.caption(
@@ -3677,44 +3728,99 @@ def main():
     _pl_u_gp = _pl_u
     _tax_preview = _tax_r
     _st_gp = STATUS_SOLD if movement == "出庫（販売）" else _st
+    _pv_ok_rows: list[pd.Series] = []
+    _ids_pv: list[str] = []
     if movement == "出庫（販売）":
-        _mid_pv = str(st.session_state.get("field_sale_source_mgmt_id", "") or "").strip()
-        if _mid_pv and df_ledger_hint is not None:
-            _tr_pv = lookup_ledger_row_by_management_id(df_ledger_hint, _mid_pv)
-            if _tr_pv is None:
-                st.warning(f"管理ID **{_mid_pv}** が台帳に見つかりません。")
-            else:
+        _ids_pv = _split_management_ids_from_field(
+            str(st.session_state.get("field_sale_source_mgmt_id", "") or "")
+        )
+        if _ids_pv and len(_ids_pv) != _q:
+            st.warning(
+                f"販売元管理IDが **{len(_ids_pv)}** 件ですが、数量は **{_q}** です。同じ件数にしてください。"
+            )
+        if _ids_pv and len(set(_ids_pv)) != len(_ids_pv):
+            st.warning("販売元管理IDに **重複** があります。")
+        if _ids_pv and df_ledger_hint is not None:
+            _pv_msgs: list[str] = []
+            for _mid_one in _ids_pv:
+                _tr_pv = lookup_ledger_row_by_management_id(df_ledger_hint, _mid_one)
+                if _tr_pv is None:
+                    st.warning(f"管理ID **{_mid_one}** が台帳に見つかりません。")
+                    continue
                 _row_st = _normalize_stock_status(str(_tr_pv.get(COL_STOCK_STATUS, "")))
                 if _row_st != STATUS_IN_STOCK:
                     st.warning(
-                        f"管理ID **{_mid_pv}** は在庫中ではありません（現在: {_row_st}）。"
+                        f"管理ID **{_mid_one}** は在庫中ではありません（現在: {_row_st}）。"
                     )
-                else:
-                    _cogs_preview = _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0)
-                    _pl_u_gp = _finite_int(_tr_pv.get(COL_PLANNED_SALE), 0)
-                    _tax_preview = _infer_tax_rate_from_main_line(
-                        _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0),
-                        _finite_int(_tr_pv.get(COL_PRICE_INCL), 0),
-                    )
-                    _pnv = str(_tr_pv.get(COL_NAME, "") or "").strip()
-                    _suv = str(_tr_pv.get(COL_SUPPLIER, "") or "").strip()
-                    st.info(
-                        f"紐付け元（在庫中）: **{_pnv or '—'}** ／ {_suv or '—'} ／ 原価税抜 **¥{_cogs_preview:,}**"
-                    )
-        elif _mid_pv:
+                    continue
+                _pv_ok_rows.append(_tr_pv)
+                _cg1 = _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0)
+                _pnv = str(_tr_pv.get(COL_NAME, "") or "").strip()
+                _suv = str(_tr_pv.get(COL_SUPPLIER, "") or "").strip()
+                _pv_msgs.append(
+                    f"**{_mid_one}** … {_pnv or '—'} ／ {_suv or '—'} ／ 原価税抜 ¥{_cg1:,}"
+                )
+            if _pv_msgs:
+                st.info("紐付け元（在庫中）:\n" + "\n".join(_pv_msgs))
+        elif _ids_pv:
             st.warning("台帳を読み込めないため、紐付け元の原価を表示できません。")
-    _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
-        1, _pl_u_gp, _act_u, _st_gp, _tax_preview
+
+    _sale_pv_agg = (
+        movement == "出庫（販売）"
+        and _ids_pv
+        and len(_ids_pv) == _q
+        and len(set(_ids_pv)) == len(_ids_pv)
+        and len(_pv_ok_rows) == len(_ids_pv)
+        and len(_pv_ok_rows) > 0
     )
-    _gp_preview = _compute_gross_profit_row(
-        _cogs_preview,
-        _plex,
-        _aex if _st_gp == STATUS_SOLD else 0,
-        _st_gp,
-    )
+    if _sale_pv_agg:
+        _cogs_preview = sum(_finite_int(x.get(COL_PRICE_EXCL), 0) for x in _pv_ok_rows)
+        _tr0 = _pv_ok_rows[0]
+        _tax_preview = _infer_tax_rate_from_main_line(
+            _finite_int(_tr0.get(COL_PRICE_EXCL), 0),
+            _finite_int(_tr0.get(COL_PRICE_INCL), 0),
+        )
+        _pl_u_gp = _finite_int(_tr0.get(COL_PLANNED_SALE), 0)
+        _plex = sum(_finite_int(x.get(COL_PLANNED_SALE), 0) for x in _pv_ok_rows)
+        _pin = price_incl_tax(_plex, _tax_preview) if _plex > 0 else 0
+        _aex = _act_u * _q if _st_gp == STATUS_SOLD else 0
+        _ain = price_incl_tax(_aex, _tax_preview) if _aex > 0 else 0
+        _gp_acc = 0
+        _gp_any = False
+        for _xr in _pv_ok_rows:
+            _cgx = _finite_int(_xr.get(COL_PRICE_EXCL), 0)
+            _plx = _finite_int(_xr.get(COL_PLANNED_SALE), 0)
+            _gpx = _compute_gross_profit_row(_cgx, _plx, _act_u, STATUS_SOLD)
+            if _gpx is not None:
+                _gp_acc += int(_gpx)
+                _gp_any = True
+        _gp_preview = _gp_acc if _gp_any else None
+    else:
+        if movement == "出庫（販売）" and len(_pv_ok_rows) == 1:
+            _tr_pv = _pv_ok_rows[0]
+            _cogs_preview = _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0)
+            _pl_u_gp = _finite_int(_tr_pv.get(COL_PLANNED_SALE), 0)
+            _tax_preview = _infer_tax_rate_from_main_line(
+                _finite_int(_tr_pv.get(COL_PRICE_EXCL), 0),
+                _finite_int(_tr_pv.get(COL_PRICE_INCL), 0),
+            )
+        _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
+            1, _pl_u_gp, _act_u, _st_gp, _tax_preview
+        )
+        _gp_preview = _compute_gross_profit_row(
+            _cogs_preview,
+            _plex,
+            _aex if _st_gp == STATUS_SOLD else 0,
+            _st_gp,
+        )
     pm1, pm2, pm3, pm4, pm5 = st.columns(5)
     with pm1:
-        st.metric("原価（税抜・1点）", f"¥{_cogs_preview:,}")
+        _cogs_lbl = (
+            "原価（税抜・合計）"
+            if movement == "出庫（販売）" and _sale_pv_agg and _q > 1
+            else "原価（税抜・1点）"
+        )
+        st.metric(_cogs_lbl, f"¥{_cogs_preview:,}")
     with pm2:
         st.metric(
             "販売予定（税抜・行計）",
@@ -3762,7 +3868,10 @@ def main():
         ).strip()
         _act_ex2 = int(st.session_state.get("field_actual_sale_excl", 0))
 
+        _ids_sale_val: list[str] = []
         if movement == "出庫（販売）":
+            _q_sv = int(quantity)
+            _ids_sale_val = _split_management_ids_from_field(_sale_src_save)
             if not _sale_src_save:
                 st.error(
                     "出庫（販売）では **販売元管理ID**（在庫中の行の **管理ID**）の入力が必須です。"
@@ -3774,21 +3883,33 @@ def main():
             elif df_ledger_hint is None:
                 st.error("台帳を読み込めないため、販売反映できません。")
                 validation_ok = False
-            elif validation_ok:
-                trv = lookup_ledger_row_by_management_id(
-                    df_ledger_hint, _sale_src_save
+            elif len(_ids_sale_val) != _q_sv:
+                st.error(
+                    "出庫（販売）では **販売元管理ID** を **数量と同じ件数** で入力してください（カンマ・読点・空白・改行で区切れます）。"
+                    f"（数量 **{_q_sv}** に対し、有効な区切りで **{len(_ids_sale_val)}** 件と読み取りました。）"
                 )
-                if trv is None:
-                    st.error(f"管理ID {_sale_src_save} が台帳に見つかりません。")
-                    validation_ok = False
-                elif (
-                    _normalize_stock_status(str(trv.get(COL_STOCK_STATUS, "")))
-                    != STATUS_IN_STOCK
-                ):
-                    st.error(
-                        "対象行が在庫中ではありません。既に販売済の可能性があります。"
+                validation_ok = False
+            elif len(set(_ids_sale_val)) != len(_ids_sale_val):
+                st.error("販売元管理IDに **重複** があります。1点につき別の管理IDを指定してください。")
+                validation_ok = False
+            elif validation_ok:
+                for _sid_v in _ids_sale_val:
+                    trv = lookup_ledger_row_by_management_id(
+                        df_ledger_hint, _sid_v
                     )
-                    validation_ok = False
+                    if trv is None:
+                        st.error(f"管理ID {_sid_v} が台帳に見つかりません。")
+                        validation_ok = False
+                        break
+                    if (
+                        _normalize_stock_status(str(trv.get(COL_STOCK_STATUS, "")))
+                        != STATUS_IN_STOCK
+                    ):
+                        st.error(
+                            f"管理ID **{_sid_v}** は在庫中ではありません。既に販売済の可能性があります。"
+                        )
+                        validation_ok = False
+                        break
         else:
             if not (product_name or "").strip():
                 st.error("商品名を入力してください。")
@@ -3814,7 +3935,7 @@ def main():
                 _stat2 = STATUS_IN_STOCK
             memo_s = (memo or "").strip()
 
-            _q2 = 1 if _movement_is_outbound(movement) else int(quantity)
+            _q2 = int(quantity)
             n_save = _q2
             urls: list[str] = [""] * n_save
             _record_dt = jst_now_str()
@@ -3865,15 +3986,21 @@ def main():
                         )
                     else:
                         try:
-                            with st.spinner(
+                            _n_ids = len(_ids_sale_val)
+                            _spin_sale = (
                                 "該当の在庫行を販売済に更新しています（新規行は追加しません）…"
-                            ):
-                                apply_outbound_sale_to_ledger_by_management_id(
-                                    _sale_src_save,
-                                    actual_sale_unit_excl_yen=_act_ex2,
-                                    new_image_url=(urls[0] if urls else "") or "",
-                                    memo_suffix=memo_s,
-                                )
+                                if _n_ids <= 1
+                                else f"在庫行 **{_n_ids} 件** を順に販売済に更新しています…"
+                            )
+                            with st.spinner(_spin_sale):
+                                for _sid_save in _ids_sale_val:
+                                    apply_outbound_sale_to_ledger_by_management_id(
+                                        _sid_save,
+                                        actual_sale_unit_excl_yen=_act_ex2,
+                                        new_image_url=(urls[0] if urls else "")
+                                        or "",
+                                        memo_suffix=memo_s,
+                                    )
                         except Exception as e:
                             st.error(f"台帳の更新に失敗しました: {e}")
                             if any(urls):
@@ -3882,9 +4009,19 @@ def main():
                                 )
                         else:
                             st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
-                            st.success(
-                                f"管理ID **{_sale_src_save}** の行を販売済に更新しました（実売 ¥{_act_ex2:,}・販売日時は確定実行の JST 時刻を記録）。"
-                            )
+                            if len(_ids_sale_val) <= 1:
+                                _sid_one = (
+                                    _ids_sale_val[0] if _ids_sale_val else _sale_src_save
+                                )
+                                st.success(
+                                    f"管理ID **{_sid_one}** の行を販売済に更新しました（実売 ¥{_act_ex2:,}・販売日時は確定実行の JST 時刻を記録）。"
+                                )
+                            else:
+                                _ids_join = "、".join(_ids_sale_val)
+                                st.success(
+                                    f"**{len(_ids_sale_val)} 件** の在庫行を販売済に更新しました（管理ID: {_ids_join}）。"
+                                    f"実売（税抜・1点あたり）は各行 ¥{_act_ex2:,}、販売日時は確定実行の JST 時刻を記録しています。"
+                                )
                             _link_urls = list(dict.fromkeys(u for u in urls if u))
                             for _uurl in _link_urls[:8]:
                                 st.markdown(f"[保存した画像を開く]({_uurl})")
