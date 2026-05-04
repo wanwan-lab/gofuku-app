@@ -36,12 +36,12 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
   日時 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
-  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID | 浮貸日時 | 証憑記録日時 | 証憑URL
-  | 仕入日時 | 入庫種別 | 販売日時 | 出庫種別
+  | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 販売元管理ID | 証憑記録日時 | 証憑URL
+  | 仕入日時 | 入庫種別 | 浮貸日時 | 販売日時 | 出庫種別
   ※在庫は **1点につき1行** で統一します。登録時の行数は **数量** と同じで、各行の数量は **1** です。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、数量が **2以上** のときは **全行に同じ画像URL** を入れます（数量が1のときはその1行のみ）。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
-  ※「**日時**」列（A列）は **その行が最後に台帳へ保存された時点の JST 時刻**（登録・販売反映・一覧からの保存など）です。**仕入日時** は仕入の暦（EXIF 等を ``record_datetime`` に渡した値）、**入庫種別** は登録画面の区分（入庫（購入）等）です。**販売日時**・**出庫種別** は販売確定時に記録します。
+  ※「**日時**」列（A列）は **その行が最後に台帳へ保存された時点の JST 時刻**（登録・販売反映・一覧からの保存など）です。**仕入日時** は仕入の暦（EXIF 等を ``record_datetime`` に渡した値）、**入庫種別** は登録画面の区分（入庫（購入）・入庫（返品）・入庫（浮貸）等）です。**販売日時**・**出庫種別** は販売確定時に記録します。
   ※旧シートの「入出庫種別」列は読み込み時に **入庫種別** へ移して無視します（ヘッダーは新列順に更新されます）。
   ※「仕入金額（税抜）」「仕入金額（税込）」は **1点あたりの行合計**（台帳の各行は数量1）です。
   ※旧シートに「仕入単価（税抜）」列が残っている場合は、読み込み時にその列を除いて新しい列構成に揃えます。
@@ -151,11 +151,11 @@ EXPECTED_HEADERS: list[str] = [
     COL_MANAGEMENT_ID,
     COL_LAST_STOCKTAKE,
     COL_SALE_SOURCE_MGMT_ID,
-    COL_LOAN_DATETIME,
     COL_VOUCHER_RECORDED_AT,
     COL_VOUCHER_EVIDENCE_URL,
     COL_PURCHASE_DATETIME,
     COL_PURCHASE_MOVEMENT,
+    COL_LOAN_DATETIME,
     COL_SALE_DATETIME,
     COL_SALE_OUTBOUND_TYPE,
 ]
@@ -1740,7 +1740,9 @@ def _coerce_money_columns_for_recalc(df: pd.DataFrame) -> pd.DataFrame:
             .replace([np.inf, -np.inf], np.nan)
             .fillna(0)
         )
-        out[c] = s.map(lambda x: _finite_int(x, 0))
+        x = pd.to_numeric(s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        x = np.where(np.isfinite(x), np.rint(x), 0.0)
+        out[c] = x.astype(np.int64)
     return out
 
 
@@ -1856,6 +1858,36 @@ def _fuzzy_ledger_match_rows(
     return sub.loc[picked]
 
 
+def _infer_tax_rate_from_lines_vectorized(
+    excl: np.ndarray, incl: np.ndarray
+) -> np.ndarray:
+    """各行の仕入税抜・税込から税率を推定（:func:`_infer_tax_rate_from_main_line` と同じ優先）。"""
+    excl = np.asarray(excl, dtype=np.int64)
+    incl = np.asarray(incl, dtype=np.int64)
+    default_r = float(CONSUMPTION_TAX_RATE)
+    out = np.full(excl.shape[0], default_r, dtype=np.float64)
+    excl_le0 = excl <= 0
+    out[excl_le0] = default_r
+    incl_le = (~excl_le0) & (incl <= excl)
+    out[incl_le] = 0.0
+    cand = (~excl_le0) & (~incl_le)
+    if not np.any(cand):
+        return out
+    ec = excl[cand].astype(np.float64)
+    ic = incl[cand]
+    idx = np.flatnonzero(cand)
+    rates_found = np.full(len(idx), default_r, dtype=np.float64)
+    matched = np.zeros(len(idx), dtype=bool)
+    for _label, rate in CONSUMPTION_TAX_CHOICE_TO_RATE.items():
+        rr = float(rate)
+        pred = np.rint(ec * (1.0 + rr)).astype(np.int64)
+        m_new = (~matched) & (pred == ic)
+        rates_found[m_new] = rr
+        matched |= m_new
+    out[idx] = rates_found
+    return out
+
+
 def _compute_gross_profit_row(
     cogs_line_excl: int,
     planned_line_excl: int,
@@ -1879,7 +1911,10 @@ def _compute_gross_profit_row(
 
 
 def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """販売予定/実売の税込総額列と粗利を再計算する（数値列は int で統一）。"""
+    """販売予定/実売の税込総額列と粗利を再計算する（数値列は int で統一）。
+
+    行ループではなく NumPy ベクトル演算で処理し、大行数でも応答を速くする。
+    """
     need = (
         COL_GROSS_PROFIT,
         COL_STOCK_STATUS,
@@ -1894,24 +1929,55 @@ def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if not all(c in df.columns for c in need):
         return df.copy()
     out = _coerce_money_columns_for_recalc(df)
-    for i in out.index:
-        cogs = _finite_int(out.at[i, COL_PRICE_EXCL], 0)
-        line_in = _finite_int(out.at[i, COL_PRICE_INCL], 0)
-        qty = max(1, _finite_int(out.at[i, COL_QTY], 1))
-        pl_u = _finite_int(out.at[i, COL_PLANNED_SALE], 0)
-        ac_u = _finite_int(out.at[i, COL_ACTUAL_SALE], 0)
-        stt = _normalize_stock_status(str(out.at[i, COL_STOCK_STATUS]))
-        out.at[i, COL_STOCK_STATUS] = stt
-        tax_r = _infer_tax_rate_from_main_line(cogs, line_in)
-        plex, pincl, aex, aincl = _planned_actual_line_amounts(
-            qty, pl_u, ac_u, stt, tax_r
+    n = len(out.index)
+    if n == 0:
+        return out
+
+    def _i64_col(c: str) -> np.ndarray:
+        x = pd.to_numeric(out[c], errors="coerce").fillna(0).to_numpy(
+            dtype=np.float64, copy=False
         )
-        pincl_i = _finite_int(pincl, 0)
-        aincl_i = _finite_int(aincl, 0)
-        out.at[i, COL_PLANNED_SALE_INCL] = pincl_i if pincl_i > 0 else 0
-        out.at[i, COL_ACTUAL_SALE_INCL] = aincl_i if aincl_i > 0 else 0
-        gp = _compute_gross_profit_row(cogs, plex, aex, stt)
-        out.at[i, COL_GROSS_PROFIT] = 0 if gp is None else _finite_int(gp, 0)
+        return np.where(np.isfinite(x), np.rint(x), 0.0).astype(np.int64, copy=False)
+
+    cogs = _i64_col(COL_PRICE_EXCL)
+    line_in = _i64_col(COL_PRICE_INCL)
+    qty = np.maximum(_i64_col(COL_QTY), 1)
+    pu = _i64_col(COL_PLANNED_SALE)
+    au = _i64_col(COL_ACTUAL_SALE)
+
+    st_raw = out[COL_STOCK_STATUS].astype(str).str.strip().to_numpy()
+    st = np.where(np.isin(st_raw, list(STOCK_STATUS_OPTIONS)), st_raw, STATUS_IN_STOCK)
+    out[COL_STOCK_STATUS] = st
+
+    tax_r = _infer_tax_rate_from_lines_vectorized(cogs, line_in)
+
+    plex = np.where(pu > 0, pu * qty, 0).astype(np.int64, copy=False)
+    fplex = plex.astype(np.float64, copy=False)
+    pincl = np.zeros(n, dtype=np.int64)
+    m_plex = plex > 0
+    pincl[m_plex] = np.rint(
+        fplex[m_plex] * (1.0 + tax_r[m_plex].astype(np.float64))
+    ).astype(np.int64)
+
+    is_sold = st == STATUS_SOLD
+    aex = np.where(is_sold & (au > 0), au * qty, 0).astype(np.int64, copy=False)
+    faex = aex.astype(np.float64, copy=False)
+    aincl = np.zeros(n, dtype=np.int64)
+    m_aex = aex > 0
+    aincl[m_aex] = np.rint(
+        faex[m_aex] * (1.0 + tax_r[m_aex].astype(np.float64))
+    ).astype(np.int64)
+
+    gp = np.zeros(n, dtype=np.int64)
+    m_sold = is_sold & (aex > 0)
+    gp[m_sold] = aex[m_sold] - cogs[m_sold]
+    is_in = st == STATUS_IN_STOCK
+    m_in = is_in & (plex > 0)
+    gp[m_in] = plex[m_in] - cogs[m_in]
+
+    out[COL_PLANNED_SALE_INCL] = pincl
+    out[COL_ACTUAL_SALE_INCL] = aincl
+    out[COL_GROSS_PROFIT] = gp
     return out
 
 
@@ -2024,11 +2090,11 @@ def _inventory_row_values_for_append(
         management_id,
         "",
         (sale_source_management_id or "").strip(),
-        (loan_datetime or "").strip(),
         (voucher_recorded_at or "").strip(),
         (voucher_evidence_url or "").strip(),
         dt_purchase,
         pm,
+        (loan_datetime or "").strip(),
         (dt_a if stt == STATUS_SOLD else ""),
         (
             pm
@@ -2544,18 +2610,31 @@ def _apply_ledger_sort(
     primary_asc: bool,
     secondary: str,
     secondary_asc: bool,
+    tertiary: str,
+    tertiary_asc: bool,
 ) -> pd.DataFrame:
-    """日時・仕入先・取引先による表示用ソート（コピーを返す）。"""
+    """在庫一覧の表示用ソート（最大3キー、コピーを返す）。"""
     if df.empty:
         return df
-    col_map = {"日時": COL_DATETIME, "仕入先・取引先": COL_SUPPLIER}
+    col_map = {
+        "日時": COL_DATETIME,
+        "仕入先・取引先": COL_SUPPLIER,
+        "管理ID": COL_MANAGEMENT_ID,
+        "仕入日時": COL_PURCHASE_DATETIME,
+        "販売日時": COL_SALE_DATETIME,
+    }
     pairs: list[tuple[str, bool]] = []
-    if primary != "なし" and primary in col_map:
-        pairs.append((col_map[primary], primary_asc))
-    if secondary != "なし" and secondary in col_map:
-        c2 = col_map[secondary]
-        if not pairs or pairs[0][0] != c2:
-            pairs.append((c2, secondary_asc))
+    for label, asc in (
+        (primary, primary_asc),
+        (secondary, secondary_asc),
+        (tertiary, tertiary_asc),
+    ):
+        if label == "なし" or label not in col_map:
+            continue
+        col = col_map[label]
+        if any(p[0] == col for p in pairs):
+            continue
+        pairs.append((col, asc))
     if not pairs:
         return df.copy()
 
@@ -2565,8 +2644,10 @@ def _apply_ledger_sort(
     for col, asc in pairs:
         if col not in out.columns:
             continue
-        if col == COL_DATETIME:
+        if col in (COL_DATETIME, COL_PURCHASE_DATETIME, COL_SALE_DATETIME):
             tmp = "_sort_dt_internal"
+            if col != COL_DATETIME:
+                tmp = f"_sort_dt_internal_{col}"
             out[tmp] = pd.to_datetime(out[col], errors="coerce")
             sort_cols.append(tmp)
         else:
@@ -2580,15 +2661,13 @@ def _apply_ledger_sort(
 
 def _evidence_url_column_all_http_or_blank(s: pd.Series) -> bool:
     """証憑URL列を LinkColumn にできるか（空・欠損・http(s) のみ）。"""
-    for v in s:
-        if v is None or pd.isna(v):
-            continue
-        t = str(v).strip()
-        if not t or t.lower() in ("nan", "none", "<na>", "nat"):
-            continue
-        if not (t.startswith("http://") or t.startswith("https://")):
-            return False
-    return True
+    t = s.fillna("").astype(str).str.strip().str.lower()
+    t = t.replace({"nan": "", "none": "", "<na>": "", "nat": ""}, regex=False)
+    nonempty = t[t != ""]
+    if nonempty.empty:
+        return True
+    ok = nonempty.str.startswith("http://") | nonempty.str.startswith("https://")
+    return bool(ok.all())
 
 
 def _normalize_evidence_urls_for_link_editor(df: pd.DataFrame, col: str) -> bool:
@@ -2597,17 +2676,15 @@ def _normalize_evidence_urls_for_link_editor(df: pd.DataFrame, col: str) -> bool
         return False
     if not _evidence_url_column_all_http_or_blank(df[col]):
         return False
-    norm: list[str | None] = []
-    for v in df[col]:
-        if v is None or pd.isna(v):
-            norm.append(None)
-            continue
-        t = str(v).strip()
-        if not t or t.lower() in ("nan", "none", "<na>", "nat"):
-            norm.append(None)
-        else:
-            norm.append(t)
-    df[col] = norm
+    v = df[col]
+    strv = v.fillna("").astype(str).str.strip()
+    low = strv.str.lower()
+    isblank = v.isna() | low.isin(("", "nan", "none", "<na>", "nat"))
+    nb = isblank.fillna(False).to_numpy(dtype=bool, copy=False)
+    arr = np.empty(len(strv), dtype=object)
+    arr[nb] = None
+    arr[~nb] = strv[~isblank].to_numpy(dtype=object, copy=False)
+    df[col] = arr
     return True
 
 
@@ -2882,7 +2959,6 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
             ]
             if COL_GROSS_PROFIT in flt.columns:
                 cols.append("粗利合計")
-            cols.extend(["差し引き数量", "差し引き税抜"])
             return pd.DataFrame(columns=cols)
         g = part.assign(**{sup_col: part[COL_SUPPLIER].fillna("(未設定)").astype(str)})
         _agg_sup: dict[str, tuple[str, str]] = {
@@ -2901,8 +2977,6 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
                     .replace([np.inf, -np.inf], np.nan)
                     .fillna(0.0)
                 )
-        out["差し引き数量"] = (out["入庫数量"] - out["出庫数量"]).astype(int)
-        out["差し引き税抜"] = (out["入庫金額税抜"] - out["出庫金額税抜"]).round(0).astype(int)
         return out
 
     grp = _supplier_grp(flt)
@@ -3474,6 +3548,8 @@ def _render_inventory_gallery_thumbnail(image_url: str, *, width: int, sold: boo
 
 def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> None:
     """在庫一覧の表形式: data_editor と保存ボタン。"""
+    _ledger_base_for_save = df_sorted
+    df_sorted = df_sorted.copy()
     _ledger_evidence_link_mode = _normalize_evidence_urls_for_link_editor(
         df_sorted, COL_VOUCHER_EVIDENCE_URL
     )
@@ -3562,7 +3638,7 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
             try:
                 overwrite_inventory_worksheet_from_dataframe(
                     edited.reset_index(drop=True),
-                    previous_df=df_sorted.reset_index(drop=True),
+                    previous_df=_ledger_base_for_save.reset_index(drop=True),
                 )
             except Exception as e:
                 st.error(str(e))
@@ -3675,16 +3751,20 @@ def render_inventory_list_page() -> None:
         )
 
     st.markdown("##### 表示の並び順（台帳表に反映・保存時もこの順で書き込みます）")
-    s1, s2, s3, s4 = st.columns([2, 1, 2, 1])
-    sort_choices = ["日時", "仕入先・取引先", "なし"]
+    s1, s2, s3, s4, s5, s6 = st.columns([2, 1, 2, 1, 2, 1])
+    sort_choices = ["日時", "仕入先・取引先", "管理ID", "仕入日時", "販売日時", "なし"]
     with s1:
         prim = st.selectbox("第1ソート", sort_choices, index=0, key="ledger_sort_p")
     with s2:
         prim_ord = st.radio("第1の順序", ["昇順", "降順"], horizontal=True, key="ledger_sort_p_ord")
     with s3:
-        sec = st.selectbox("第2ソート", sort_choices, index=2, key="ledger_sort_s")
+        sec = st.selectbox("第2ソート", sort_choices, index=5, key="ledger_sort_s")
     with s4:
         sec_ord = st.radio("第2の順序", ["昇順", "降順"], horizontal=True, key="ledger_sort_s_ord")
+    with s5:
+        ter = st.selectbox("第3ソート", sort_choices, index=5, key="ledger_sort_t")
+    with s6:
+        ter_ord = st.radio("第3の順序", ["昇順", "降順"], horizontal=True, key="ledger_sort_t_ord")
 
     df_sorted = _apply_ledger_sort(
         df_sheet,
@@ -3692,6 +3772,8 @@ def render_inventory_list_page() -> None:
         prim_ord == "昇順",
         sec,
         sec_ord == "昇順",
+        ter,
+        ter_ord == "昇順",
     )
 
     df_sorted_calc = _recalc_gross_profit_dataframe(df_sorted.copy())
@@ -3864,7 +3946,7 @@ def render_inventory_list_page() -> None:
         st.caption(
             "全列・全行を表示します。行数が多いときは表の **縦スクロール** で移動してください（保存はこのタブから）。"
         )
-        _render_inventory_ledger_data_editor_section(df_sorted)
+        _render_inventory_ledger_data_editor_section(df_sorted_calc)
 
 
 def _init_registration_form_session_state() -> None:
@@ -4595,7 +4677,7 @@ def main():
 
         movement = st.radio(
             "区分（仕入れ・在庫の増減）",
-            ("入庫（購入）", "入庫（返品）"),
+            ("入庫（購入）", "入庫（返品）", "入庫（浮貸）"),
             horizontal=True,
             key="tab_purchase_movement",
         )
@@ -4721,7 +4803,7 @@ def main():
     
         st.markdown("##### 必須入力項目")
         st.caption(
-            "このタブの確定は **在庫中** の新規行のみを追加します（入庫（購入）／入庫（返品））。"
+            "このタブの確定は **在庫中** の新規行のみを追加します（入庫（購入）／入庫（返品）／入庫（浮貸））。"
             "**出庫（浮貸）・出庫（販売）** は **販売管理** タブで行ってください。"
         )
         product_name = st.text_input("商品名（必須）", key="field_product_name")
