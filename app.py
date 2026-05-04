@@ -170,8 +170,11 @@ def _inventory_csv_path() -> Path:
     return Path(__file__).resolve().parent / _INVENTORY_CSV_DEFAULT_NAME
 
 
-def _inventory_csv_read_df() -> pd.DataFrame:
-    path = _inventory_csv_path()
+@st.cache_data(show_spinner=False)
+def _inventory_csv_read_df_cached(mtime_ns: int, path_str: str) -> pd.DataFrame:
+    """CSV の内容を mtime 付きでキャッシュ（同一内容の連続再描画を軽くする）。"""
+    _ = mtime_ns
+    path = Path(path_str)
     if not path.exists():
         return pd.DataFrame(columns=EXPECTED_HEADERS)
     df = pd.read_csv(path, encoding="utf-8-sig")
@@ -187,6 +190,17 @@ def _inventory_csv_read_df() -> pd.DataFrame:
         if c not in df.columns:
             df[c] = ""
     return df[EXPECTED_HEADERS].copy()
+
+
+def _inventory_csv_read_df() -> pd.DataFrame:
+    path = _inventory_csv_path()
+    if not path.exists():
+        return pd.DataFrame(columns=EXPECTED_HEADERS)
+    try:
+        mt = int(path.stat().st_mtime_ns)
+    except OSError:
+        mt = 0
+    return _inventory_csv_read_df_cached(mt, str(path.resolve()))
 
 
 def _inventory_csv_write_df(df: pd.DataFrame) -> None:
@@ -232,6 +246,8 @@ VOUCHER_DRIVE_JPEG_QUALITY = 75
 SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
 TZ_JP = pytz.timezone("Asia/Tokyo")
 LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
+INV_GALLERY_PAGE_SIZE = 30
+SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 
@@ -1591,6 +1607,43 @@ def _get_or_create_inventory_worksheet():
         return None
 
 
+def _bump_inventory_sheet_cache_bust() -> None:
+    """スプレッドシート由来の get_all_values キャッシュを無効化する（追記・全置換・手動再読込後）。"""
+    try:
+        st.session_state[SESSION_KEY_INV_SHEET_CACHE_BUST] = int(
+            st.session_state.get(SESSION_KEY_INV_SHEET_CACHE_BUST, 0)
+        ) + 1
+    except Exception:
+        pass
+
+
+@st.cache_data(show_spinner=False)
+def _inventory_sheet_get_all_values_cached(
+    sheet_id: str, worksheet_title: str, bust: int
+) -> list[list[str]] | None:
+    """同一 bust の間は get_all_values の結果を再利用する（bust は書き込み・再読込で進める）。"""
+    _ = bust
+    try:
+        sh = _gspread_client().open_by_key(str(sheet_id))
+    except Exception:
+        return None
+    try:
+        try:
+            ws = sh.worksheet(str(worksheet_title))
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(
+                title=str(worksheet_title),
+                rows=2000,
+                cols=max(20, len(EXPECTED_HEADERS) + 2),
+            )
+    except Exception:
+        return None
+    try:
+        return ws.get_all_values()
+    except Exception:
+        return None
+
+
 def ensure_worksheet_header():
     """1行目がヘッダーでなければ作成（初回のみ想定）。secrets 未設定時は None。"""
     ws = _get_or_create_inventory_worksheet()
@@ -2021,6 +2074,7 @@ def _append_inventory_data_rows(rows: list[list[Any]]) -> None:
             pass
     except Exception as e:
         raise RuntimeError(f"スプレッドシート追記に失敗しました: {e}") from e
+    _bump_inventory_sheet_cache_bust()
 
 
 def append_sheet_row(
@@ -2094,12 +2148,13 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
     """1行目をヘッダー、2行目以降をデータとして読み込み、列は EXPECTED_HEADERS に揃える。"""
     if _uses_local_inventory_csv():
         return _inventory_csv_read_df()
-    ws = _get_or_create_inventory_worksheet()
-    if ws is None:
+    sid = _secret_str(SECRET_GOOGLE_SPREADSHEET_ID)
+    if not sid:
         return None
-    try:
-        raw = ws.get_all_values()
-    except Exception:
+    wname = _secret_str(SECRET_GOOGLE_WORKSHEET_NAME, DEFAULT_WORKSHEET_NAME)
+    bust = int(st.session_state.get(SESSION_KEY_INV_SHEET_CACHE_BUST, 0))
+    raw = _inventory_sheet_get_all_values_cached(str(sid), str(wname), bust)
+    if raw is None:
         return None
     if not raw:
         return pd.DataFrame(columns=EXPECTED_HEADERS)
@@ -2293,6 +2348,7 @@ def overwrite_inventory_worksheet_from_dataframe(
             pass
     except Exception as e:
         raise RuntimeError(f"スプレッドシートの上書きに失敗しました: {e}") from e
+    _bump_inventory_sheet_cache_bust()
 
 
 def _ledger_df_loosen_numeric_columns_for_assignment(df: pd.DataFrame) -> None:
@@ -3469,6 +3525,7 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
         "key": LEDGER_DATA_EDITOR_KEY,
         "use_container_width": True,
         "hide_index": True,
+        "height": 720,
     }
     if _ledger_col_cfg:
         _editor_kw["column_config"] = _ledger_col_cfg
@@ -3526,7 +3583,7 @@ def render_inventory_list_page() -> None:
         "http 以外の文字が混ざる行がある場合はテキスト列のままです）。"
         "棚卸し用の「最後に確認した日付（棚卸日）」は **YYYY-MM-DD** 推奨です（例: 今日なら "
         f"{_today_jst_date().isoformat()}）。"
-        "下の表は常に **全行** を表示します（未確認だけの一覧は展開パネルで参照し、保存で行が消えないようにしています）。"
+        "既定は **ギャラリー（カタログ）** タブです。**在庫一覧** タブの表は **全行** を表示します（未確認だけの一覧は展開パネルで参照できます）。"
     )
 
     if msg := st.session_state.pop("_ledger_saved_flash", None):
@@ -3547,6 +3604,15 @@ def render_inventory_list_page() -> None:
             else "スプレッドシートから再読込"
         )
         if st.button(_reload_label, key="ledger_reload_from_sheet"):
+            try:
+                _inventory_csv_read_df_cached.clear()
+            except Exception:
+                pass
+            try:
+                _inventory_sheet_get_all_values_cached.clear()
+            except Exception:
+                pass
+            _bump_inventory_sheet_cache_bust()
             st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
             st.rerun()
 
@@ -3633,10 +3699,11 @@ def render_inventory_list_page() -> None:
     _inject_prominent_main_tabs_style()
     st.markdown("## 表示形式")
     st.caption(
-        "**上の大きなタブ** で切り替えます。**表形式** で編集・保存、**ギャラリー** で接客用の一覧（閲覧専用）です。"
+        "**上の大きなタブ** で切り替えます（先頭タブが既定表示）。**ギャラリー（カタログ）** は接客用プレビュー（"
+        f"1ページ **{INV_GALLERY_PAGE_SIZE}** 件・ページ切替で全件）、**在庫一覧** は全行の表で編集・保存します。"
     )
-    tab_ledger_table, tab_ledger_gallery = st.tabs(
-        ("表形式（編集・保存）", "ギャラリー（カタログ）"),
+    tab_ledger_gallery, tab_ledger_table = st.tabs(
+        ("ギャラリー（カタログ）", "在庫一覧"),
     )
 
     with tab_ledger_gallery:
@@ -3685,14 +3752,55 @@ def render_inventory_list_page() -> None:
             suppliers=_sup_f,
             status_mode=_st_f,
         )
-        st.caption(f"該当 **{len(df_view):,}** 行（全 {len(df_sorted_calc):,} 行・粗利は再計算済み）")
+        n_total = len(df_view)
+        st.caption(
+            f"該当 **{n_total:,}** 行（台帳全体 {len(df_sorted_calc):,} 行・粗利は再計算済み）。"
+            f"表示は **{INV_GALLERY_PAGE_SIZE}** 件ずつです。"
+        )
 
-        _max_tiles = 96
-        df_tiles = df_view.head(_max_tiles).reset_index(drop=True)
-        if len(df_view) > _max_tiles:
-            st.warning(
-                f"表示は最大 **{_max_tiles}** 件に制限しています。検索・フィルタで絞り込んでください。"
-            )
+        if "inv_gallery_page" not in st.session_state:
+            st.session_state.inv_gallery_page = 0
+        _fp_gal = f"{_fw!r}|{repr(_sup_f)}|{_st_f!r}"
+        if st.session_state.get("_inv_gallery_filter_fp") != _fp_gal:
+            st.session_state._inv_gallery_filter_fp = _fp_gal
+            st.session_state.inv_gallery_page = 0
+
+        n_pages = max(1, (n_total + INV_GALLERY_PAGE_SIZE - 1) // INV_GALLERY_PAGE_SIZE)
+        page_idx = int(st.session_state.inv_gallery_page)
+        if page_idx >= n_pages:
+            page_idx = n_pages - 1
+            st.session_state.inv_gallery_page = page_idx
+        if page_idx < 0:
+            page_idx = 0
+            st.session_state.inv_gallery_page = 0
+
+        start_idx = page_idx * INV_GALLERY_PAGE_SIZE
+        end_idx = min(n_total, start_idx + INV_GALLERY_PAGE_SIZE)
+        df_tiles = df_view.iloc[start_idx:end_idx].reset_index(drop=True)
+
+        if n_pages > 1:
+            p1, p2, p3 = st.columns([1, 3, 1])
+            with p1:
+                if st.button(
+                    "◀ 前のページ",
+                    disabled=page_idx <= 0,
+                    key="inv_gallery_prev_page",
+                ):
+                    st.session_state.inv_gallery_page = max(0, page_idx - 1)
+                    st.rerun()
+            with p2:
+                st.markdown(
+                    f"**ページ {page_idx + 1} / {n_pages}**　"
+                    f"（{n_total:,} 件中 **{start_idx + 1}〜{end_idx}** 件を表示）"
+                )
+            with p3:
+                if st.button(
+                    "次のページ ▶",
+                    disabled=page_idx >= n_pages - 1,
+                    key="inv_gallery_next_page",
+                ):
+                    st.session_state.inv_gallery_page = min(n_pages - 1, page_idx + 1)
+                    st.rerun()
 
         ncols = 4
         for i in range(0, len(df_tiles), ncols):
@@ -3752,7 +3860,10 @@ def render_inventory_list_page() -> None:
                             _inventory_gallery_detail_dialog(rd)
 
     with tab_ledger_table:
-        st.markdown("### 表形式（編集・保存）")
+        st.markdown("### 在庫一覧")
+        st.caption(
+            "全列・全行を表示します。行数が多いときは表の **縦スクロール** で移動してください（保存はこのタブから）。"
+        )
         _render_inventory_ledger_data_editor_section(df_sorted)
 
 
@@ -4464,6 +4575,11 @@ def main():
     )
 
     _inject_prominent_main_tabs_style()
+    st.markdown("## 入力モード")
+    st.caption(
+        "**上の大きなタブ** で切り替えます。**仕入れ登録** で証憑・入庫と新規行、**販売管理** で販売・浮貸の反映、"
+        "**棚卸しスキャン** で棚卸日の確定（いずれも **上の1枚の写真** を共通で使えます）。"
+    )
     tab_purchase, tab_sales, tab_stock = st.tabs(
         ("仕入れ登録", "販売管理", "棚卸しスキャン")
     )
