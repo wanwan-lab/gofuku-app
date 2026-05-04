@@ -63,7 +63,6 @@ from typing import Any
 
 import altair as alt
 import numpy as np
-import plotly.express as px
 import google.generativeai as genai
 import gspread
 import pandas as pd
@@ -2539,6 +2538,48 @@ def _product_keyword_category(name: str) -> str:
     return "その他"
 
 
+def _render_inventory_category_pie_altair(pie_df: pd.DataFrame) -> None:
+    """Plotly 未導入時のカテゴリ構成比（円グラフ相当）。"""
+    chart = (
+        alt.Chart(pie_df)
+        .mark_arc(innerRadius=55)
+        .encode(
+            theta=alt.Theta("金額税抜:Q", stack=True),
+            color=alt.Color("カテゴリー:N"),
+            tooltip=[
+                alt.Tooltip("カテゴリー:N"),
+                alt.Tooltip("金額税抜:Q", title="金額（税抜）", format=","),
+            ],
+        )
+        .properties(
+            title="在庫中の原価シェア（簡易カテゴリ・Altair）",
+            height=400,
+        )
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
+def _render_inventory_category_pie(pie_df: pd.DataFrame) -> None:
+    """plotly が入っていれば ``st.plotly_chart``、なければ Altair にフォールバック。"""
+    if float(pie_df["金額税抜"].sum()) <= 0:
+        st.caption("在庫中で原価が入っている行がありません。")
+        return
+    try:
+        import plotly.express as px
+    except ImportError:
+        _render_inventory_category_pie_altair(pie_df)
+        return
+    fig = px.pie(
+        pie_df,
+        names="カテゴリー",
+        values="金額税抜",
+        hole=0.35,
+        title="在庫中の原価シェア（簡易カテゴリ）",
+    )
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_analytics_dashboard_page() -> None:
     """集計・分析: メトリクス・Plotly・既存の月次ダッシュボード。"""
     st.subheader("集計・分析（ダッシュボード）")
@@ -2596,18 +2637,7 @@ def render_analytics_dashboard_page() -> None:
     sub["_px"] = _series_to_numeric_loose(sub[COL_PRICE_EXCL]).fillna(0)
     pie_df = sub.groupby("_category", dropna=False)["_px"].sum().reset_index()
     pie_df.columns = ["カテゴリー", "金額税抜"]
-    if pie_df["金額税抜"].sum() > 0:
-        fig = px.pie(
-            pie_df,
-            names="カテゴリー",
-            values="金額税抜",
-            hole=0.35,
-            title="在庫中の原価シェア（簡易カテゴリ）",
-        )
-        fig.update_traces(textposition="inside", textinfo="percent+label")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.caption("在庫中で原価が入っている行がありません。")
+    _render_inventory_category_pie(pie_df)
 
     st.divider()
     render_ledger_dashboard(calc)
