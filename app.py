@@ -30,7 +30,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 ※ 証憑ファイルを台帳に確定反映するとき、Drive 保存用には画像のみ長辺最大2000px・JPEG品質75に再圧縮します（PDF/xlsx/docx は原本のまま）。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
-サイドバーで **登録（インプット）** / **在庫一覧** / **集計・分析（ダッシュボード）** を切り替えられます。
+サイドバーで **登録（インプット）** / **ギャラリー（カタログ）・在庫一覧** / **集計・分析（ダッシュボード）** を切り替えられます。
 在庫データは **共有の inventory.csv**（ローカル）または **Google スプレッドシート**（``INVENTORY_SOURCE`` で選択）に読み書きします。
 列定義・CSV 入出力は **app.py 内に内包**しています。
 
@@ -3754,7 +3754,7 @@ def render_inventory_list_page() -> None:
     s1, s2, s3, s4, s5, s6 = st.columns([2, 1, 2, 1, 2, 1])
     sort_choices = ["日時", "仕入先・取引先", "管理ID", "仕入日時", "販売日時", "なし"]
     with s1:
-        prim = st.selectbox("第1ソート", sort_choices, index=0, key="ledger_sort_p")
+        prim = st.selectbox("第1ソート", sort_choices, index=5, key="ledger_sort_p")
     with s2:
         prim_ord = st.radio("第1の順序", ["昇順", "降順"], horizontal=True, key="ledger_sort_p_ord")
     with s3:
@@ -4616,7 +4616,7 @@ def _render_sales_management_tab(
 
 def main():
     st.set_page_config(page_title="商品在庫・販売", layout="wide")
-    _nav_opts = ("登録（インプット）", "在庫一覧", "集計・分析（ダッシュボード）")
+    _nav_opts = ("登録（インプット）", "ギャラリー（カタログ）・在庫一覧", "集計・分析（ダッシュボード）")
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = _nav_opts[0]
     with st.sidebar:
@@ -4627,7 +4627,7 @@ def main():
         "写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・"
         "**inventory.csv** またはスプレッドシートへの記録ができます。"
     )
-    if page == "在庫一覧":
+    if page == "ギャラリー（カタログ）・在庫一覧":
         render_inventory_list_page()
         return
     if page == "集計・分析（ダッシュボード）":
