@@ -81,15 +81,6 @@ import requests
 import streamlit as st
 from google.oauth2 import service_account
 from PIL import Image, ImageOps
-try:
-    import qrcode
-except Exception:
-    qrcode = None
-
-try:
-    from pyzbar.pyzbar import decode as _pyzbar_decode
-except Exception:
-    _pyzbar_decode = None
 
 # --- スプレッドシート列・税率（app 単体で完結：サブモジュール未コミットでも Cloud で動く） ---
 COL_DATETIME = "日時"
@@ -110,6 +101,7 @@ COL_GROSS_PROFIT = "粗利"
 COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
 COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
+# 廃止済み機能との互換用（台帳定義には含めない）
 COL_FEATURES = "個体特徴（デジタル指紋）"
 COL_CATEGORY = "在庫カテゴリー"
 COL_MANAGEMENT_ID = "管理ID"
@@ -155,11 +147,9 @@ EXPECTED_HEADERS: list[str] = [
     COL_GROSS_PROFIT,
     COL_STOCK_STATUS,
     COL_MEMO,
-    COL_FEATURES,
     COL_CATEGORY,
     COL_IMAGE_URL,
     COL_MANAGEMENT_ID,
-    COL_QR_CODE,
     COL_LAST_STOCKTAKE,
     COL_VOUCHER_RECORDED_AT,
     COL_VOUCHER_EVIDENCE_URL,
@@ -263,41 +253,15 @@ STOCKTAKE_CAND_AI_MAX = 40
 # 棚卸しスキャン: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
 STOCKTAKE_CAND_MIN_CONFIDENCE = 0.14
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
-SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
 STOCKTAKE_WORK_SESSION_FILENAME = "stocktake_work_session.json"
 # 分析ダッシュボード: 商品名＋仕入先をキーにしたカテゴリー推定キャッシュ（.gitignore の *.json でコミットされない想定）
 INVENTORY_CATEGORY_CACHE_FILENAME = "inventory_category_cache.json"
-NORMALIZATION_DICTIONARY_FILENAME = "normalization_dictionary.json"
-NORMALIZATION_PENDING_FILENAME = "normalization_pending.json"
-NORMALIZATION_AUTO_ACCEPT_MIN_CONFIDENCE = 0.90
-NORMALIZATION_AUTO_ACCEPT_MIN_COUNT = 5
 # 移行前の session_state キー（読み込み時にファイルへ移す）
 _SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY = "_inv_stocktake_work_remaining_mids"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 
-_NORMALIZATION_BASE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
-    ("アイボリー", "ベージュ"),
-    ("生成り", "ベージュ"),
-    ("きなり", "ベージュ"),
-    ("オフホワイト", "ホワイト"),
-    ("白色", "ホワイト"),
-    ("黒色", "ブラック"),
-    ("灰色", "グレー"),
-    ("ねずみ", "グレー"),
-    ("紺", "ネイビー"),
-    ("ベースボールキャップ型", "ベースボールキャップ"),
-    ("キャップ型", "キャップ"),
-    ("フラットに近い", "フラット"),
-    ("つば", "バイザー"),
-    ("コンビネーション", "コンビ"),
-    ("メッシュ素材", "メッシュ"),
-    ("布地", "布"),
-    ("立体刺繍", "刺繍"),
-    ("ロゴ刺繍", "刺繍"),
-    ("エンブレム", "ロゴ"),
-)
 
 # 写真→台帳照合（仕入 AI・棚卸し・販売の写真紐付け）向け。和装専門店以外・雑貨・アパレルでも迷いにくくする。
 _GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA = """
@@ -765,9 +729,6 @@ def _apply_gemini_json_to_session(
         vf = " / ".join(str(p) for p in parts)
     st.session_state.ai_features = str(vf or "")
     st.session_state.ai_parse_ran = True
-    feat_list = _extract_distinctive_features_from_result(r)
-    st.session_state["_ai_distinctive_features"] = feat_list
-    st.session_state["_ai_feature_profile"] = _extract_feature_profile_from_result(r)
 
     ic = str(
         r.get("inventory_category")
@@ -813,32 +774,20 @@ def _apply_gemini_sale_link_to_session(
         and not df_ledger.empty
     ):
         pn0 = str(
-            m.get("normalized_name")
-            or r.get("normalized_name")
-            or r.get("normalized_product_name")
-            or
             m.get("product_name")
             or r.get("product_name")
             or r.get("商品名")
             or ""
         ).strip()
         su0 = str(
-            m.get("normalized_supplier")
-            or r.get("normalized_supplier")
-            or
             m.get("supplier")
             or r.get("supplier")
             or r.get("仕入先・取引先")
             or r.get("仕入先")
             or ""
         ).strip()
-        ft0 = _extract_distinctive_features_from_result(r)
-        fp0 = _extract_feature_profile_from_result(r)
-        nfp0 = r.get("normalized_feature_profile")
-        if isinstance(nfp0, dict):
-            fp0 = {**fp0, **{str(k): str(v) for k, v in nfp0.items() if str(v).strip()}}
         fr = _single_row_fuzzy_ledger_match(
-            df_ledger, pn0, su0, ft0, fp0, only_in_stock=True, limit=14
+            df_ledger, pn0, su0, only_in_stock=True, limit=14
         )
         if fr is not None:
             mid = str(fr.get(COL_MANAGEMENT_ID, "") or "").strip()
@@ -1089,7 +1038,7 @@ def analyze_image_with_gemini(
 次の **続きのテキスト** に示すリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定します（販売済は含みません。リスト外の管理IDは返さない）。
 同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
 **どの行が写真の品かは、金額の一致では判断しない**（商品名・メモ・カテゴリー・仕入先・タグ・色形などで推測する）。
-とくに各行メモ内の「個体特徴（染み・傷・刻印・縫い目・ほつれ）」と、現在画像に見える特徴が一致するかを最優先で評価する。
+台帳の「商品名」「仕入先・取引先」と現在画像の見た目・文脈を基に、同一商品の可能性を評価する。
 **リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
 ---
 {inv_stripped}
@@ -1100,13 +1049,12 @@ def analyze_image_with_gemini(
   - "confidence" (number): 0.0〜1.0（写真と同一在庫である確信度。表示順はアプリ側で管理IDの昇順に整列する）
   - "product_name" (string): その行の商品名（参考）
   - "supplier" (string): その行の仕入先（参考）
-  - "feature_observation" (string): この画像で見えた個体特徴（染み/傷/刻印/縫い目等）。メモに追記できる短文。なければ ""
+  - "feature_observation" (string): この画像で見えた特徴の補足メモ。なければ ""
   該当が1件も無いときは空配列 []。
   迷う場合は複数入れてよい（confidence が低いものも列挙してよい。ただし無関係な行は入れない）。
   各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
 
 任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
-        prompt += "\n任意: normalization_suggestions（表記ゆれ正規化提案の配列）"
         response = model.generate_content([prompt, subject])
         return response.text or ""
 
@@ -1120,7 +1068,7 @@ def analyze_image_with_gemini(
 {_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
 
 次の **続きのテキスト** のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。**行の選定に金額の一致は使わない。** 必ずこのリストの中からだけ management_id を選べ。
-各行のメモに記録された「個体特徴（染み・傷・刻印・縫い目等）」が現在画像でも確認できるかを最優先の根拠として一致判定する。
+各行の「商品名」「仕入先・取引先」の一致度を優先し、画像全体の見た目で同一商品かを判断する。
 JSON だけを返してください（説明文・コードフェンス禁止）。
 ---
 {inv_stripped}
@@ -1132,10 +1080,7 @@ JSON だけを返してください（説明文・コードフェンス禁止）
   - "product_name" (string): その行の商品名（参考）
   - "supplier" (string): その行の仕入先（参考）
   - "line_price_excl" (integer or null): 選んだ行の仕入金額（税抜）を台帳どおり（**写真と金額が一致するかで行を決めない**）。不明なら null
-  - "feature_observation" (string): 現在画像で確認できた個体特徴（メモ追記用）。なければ ""
-
-任意:
-- "normalization_suggestions" (array): 表記ゆれ正規化の提案。
+  - "feature_observation" (string): 現在画像で確認できた特徴の補足（メモ追記用）。なければ ""
 
 該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
         response = model.generate_content([prompt, subject])
@@ -1155,19 +1100,6 @@ JSON だけを返してください（説明文・コードフェンス禁止）
 - "material" (string): 素材の推定。不明なら ""
 - "condition" (string): 状態の推定。不明なら ""
 - "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
-- "distinctive_features" (array of string): この個体だけの識別に使える物理的特徴を3件以上（例: 染み/傷/刻印/縫い目のズレ）。短文で具体的に。
-- "feature_profile" (object): 個体特徴を次のキーで整理して返す（空文字可）:
-  - "category": 商品のカテゴリー
-  - "overall_shape": 全体の形
-  - "major_shape_feature": 大きな形状特徴（例: エンブレム）
-  - "material": 素材の違い
-  - "color": 色
-  - "other": その他の識別点
-- "normalized_name" (string): 照合用に正規化した商品名（表記ゆれを吸収）
-- "normalized_supplier" (string): 照合用に正規化した仕入先
-- "normalized_feature_profile" (object): feature_profile と同じキーで、照合用の正規化値
-- "normalization_suggestions" (array): 任意。辞書追加候補を返す。
-  各要素は {{"source": "...", "normalized": "...", "type": "color|shape|material|feature|supplier|other", "confidence": 0.0-1.0}}
 """
     schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
@@ -2386,18 +2318,11 @@ def _inventory_line_text_for_gemini_prompt(row: pd.Series) -> str:
             if len(memo) > 56:
                 memo = memo[:53] + "…"
             memo_seg = f" メモ={json.dumps(memo, ensure_ascii=False)}"
-    feat_seg = ""
-    if COL_FEATURES in row.index:
-        feat = str(row.get(COL_FEATURES, "") or "").strip().replace("\n", " ")
-        if feat:
-            if len(feat) > 72:
-                feat = feat[:69] + "…"
-            feat_seg = f" 個体特徴={json.dumps(feat, ensure_ascii=False)}"
     return (
         f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
         f"商品名={json.dumps(pn, ensure_ascii=False)} "
         f"仕入先={json.dumps(su, ensure_ascii=False)}"
-        f"{st_seg}{cat_seg}{memo_seg}{feat_seg}"
+        f"{st_seg}{cat_seg}{memo_seg}"
     )
 
 
@@ -2430,80 +2355,29 @@ def _fuzzy_ledger_match_rows(
     df: pd.DataFrame,
     product_name: str,
     supplier: str,
-    features: list[str] | None = None,
-    feature_profile: dict[str, str] | None = None,
     *,
     limit: int | None = 8,
 ) -> pd.DataFrame:
-    """台帳候補を返す（優先順: 名前+特徴 → 名前+仕入先 → 名前 → 仕入先）。"""
+    """台帳候補を返す（優先順: 名前+仕入先 → 名前 → 仕入先）。"""
     if df is None or df.empty:
         return pd.DataFrame()
-    learned = _normalization_dictionary_load()
-    learned_pairs = tuple((k, v) for k, v in learned.items() if k and v)
-    norm_pairs: tuple[tuple[str, str], ...] = _NORMALIZATION_BASE_REPLACEMENTS + learned_pairs
-
-    def _normalize_for_match(txt: str) -> str:
-        s = (txt or "").strip().casefold()
-        if not s:
-            return ""
-        for src, dst in norm_pairs:
-            s = s.replace(src.casefold(), dst.casefold())
-        return s
-
     pn = (product_name or "").strip().casefold()
     su = (supplier or "").strip().casefold()
-    pn = _normalize_for_match(pn)
-    su = _normalize_for_match(su)
-    ft_list = [
-        _normalize_for_match(str(x or ""))
-        for x in (features or [])
-        if str(x or "").strip()
-    ]
-    fprof = {
-        str(k): _normalize_for_match(str(v))
-        for k, v in (feature_profile or {}).items()
-        if str(v).strip()
-    }
-    if not pn and not su and not ft_list and not fprof:
+    if not pn and not su:
         return df.iloc[:0]
-
-    def _feature_tokens(txt: str) -> set[str]:
-        s = _normalize_for_match(txt or "")
-        if not s:
-            return set()
-        parts = re.split(r"[\s,;:/|・、。\n\t=\-()\[\]{}]+", s)
-        return {p for p in parts if len(p) >= 2}
-
-    q_feat_tokens: set[str] = set()
-    for f in ft_list:
-        q_feat_tokens.update(_feature_tokens(f))
-    for v in fprof.values():
-        q_feat_tokens.update(_feature_tokens(v))
 
     scored: list[tuple[int, float, Any]] = []
     for i, row in df.iterrows():
         rpn = str(row.get(COL_NAME, "") or "").strip()
         rsu = str(row.get(COL_SUPPLIER, "") or "").strip()
-        rft = str(row.get(COL_FEATURES, "") or "").strip()
-        rpn_l = _normalize_for_match(rpn)
-        rsu_l = _normalize_for_match(rsu)
-        rft_l = _normalize_for_match(rft)
-        row_feat_tokens = _feature_tokens(rft)
-        feat_hits = len(q_feat_tokens & row_feat_tokens)
-        feat_ok = feat_hits >= 1
-        profile_hits = 0
-        if fprof:
-            for _k, _v in fprof.items():
-                if _v and _v in rft_l:
-                    profile_hits += 1
+        rpn_l = rpn.casefold()
+        rsu_l = rsu.casefold()
         both_ok = bool(pn and su and (pn in rpn_l) and (su in rsu_l))
         name_ok = bool(pn and (pn in rpn_l))
         sup_ok = bool(su and (su in rsu_l))
-        if not (feat_ok or profile_hits > 0 or both_ok or name_ok or sup_ok):
+        if not (both_ok or name_ok or sup_ok):
             continue
-        if name_ok and (feat_ok or profile_hits > 0):
-            prio = 0
-        elif both_ok:
+        if both_ok:
             prio = 1
         elif name_ok:
             prio = 2
@@ -2514,10 +2388,6 @@ def _fuzzy_ledger_match_rows(
             sim += 0.6 * difflib.SequenceMatcher(None, rpn_l, pn).ratio()
         if su:
             sim += 0.4 * difflib.SequenceMatcher(None, rsu_l, su).ratio()
-        if q_feat_tokens:
-            sim += 0.70 * (feat_hits / max(1, len(q_feat_tokens)))
-        if fprof:
-            sim += 0.95 * (profile_hits / max(1, len(fprof)))
         scored.append((prio, -sim, i))
 
     scored.sort(key=lambda x: (x[0], x[1], _management_id_sort_key(str(df.loc[x[2]].get(COL_MANAGEMENT_ID, "") or "").strip())))
@@ -2534,8 +2404,6 @@ def _single_row_fuzzy_ledger_match(
     df: pd.DataFrame | None,
     product_name: str,
     supplier: str,
-    features: list[str] | None = None,
-    feature_profile: dict[str, str] | None = None,
     *,
     only_in_stock: bool,
     limit: int = 12,
@@ -2550,9 +2418,7 @@ def _single_row_fuzzy_ledger_match(
     su = (supplier or "").strip()
     if not pn and not su:
         return None
-    cand = _fuzzy_ledger_match_rows(
-        base, pn, su, features, feature_profile, limit=limit
-    )
+    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=limit)
     if cand.shape[0] != 1:
         return None
     row = cand.iloc[0]
@@ -2572,19 +2438,12 @@ def _apply_purchase_ledger_match_supplement(
     if str(m.get("management_id") or m.get("管理ID") or "").strip():
         return result
     pn = str(
-        result.get("normalized_name")
-        or result.get("normalized_product_name")
-        or result.get("normalized_product")
-        or
         result.get("product_name")
         or result.get("商品名")
         or m.get("product_name")
         or ""
     ).strip()
     su = str(
-        result.get("normalized_supplier")
-        or result.get("normalized_vendor")
-        or
         result.get("supplier")
         or result.get("仕入先・取引先")
         or result.get("仕入先")
@@ -2592,13 +2451,8 @@ def _apply_purchase_ledger_match_supplement(
         or m.get("supplier")
         or ""
     ).strip()
-    ft = _extract_distinctive_features_from_result(result)
-    fp = _extract_feature_profile_from_result(result)
-    nfp = result.get("normalized_feature_profile")
-    if isinstance(nfp, dict):
-        fp = {**fp, **{str(k): str(v) for k, v in nfp.items() if str(v).strip()}}
     row = _single_row_fuzzy_ledger_match(
-        df_ledger, pn, su, ft, fp, only_in_stock=False, limit=12
+        df_ledger, pn, su, only_in_stock=False, limit=12
     )
     if row is None:
         return result
@@ -3028,11 +2882,7 @@ def _refresh_ledger_quick_search_candidates(df_ledger: pd.DataFrame | None) -> N
         return
     pn = str(st.session_state.get("field_product_name", "") or "").strip()
     su = str(st.session_state.get("field_supplier", "") or "").strip()
-    ft = _extract_distinctive_features_from_result(
-        {"distinctive_features": st.session_state.get("_ai_distinctive_features", [])}
-    )
-    fp = st.session_state.get("_ai_feature_profile") or {}
-    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, ft, fp, limit=None)
+    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, limit=None)
     if cand.empty:
         st.session_state.pop("ledger_quick_candidates", None)
     else:
@@ -3311,7 +3161,7 @@ def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None
     if sub.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
         return
-    cand = _fuzzy_ledger_match_rows(sub, pn, su, None, None, limit=None)
+    cand = _fuzzy_ledger_match_rows(sub, pn, su, limit=None)
     if cand.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
     else:
@@ -3399,7 +3249,7 @@ def _refresh_stocktake_assist_quick_candidates(
         return
     pn = str(st.session_state.get("stocktake_assist_buf_product_name", "") or "").strip()
     su = str(st.session_state.get("stocktake_assist_buf_supplier", "") or "").strip()
-    cand = _fuzzy_ledger_match_rows(base, pn, su, None, None, limit=None)
+    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=None)
     if cand.empty:
         st.session_state.pop("stocktake_assist_quick_candidates", None)
     else:
@@ -3767,8 +3617,6 @@ def apply_outbound_loan_in_stock_datetime_by_management_id(
 
 def apply_last_stocktake_jst_for_management_ids(
     management_ids: Iterable[str],
-    *,
-    feature_updates_by_management_id: dict[str, str] | None = None,
 ) -> tuple[int, list[str]]:
     """複数の在庫中の行について棚卸日を本日（JST）にし、1回の読込・保存で反映する。
 
@@ -3802,15 +3650,6 @@ def apply_last_stocktake_jst_for_management_ids(
             continue
         if COL_LAST_STOCKTAKE in df_src.columns:
             df_src.loc[msk, COL_LAST_STOCKTAKE] = today_s
-        if feature_updates_by_management_id:
-            obs = str(feature_updates_by_management_id.get(sid, "") or "").strip()
-            if obs:
-                tag = f"[{today_s} 棚卸し時] {obs}"
-                old_feat = str(df_src.loc[msk, COL_FEATURES].iloc[0] or "").strip()
-                if tag not in old_feat:
-                    df_src.loc[msk, COL_FEATURES] = (
-                        old_feat + ("\n" if old_feat else "") + tag
-                    )
         df_src.loc[msk, COL_DATETIME] = now_exec
         updated.add(sid)
     if not updated:
@@ -4623,80 +4462,6 @@ def _inventory_category_cache_path() -> Path:
     return Path(__file__).resolve().parent / INVENTORY_CATEGORY_CACHE_FILENAME
 
 
-def _normalization_dictionary_path() -> Path:
-    return Path(__file__).resolve().parent / NORMALIZATION_DICTIONARY_FILENAME
-
-
-def _normalization_pending_path() -> Path:
-    return Path(__file__).resolve().parent / NORMALIZATION_PENDING_FILENAME
-
-
-def _normalization_dictionary_load() -> dict[str, str]:
-    p = _normalization_dictionary_path()
-    if not p.is_file():
-        return {}
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, str] = {}
-    for k, v in raw.items():
-        ks = str(k).strip()
-        vs = str(v).strip()
-        if ks and vs:
-            out[ks] = vs
-    return out
-
-
-def _normalization_dictionary_write(mapping: dict[str, str]) -> None:
-    p = _normalization_dictionary_path()
-    data = {k: mapping[k] for k in sorted(mapping.keys())}
-    tmp = p.with_name(p.name + ".tmp")
-    try:
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(p)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-
-
-def _normalization_pending_load() -> dict[str, dict[str, Any]]:
-    p = _normalization_pending_path()
-    if not p.is_file():
-        return {}
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, dict[str, Any]] = {}
-    for k, v in raw.items():
-        if isinstance(v, dict):
-            out[str(k)] = dict(v)
-    return out
-
-
-def _normalization_pending_write(mapping: dict[str, dict[str, Any]]) -> None:
-    p = _normalization_pending_path()
-    data = {k: mapping[k] for k in sorted(mapping.keys())}
-    tmp = p.with_name(p.name + ".tmp")
-    try:
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(p)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-
-
 def _inventory_category_cache_key(product_name: str, supplier: str = "") -> str:
     """商品名＋仕入先でキャッシュ参照用のキー（大小・前後空白は正規化）。"""
     n = (product_name or "").strip()
@@ -5187,207 +4952,6 @@ def _google_drive_file_id_from_url(url: str) -> str | None:
     return None
 
 
-def _qr_png_bytes_for_management_id(management_id: str) -> bytes:
-    """管理ID文字列をQR(PNG)化して返す。"""
-    if qrcode is None:
-        return b""
-    data = str(management_id or "").strip()
-    if not data:
-        return b""
-    img = qrcode.make(data)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def _qr_data_url_for_management_id(management_id: str) -> str:
-    """管理IDのQRを data URL 形式で返す（シート保存用）。"""
-    b = _qr_png_bytes_for_management_id(management_id)
-    if not b:
-        return ""
-    return "data:image/png;base64," + base64.b64encode(b).decode("ascii")
-
-
-def _extract_qr_management_id_from_image(image_data: Any) -> str:
-    """画像からQRを読み、G######## 形式の管理IDを返す（無ければ空）。"""
-    if _pyzbar_decode is None:
-        return ""
-    try:
-        im = _pil_image_for_gemini(image_data)
-        decoded = _pyzbar_decode(im)
-    except Exception:
-        return ""
-    for d in decoded or []:
-        try:
-            txt = d.data.decode("utf-8", errors="ignore").strip()
-        except Exception:
-            txt = ""
-        if re.fullmatch(r"(?i)G\d{8}", txt):
-            return txt.upper()
-    return ""
-
-
-def _extract_distinctive_features_from_result(result: dict[str, Any]) -> list[str]:
-    """Gemini結果から個体特徴を抽出（3件まで）。"""
-    if not isinstance(result, dict):
-        return []
-    raw = result.get("distinctive_features")
-    feats: list[str] = []
-    if isinstance(raw, list):
-        for v in raw:
-            s = str(v or "").strip()
-            if s:
-                feats.append(s)
-    if not feats:
-        alt = str(
-            result.get("feature_note")
-            or result.get("feature_notes")
-            or result.get("個体特徴")
-            or ""
-        ).strip()
-        if alt:
-            feats = [x.strip(" ・-\t") for x in re.split(r"[\n;,、]+", alt) if x.strip()]
-    out: list[str] = []
-    seen: set[str] = set()
-    for f in feats:
-        if f in seen:
-            continue
-        seen.add(f)
-        out.append(f[:120])
-        if len(out) >= 6:
-            break
-    return out
-
-
-def _extract_feature_profile_from_result(result: dict[str, Any]) -> dict[str, str]:
-    """Gemini結果から特徴プロファイルを抽出（カテゴリ別）。"""
-    if not isinstance(result, dict):
-        return {}
-    src = result.get("feature_profile")
-    if not isinstance(src, dict):
-        src = {}
-    key_map = {
-        "category": ("category", "カテゴリー"),
-        "overall_shape": ("overall_shape", "全体の形"),
-        "major_shape_feature": ("major_shape_feature", "大きな形状特徴"),
-        "material": ("material", "素材"),
-        "color": ("color", "色"),
-        "other": ("other", "その他"),
-    }
-    out: dict[str, str] = {}
-    for k, aliases in key_map.items():
-        v = ""
-        for a in aliases:
-            vv = src.get(a)
-            if vv is not None and str(vv).strip():
-                v = str(vv).strip()
-                break
-        if not v and k == "category":
-            v = str(
-                result.get("inventory_category")
-                or result.get("在庫カテゴリー")
-                or ""
-            ).strip()
-        if v:
-            out[k] = v[:120]
-    return out
-
-
-def _extract_normalization_suggestions_from_result(
-    result: dict[str, Any],
-) -> list[dict[str, Any]]:
-    if not isinstance(result, dict):
-        return []
-    raw = result.get("normalization_suggestions")
-    if not isinstance(raw, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for it in raw:
-        if not isinstance(it, dict):
-            continue
-        src = str(it.get("source") or "").strip()
-        dst = str(it.get("normalized") or "").strip()
-        typ = str(it.get("type") or "other").strip()[:40]
-        try:
-            cf = float(it.get("confidence") or 0)
-        except (TypeError, ValueError):
-            cf = 0.0
-        if not src or not dst or src == dst:
-            continue
-        out.append(
-            {
-                "source": src[:120],
-                "normalized": dst[:120],
-                "type": typ,
-                "confidence": max(0.0, min(1.0, cf)),
-            }
-        )
-    return out
-
-
-def _record_normalization_suggestions_auto_accept(
-    suggestions: list[dict[str, Any]],
-) -> int:
-    """AI提案を pending に蓄積し、条件達成時に辞書へ自動採用する。"""
-    if not suggestions:
-        return 0
-    pending = _normalization_pending_load()
-    dictionary = _normalization_dictionary_load()
-    accepted = 0
-    for s in suggestions:
-        src = str(s.get("source") or "").strip()
-        dst = str(s.get("normalized") or "").strip()
-        typ = str(s.get("type") or "other").strip()
-        cf = float(s.get("confidence") or 0)
-        if not src or not dst or src == dst:
-            continue
-        # 固有識別系は誤学習を避けるため自動採用対象外
-        if re.search(r"(管理id|g\d{4,}|型番|sku|jan|barcode)", src, re.I):
-            continue
-        key = f"{src}\t{dst}\t{typ}"
-        rec = pending.get(key) or {
-            "source": src,
-            "normalized": dst,
-            "type": typ,
-            "count": 0,
-            "max_confidence": 0.0,
-        }
-        rec["count"] = int(rec.get("count") or 0) + 1
-        rec["max_confidence"] = max(float(rec.get("max_confidence") or 0), cf)
-        pending[key] = rec
-        if (
-            float(rec["max_confidence"]) >= NORMALIZATION_AUTO_ACCEPT_MIN_CONFIDENCE
-            and int(rec["count"]) >= NORMALIZATION_AUTO_ACCEPT_MIN_COUNT
-        ):
-            cur = dictionary.get(src, "")
-            if not cur:
-                dictionary[src] = dst
-                accepted += 1
-    _normalization_pending_write(pending)
-    if accepted > 0:
-        _normalization_dictionary_write(dictionary)
-    return accepted
-
-
-def _feature_profile_to_text(profile: dict[str, str]) -> str:
-    if not profile:
-        return ""
-    labels = (
-        ("category", "カテゴリー"),
-        ("overall_shape", "全体の形"),
-        ("major_shape_feature", "大きな形状特徴"),
-        ("material", "素材"),
-        ("color", "色"),
-        ("other", "その他"),
-    )
-    lines: list[str] = []
-    for k, lb in labels:
-        v = str(profile.get(k, "") or "").strip()
-        if v:
-            lines.append(f"{lb}: {v}")
-    return "\n".join(lines)
-
-
 def _render_inventory_gallery_thumbnail(image_url: str, *, width: int, sold: bool) -> None:
     """ギャラリー用。Drive 直リンクは ``st.image(URL)`` が効かないことが多いため、取得して JPEG 化して表示する。"""
     iu = (image_url or "").strip()
@@ -5605,33 +5169,21 @@ def _sales_photo_match_card_hits_from_result(
     if not isinstance(m, dict):
         m = {}
     pn0 = str(
-        m.get("normalized_name")
-        or result.get("normalized_name")
-        or result.get("normalized_product_name")
-        or
         m.get("product_name")
         or result.get("product_name")
         or result.get("商品名")
         or ""
     ).strip()
     su0 = str(
-        m.get("normalized_supplier")
-        or result.get("normalized_supplier")
-        or
         m.get("supplier")
         or result.get("supplier")
         or result.get("仕入先・取引先")
         or result.get("仕入先")
         or ""
     ).strip()
-    ft0 = _extract_distinctive_features_from_result(result)
-    fp0 = _extract_feature_profile_from_result(result)
-    nfp0 = result.get("normalized_feature_profile")
-    if isinstance(nfp0, dict):
-        fp0 = {**fp0, **{str(k): str(v) for k, v in nfp0.items() if str(v).strip()}}
     conf = float(m.get("confidence") or result.get("confidence") or 0)
     mid_primary = str(m.get("management_id") or "").strip()
-    cand = _fuzzy_ledger_match_rows(sub, pn0, su0, ft0, fp0, limit=None)
+    cand = _fuzzy_ledger_match_rows(sub, pn0, su0, limit=None)
     if cand.empty:
         return []
     hits: list[dict[str, Any]] = []
@@ -5642,10 +5194,6 @@ def _sales_photo_match_card_hits_from_result(
             continue
         seen.add(mid)
         c = conf if mid_primary and mid == mid_primary else None
-        row_feat_raw = str(row.get(COL_FEATURES, "") or "").strip()
-        row_feats = [x.strip(" ・-\t") for x in row_feat_raw.splitlines() if x.strip()]
-        matched = [f for f in ft0 if any(f.casefold() in rf.casefold() or rf.casefold() in f.casefold() for rf in row_feats)]
-        missing = [f for f in ft0 if f not in matched]
         xc = (
             "写真照合で推定した行（同一管理ID）"
             if mid_primary and mid == mid_primary
@@ -5656,8 +5204,6 @@ def _sales_photo_match_card_hits_from_result(
                 row,
                 confidence=c,
                 extra_caption=xc or None,
-                matched_features=matched,
-                missing_features=missing,
             )
         )
 
@@ -6556,8 +6102,11 @@ def _stocktake_candidates_from_gemini_response(
     return out[:max_n]
 
 
-def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
-    """棚卸しスキャン: カメラ撮影 → AI 照合 → 棚卸日の確定更新のみ。"""
+def render_stocktake_scan_tab(
+    uploaded,
+    df_ledger_hint: pd.DataFrame | None,
+) -> None:
+    """棚卸しスキャン: 共通アップロード画像で AI 照合 → 棚卸日の確定更新のみ。"""
     st.markdown("##### 棚卸しスキャン（AI 照合）")
     st_rem_scan = _inv_stocktake_work_remaining_get()
     _scan_targets_ok = st_rem_scan is not None and len(st_rem_scan) > 0
@@ -6571,11 +6120,11 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         if st_rem_scan is not None:
             st.session_state.pop("_stocktake_selected_mid", None)
     st.caption(
-        "現物を撮影し、**今回の棚卸対象リストにまだ残っている在庫中の行** だけを AI に渡し、複数候補を返します。"
+        "上部の共通アップロード画像を使い、**今回の棚卸対象リストにまだ残っている在庫中の行** だけを AI に渡し、複数候補を返します。"
         "照合は **和装に限らず** 洋服・帽子・雑貨・アパレル・一点物も想定しています。"
         "飲料・カップ麺のようにパッケージ文字が読める品より、**無包装の衣料**は難しいため、台帳の **メモ・カテゴリー・商品名・仕入先** を手がかりにします（**金額の一致は照合に使いません**）。"
         "**タグが写る撮影**を推奨します。"
-        "照合には **撮影画像** と **対象リストのテキスト** のみを 1 回の Gemini API で送ります。"
+        "照合には **アップロード画像** と **対象リストのテキスト** のみを 1 回の Gemini API で送ります。"
         f"候補は **{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、ページを切り替えて全件を確認できます（AI は最大 "
         f"**{STOCKTAKE_CAND_AI_MAX}** 件まで）。"
         "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
@@ -6591,19 +6140,9 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                 "今回の対象リストに **残っている行がありません**（すべて棚卸済みか、台帳更新でリストから外れました）。"
                 "続ける場合は **今回の棚卸を開始** でリストを作り直してください。"
             )
-    cam = st.camera_input("現物を撮影", key="stocktake_camera_input")
     st.caption(
-        "**衣料・帽子・布製品**は、飲料やカップ麺のようにパッケージ文字が読めないことが多く照合が難しくなりがちです。"
-        "**タグ・品番・サイズ・下札・内側のケア表記**が読める距離で写すと、台帳の商品名・メモと突き合わせやすくなります。"
+        "写真取り込みは販売管理と同じ仕様です。ページ上部の共通アップローダで画像を選んでから照合してください。"
     )
-    if cam is not None:
-        st.session_state[SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES] = cam.getvalue()
-    elif st.session_state.get(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES):
-        st.caption("直前に撮影した画像（**AIで台帳と照合** にそのまま使われます）")
-        st.image(
-            st.session_state[SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES],
-            width=320,
-        )
 
     if _scan_targets_ok and df_ledger_hint is not None and not df_ledger_hint.empty:
         st.markdown("##### 台帳から入力補助（任意）")
@@ -6690,49 +6229,22 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         "AIで台帳と照合",
         type="primary",
         key="stocktake_ai_match_btn",
-        disabled=not _scan_targets_ok,
+        disabled=(not _scan_targets_ok) or (uploaded is None),
     ):
         st.session_state.pop("_stocktake_scan_candidates", None)
         st.session_state.pop("_stocktake_selected_mid", None)
         st.session_state.pop("stocktake_multi_done_mids", None)
         st.session_state.pop("_stocktake_scan_warn", None)
         st.session_state.pop("stocktake_cand_page", None)
-        img_b = (
-            cam.getvalue()
-            if cam is not None
-            else st.session_state.get(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES)
-        )
         st_rem_run = _inv_stocktake_work_remaining_get()
         if st_rem_run is None or not st_rem_run:
             st.session_state["_stocktake_scan_warn"] = (
                 "今回の棚卸対象リストがありません。**今回の棚卸を開始** からやり直してください。"
             )
-        elif not img_b:
+        elif uploaded is None:
             st.session_state["_stocktake_scan_warn"] = (
-                "先にカメラで撮影するか、直前に保存した撮影データがありません。"
+                "上部の共通アップローダで写真を選択してください。"
             )
-        elif (_qr_mid := _extract_qr_management_id_from_image(img_b)):
-            if _qr_mid not in st_rem_run:
-                st.session_state["_stocktake_scan_warn"] = (
-                    f"QRで管理ID **{_qr_mid}** を検出しましたが、今回の棚卸対象リストには含まれていません。"
-                )
-            else:
-                _tr = lookup_ledger_row_by_management_id(df_ledger_hint, _qr_mid)
-                st.session_state["_stocktake_selected_mid"] = _qr_mid
-                st.session_state["_stocktake_scan_candidates"] = [
-                    {
-                        "management_id": _qr_mid,
-                        "confidence": 1.0,
-                        "product_name": str(_tr.get(COL_NAME, "") if _tr is not None else ""),
-                        "supplier": str(_tr.get(COL_SUPPLIER, "") if _tr is not None else ""),
-                        "last_stocktake": str(_tr.get(COL_LAST_STOCKTAKE, "") if _tr is not None else ""),
-                        "image_url": str(_tr.get(COL_IMAGE_URL, "") if _tr is not None else ""),
-                        "memo": str(_tr.get(COL_MEMO, "") if _tr is not None else ""),
-                        "features": str(_tr.get(COL_FEATURES, "") if _tr is not None else ""),
-                        "feature_observation": "QRコード一致で同一商品を確認",
-                    }
-                ]
-                st.session_state["stocktake_cand_page"] = 0
         elif df_ledger_hint is None or df_ledger_hint.empty:
             st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
         else:
@@ -6749,25 +6261,13 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             else:
                 with st.spinner("画像を解析して台帳と照合しています…"):
                     try:
-                        class _CamBytes:
-                            __slots__ = ("_b",)
-
-                            def __init__(self, b: bytes) -> None:
-                                self._b = b
-
-                            def getvalue(self) -> bytes:
-                                return self._b
-
-                        img_pil = _gemini_input_image_from_upload(_CamBytes(img_b))
+                        img_pil = _gemini_input_image_from_upload(uploaded)
                         raw = analyze_image_with_gemini(
                             img_pil,
                             inventory_context=inv_ctx_st or None,
                             prompt_mode="stocktake_match",
                         )
                         res = _parse_json_from_model(raw or "")
-                        _record_normalization_suggestions_auto_accept(
-                            _extract_normalization_suggestions_from_result(res)
-                        )
                         if not isinstance(res, dict):
                             res = {}
                         cand_list = _stocktake_candidates_from_gemini_response(
@@ -6920,20 +6420,6 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                     st.write(
                         f"**前回の棚卸日:** {hit.get('last_stocktake') or '—（未入力）'}"
                     )
-                    feat_text = str(
-                        hit.get("features")
-                        or hit.get("memo")
-                        or ""
-                    ).strip()
-                    if feat_text:
-                        st.markdown("**登録時の特徴点:**")
-                        for ln in [x.strip(" ・-\t") for x in feat_text.splitlines()]:
-                            if not ln:
-                                continue
-                            st.write(f"- {ln}")
-                    obs = str(hit.get("feature_observation") or "").strip()
-                    if obs:
-                        st.caption(f"今回画像で確認した特徴: {obs}")
                     st.caption(
                         f"AI 確信度: {float(hit.get('confidence') or 0):.2f}（参考）"
                     )
@@ -6948,12 +6434,6 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         if _st_batch:
             _picked = list(st.session_state.get("stocktake_multi_done_mids") or [])
             _picked = [str(x).strip() for x in _picked if str(x).strip()]
-            _obs_map: dict[str, str] = {}
-            for _h in cands:
-                _mid = str(_h.get("management_id") or "").strip()
-                _ob = str(_h.get("feature_observation") or "").strip()
-                if _mid and _ob:
-                    _obs_map[_mid] = _ob
             if st.button(
                 "選択した候補をまとめて棚卸確定（棚卸日を本日・JST）",
                 type="primary",
@@ -6962,10 +6442,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             ):
                 try:
                     with st.spinner("台帳を更新しています…"):
-                        n_ok, skips = apply_last_stocktake_jst_for_management_ids(
-                            _picked,
-                            feature_updates_by_management_id=_obs_map,
-                        )
+                        n_ok, skips = apply_last_stocktake_jst_for_management_ids(_picked)
                 except Exception as e:
                     st.error(str(e))
                 else:
@@ -6973,7 +6450,6 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                     st.session_state.pop("_stocktake_selected_mid", None)
                     st.session_state.pop("stocktake_multi_done_mids", None)
                     st.session_state.pop("stocktake_cand_page", None)
-                    st.session_state.pop(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES, None)
                     st.success(
                         f"**{n_ok}** 件の棚卸日を本日（JST）に更新しました。"
                     )
@@ -6991,17 +6467,9 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             disabled=not str(st.session_state.get("_stocktake_selected_mid") or "").strip(),
         ):
             mid = str(st.session_state.get("_stocktake_selected_mid") or "").strip()
-            _obs = ""
-            for _h in cands:
-                if str(_h.get("management_id") or "").strip() == mid:
-                    _obs = str(_h.get("feature_observation") or "").strip()
-                    break
             try:
                 with st.spinner("台帳を更新しています…"):
-                    apply_last_stocktake_jst_for_management_ids(
-                        [mid],
-                        feature_updates_by_management_id=({mid: _obs} if _obs else None),
-                    )
+                    apply_last_stocktake_jst_for_management_ids([mid])
             except Exception as e:
                 st.error(str(e))
             else:
@@ -7009,7 +6477,6 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                 st.session_state.pop("_stocktake_selected_mid", None)
                 st.session_state.pop("stocktake_multi_done_mids", None)
                 st.session_state.pop("stocktake_cand_page", None)
-                st.session_state.pop(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES, None)
                 st.success(f"管理ID **{mid}** の棚卸日を更新しました。")
                 st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
                 st.rerun()
@@ -7161,12 +6628,6 @@ def _render_sales_management_tab(
             st.rerun()
 
     if do_match and uploaded is not None:
-        _qr_mid = _extract_qr_management_id_from_image(uploaded)
-        if _qr_mid:
-            st.session_state.field_sale_source_mgmt_id = _qr_mid
-            st.success(f"QRコードから管理ID **{_qr_mid}** を読み取りました。")
-            st.session_state.pop("_sales_photo_match_card_hits", None)
-            do_match = False
         inv_ctx_sale = ""
         if df_ledger_hint is not None and not df_ledger_hint.empty:
             inv_ctx_sale = _build_gemini_inventory_context(
@@ -7188,9 +6649,6 @@ def _render_sales_management_tab(
                         prompt_mode="sale_link",
                     )
                     result = _parse_json_from_model(raw_text or "")
-                    _record_normalization_suggestions_auto_accept(
-                        _extract_normalization_suggestions_from_result(result)
-                    )
                     _apply_gemini_sale_link_to_session(
                         result,
                         df_ledger_hint,
@@ -7227,7 +6685,7 @@ def _render_sales_management_tab(
     if isinstance(_spm_hits, list) and _spm_hits:
         st.markdown("##### 写真照合の近い候補（カード）")
         st.caption(
-            "AI の商品名・個体特徴・管理IDと表記が近い **在庫中** の行です。"
+            "AI の商品名・仕入先・管理IDと表記が近い **在庫中** の行です。"
             "**この候補を販売元にする** でその管理IDへ切り替えられます。"
         )
         _render_mid_pick_candidate_cards(
@@ -7641,11 +7099,6 @@ def main():
         "写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・"
         "**inventory.csv** またはスプレッドシートへの記録ができます。"
     )
-    if qrcode is None:
-        st.info(
-            "この環境では `qrcode` が未導入のため、QR生成機能は無効です。"
-            "仕入れ・販売・棚卸しの通常機能はそのまま使えます。"
-        )
     if page == "ギャラリー（カタログ）":
         render_inventory_list_page(view_mode="gallery")
         return
@@ -7746,8 +7199,6 @@ def main():
                 st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
                 st.session_state.pop("ledger_quick_candidates", None)
                 st.session_state.pop("_gemini_match_management_id", None)
-                st.session_state.pop("_ai_distinctive_features", None)
-                st.session_state.pop("_ai_feature_profile", None)
                 st.session_state.pop("_sale_link_management_id", None)
                 st.session_state.pop("_sale_link_warn", None)
                 st.rerun()
@@ -7766,9 +7217,6 @@ def main():
                         inventory_context=inv_ctx or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
-                    _record_normalization_suggestions_auto_accept(
-                        _extract_normalization_suggestions_from_result(result)
-                    )
                     result = _apply_purchase_ledger_match_supplement(
                         result, df_ledger_hint
                     )
@@ -7796,7 +7244,6 @@ def main():
             st.write(
                 f"**推定在庫カテゴリー:** {str(st.session_state.get('field_inventory_category', '') or '').strip() or '—'}"
             )
-            st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
             mid_hit = st.session_state.get("_gemini_match_management_id")
             if mid_hit:
                 st.info(
@@ -7844,29 +7291,13 @@ def main():
         ):
             with st.expander("近い候補（写真解析・入力文字から照合・カード）", expanded=False):
                 st.caption(
-                    "Gemini で管理IDが一致しないときは、**名前＋個体特徴（カテゴリー/形状/素材/色）** → **名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
+                    "Gemini で管理IDが一致しないときは、**名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
                     "カードから選ぶと、仕入入力の必須項目へ反映されます（在庫中・販売済どちらも候補対象）。"
                 )
-                _qf = _extract_distinctive_features_from_result(
-                    {"distinctive_features": st.session_state.get("_ai_distinctive_features", [])}
-                )
-                _qprof = dict(st.session_state.get("_ai_feature_profile") or {})
                 _p_hits: list[dict[str, Any]] = []
                 for _, row in _cand.iterrows():
-                    _raw = str(row.get(COL_FEATURES, "") or "").strip()
-                    _rfs = [x.strip(" ・-\t") for x in _raw.splitlines() if x.strip()]
-                    _m = [f for f in _qf if any(f.casefold() in rf.casefold() or rf.casefold() in f.casefold() for rf in _rfs)]
-                    for _k, _v in _qprof.items():
-                        _vv = str(_v or "").strip()
-                        if _vv and _vv.casefold() in _raw.casefold() and _vv not in _m:
-                            _m.append(_vv)
-                    _miss = [f for f in _qf if f not in _m]
                     _p_hits.append(
-                        _sale_card_hit_from_series(
-                            row,
-                            matched_features=_m,
-                            missing_features=_miss,
-                        )
+                        _sale_card_hit_from_series(row)
                     )
                 _render_mid_pick_candidate_cards(
                     _p_hits,
@@ -8044,22 +7475,6 @@ def main():
                 _plan2 = int(st.session_state.get("field_planned_sale_excl", 0))
                 _stat2 = STATUS_IN_STOCK
                 memo_s = (memo or "").strip()
-                _feat_list = _extract_distinctive_features_from_result(
-                    {
-                        "distinctive_features": st.session_state.get(
-                            "_ai_distinctive_features", []
-                        )
-                    }
-                )
-                _feat_profile = dict(
-                    st.session_state.get("_ai_feature_profile") or {}
-                )
-                _feat_text = _feature_profile_to_text(_feat_profile)
-                if not _feat_text:
-                    _feat_text = (
-                        "\n".join(f"- {x}" for x in _feat_list) if _feat_list else ""
-                    )
-    
                 _rq2 = max(1, min(2000, int(st.session_state.get("field_row_quantity", 1))))
                 _icat2 = str(
                     st.session_state.get("field_inventory_category", "") or ""
@@ -8118,11 +7533,7 @@ def main():
                             with st.spinner(_spin_msg):
                                 _reg_row_dt = jst_now_str()
                                 _reg_batch: list[list[Any]] = []
-                                _qr_codes_for_ui: list[bytes] = []
                                 for i in range(n_save):
-                                    _qr_data_url = _qr_data_url_for_management_id(ids[i])
-                                    _qr_png = _qr_png_bytes_for_management_id(ids[i])
-                                    _qr_codes_for_ui.append(_qr_png)
                                     _reg_batch.append(
                                         _inventory_row_values_for_append(
                                             _reg_row_dt,
@@ -8141,8 +7552,6 @@ def main():
                                             actual_sale_unit_excl_yen=_act_ex2,
                                             stock_status=_stat2,
                                             consumption_tax_rate=_tax_r2,
-                                            features=_feat_text,
-                                            qr_code=_qr_data_url,
                                         )
                                     )
                                 _append_inventory_data_rows(_reg_batch)
@@ -8161,14 +7570,6 @@ def main():
                             _link_urls = list(dict.fromkeys(u for u in urls if u))
                             for _uurl in _link_urls[:8]:
                                 st.markdown(f"[保存した画像を開く]({_uurl})")
-                            _qr_codes_for_ui = [b for b in _qr_codes_for_ui if b]
-                            if _qr_codes_for_ui:
-                                st.caption("生成したQRコード（管理ID）")
-                                _qcols = st.columns(min(3, len(_qr_codes_for_ui)))
-                                for _qi, _qb in enumerate(_qr_codes_for_ui[:9]):
-                                    with _qcols[_qi % len(_qcols)]:
-                                        st.image(_qb, width=120)
-                                        st.caption(ids[_qi])
                             if len(_link_urls) > 8:
                                 st.caption(
                                     f"ほか {len(_link_urls) - 8} 件の画像URLは台帳の「{COL_IMAGE_URL}」列を参照してください。"
@@ -8179,7 +7580,7 @@ def main():
         _render_sales_management_tab(uploaded, df_ledger_hint)
 
     with tab_stock:
-        render_stocktake_scan_tab(df_ledger_hint)
+        render_stocktake_scan_tab(uploaded, df_ledger_hint)
 
 
 if __name__ == "__main__":
