@@ -6620,40 +6620,12 @@ def _render_sales_management_tab(
         outbound_kind == "出庫（浮貸）" and loan_target_status == STATUS_SOLD
     )
     _plain_sale = outbound_kind == "出庫（販売）"
-    c1, c2 = st.columns(2)
-    with c1:
-        do_match = st.button(
-            "AIで写真と照合",
-            type="primary",
-            disabled=uploaded is None,
-            key="sales_tab_photo_match_btn",
-        )
-    with c2:
-        if st.button("入力をクリア", key="sales_tab_clear_fields_btn"):
-            st.session_state.field_sale_source_mgmt_id = ""
-            st.session_state.field_actual_sale_excl = 0
-            st.session_state.sales_tab_memo = ""
-            st.session_state.sales_tab_loan_datetime_manual = ""
-            st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
-            st.session_state.sales_hint_filter_product_name = ""
-            st.session_state.sales_hint_filter_supplier = ""
-            st.session_state.sales_hint_filter_inventory_category = ""
-            st.session_state.sales_hint_filter_management_id = ""
-            st.session_state.sales_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
-            st.session_state.sales_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
-            st.session_state.sales_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
-            st.session_state.sales_ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
-            st.session_state.sales_assist_buf_product_name = ""
-            st.session_state.sales_assist_buf_supplier = ""
-            st.session_state.sales_assist_buf_inventory_category = ""
-            st.session_state.sales_assist_buf_management_id = ""
-            st.session_state.sales_pick_mode = "1件選択"
-            st.session_state.pop("sales_assist_quick_candidates", None)
-            st.session_state.pop("sales_assist_last_n_matching_mids", None)
-            st.session_state.pop("_sale_link_management_id", None)
-            st.session_state.pop("_sale_link_warn", None)
-            st.session_state.pop("_sales_photo_match_card_hits", None)
-            st.rerun()
+    do_match = st.button(
+        "AIで写真と照合",
+        type="primary",
+        disabled=uploaded is None,
+        key="sales_tab_photo_match_btn",
+    )
     if "sales_assist_visible" not in st.session_state:
         st.session_state.sales_assist_visible = False
     if st.button(
@@ -6663,6 +6635,31 @@ def _render_sales_management_tab(
         key="sales_assist_toggle_btn",
     ):
         st.session_state.sales_assist_visible = not st.session_state.sales_assist_visible
+        st.rerun()
+    if st.button("入力をクリア", key="sales_tab_clear_fields_btn"):
+        st.session_state.field_sale_source_mgmt_id = ""
+        st.session_state.field_actual_sale_excl = 0
+        st.session_state.sales_tab_memo = ""
+        st.session_state.sales_tab_loan_datetime_manual = ""
+        st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
+        st.session_state.sales_hint_filter_product_name = ""
+        st.session_state.sales_hint_filter_supplier = ""
+        st.session_state.sales_hint_filter_inventory_category = ""
+        st.session_state.sales_hint_filter_management_id = ""
+        st.session_state.sales_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+        st.session_state.sales_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+        st.session_state.sales_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+        st.session_state.sales_ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
+        st.session_state.sales_assist_buf_product_name = ""
+        st.session_state.sales_assist_buf_supplier = ""
+        st.session_state.sales_assist_buf_inventory_category = ""
+        st.session_state.sales_assist_buf_management_id = ""
+        st.session_state.sales_pick_mode = "1件選択"
+        st.session_state.pop("sales_assist_quick_candidates", None)
+        st.session_state.pop("sales_assist_last_n_matching_mids", None)
+        st.session_state.pop("_sale_link_management_id", None)
+        st.session_state.pop("_sale_link_warn", None)
+        st.session_state.pop("_sales_photo_match_card_hits", None)
         st.rerun()
 
     if do_match and uploaded is not None:
