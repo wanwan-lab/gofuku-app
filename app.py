@@ -749,6 +749,37 @@ def _apply_gemini_sale_link_to_session(
         or r.get("management_id")
         or ""
     ).strip()
+    if (
+        not mid
+        and df_ledger is not None
+        and not df_ledger.empty
+    ):
+        pn0 = str(
+            m.get("product_name")
+            or r.get("product_name")
+            or r.get("商品名")
+            or ""
+        ).strip()
+        su0 = str(
+            m.get("supplier")
+            or r.get("supplier")
+            or r.get("仕入先・取引先")
+            or r.get("仕入先")
+            or ""
+        ).strip()
+        fr = _single_row_fuzzy_ledger_match(
+            df_ledger, pn0, su0, only_in_stock=True, limit=14
+        )
+        if fr is not None:
+            mid = str(fr.get(COL_MANAGEMENT_ID, "") or "").strip()
+            if mid:
+                m = {
+                    **m,
+                    "management_id": mid,
+                    "confidence": max(
+                        float(m.get("confidence") or 0), 0.78
+                    ),
+                }
     conf = float(m.get("confidence") or r.get("confidence") or 0)
     row_hit: pd.Series | None = None
     if (
@@ -941,11 +972,11 @@ def analyze_image_with_gemini(
     inv_block = ""
     if inventory_context and inventory_context.strip():
         inv_block = f"""
-次のリストは、すでに台帳にある行の抜粋です（**在庫中・販売済などステータス付き**。最大約90件。写真と同一・類似の商品がありそうなら必ず照合してください）。
+次のリストは、すでに台帳にある行の抜粋です（**在庫中・販売済などステータス付き**。最大約400件。写真と同一・類似の商品がありそうなら必ず照合してください）。
 {inventory_context.strip()}
 
 照合するときは必ず "match" オブジェクトを付け、少なくとも次を含めてください:
-- "management_id" (string): 上のリストにある **在庫中** 行の **管理ID** と完全一致する値（該当がなければ ""）
+- "management_id" (string): 上のリストにある行の **管理ID** と完全一致する値。リストには **在庫中・販売済などすべてのステータス** が含まれます。**写真と同一・類似の台帳上の1行** に対応するときは、その行の管理IDを選ぶこと（仕入れの入力補助・単価参照のため。ステータスで候補を除外しない）。該当がなければ ""
 - "product_name" (string): 台帳の商品名に合わせた確定案（推測でも可）
 - "supplier" (string): 台帳の仕入先に合わせた確定案（推測でも可）
 - "line_price_excl" (integer or null): 台帳の仕入金額（税抜）と一致する整数。不明なら null
@@ -2180,12 +2211,13 @@ def _ledger_in_stock_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_gemini_inventory_context(
-    df: pd.DataFrame, *, max_lines: int = 90, only_in_stock: bool = True
+    df: pd.DataFrame, *, max_lines: int = 400, only_in_stock: bool = True
 ) -> str:
     """台帳行を短い箇条書きにし、画像照合用プロンプトへ埋め込む。
 
     ``only_in_stock=True`` … 販売照合・棚卸し用（在庫中のみ）。
     ``only_in_stock=False`` … 登録画面の AI 解析用（在庫中・販売済など全行を最大 max_lines 件）。
+    **管理IDが空の行はスキップ** し、行数上限を無駄に使わない。
     """
     if df.empty:
         return ""
@@ -2197,6 +2229,8 @@ def _build_gemini_inventory_context(
         if len(lines) >= max_lines:
             break
         mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
+        if not mid:
+            continue
         pn = str(row.get(COL_NAME, "") or "").strip().replace("\n", " ")
         su = str(row.get(COL_SUPPLIER, "") or "").strip().replace("\n", " ")
         cogs = _int_from_cell(row.get(COL_PRICE_EXCL))
@@ -2258,6 +2292,79 @@ def _fuzzy_ledger_match_rows(
     if not picked:
         return sub.iloc[:0]
     return sub.loc[picked]
+
+
+def _single_row_fuzzy_ledger_match(
+    df: pd.DataFrame | None,
+    product_name: str,
+    supplier: str,
+    *,
+    only_in_stock: bool,
+    limit: int = 12,
+) -> pd.Series | None:
+    """商品名・仕入先の近い台帳行が **1件に一意に** 定まるときだけその行を返す（AI の match 補完用）。"""
+    if df is None or df.empty:
+        return None
+    base = _ledger_in_stock_rows(df) if only_in_stock else df
+    if base.empty:
+        return None
+    pn = (product_name or "").strip()
+    su = (supplier or "").strip()
+    if not pn and not su:
+        return None
+    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=limit)
+    if cand.shape[0] != 1:
+        return None
+    row = cand.iloc[0]
+    mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
+    return row if mid else None
+
+
+def _apply_purchase_ledger_match_supplement(
+    result: dict[str, Any],
+    df_ledger: pd.DataFrame | None,
+) -> dict[str, Any]:
+    """Gemini が match.management_id を返さないとき、台帳を曖昧照合して一意なら match を補う。"""
+    if not isinstance(result, dict) or df_ledger is None or df_ledger.empty:
+        return result
+    m0 = result.get("match")
+    m = m0 if isinstance(m0, dict) else {}
+    if str(m.get("management_id") or m.get("管理ID") or "").strip():
+        return result
+    pn = str(
+        result.get("product_name")
+        or result.get("商品名")
+        or m.get("product_name")
+        or ""
+    ).strip()
+    su = str(
+        result.get("supplier")
+        or result.get("仕入先・取引先")
+        or result.get("仕入先")
+        or result.get("取引先")
+        or m.get("supplier")
+        or ""
+    ).strip()
+    row = _single_row_fuzzy_ledger_match(
+        df_ledger, pn, su, only_in_stock=False, limit=12
+    )
+    if row is None:
+        return result
+    mid0 = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
+    if not mid0:
+        return result
+    mm = dict(m) if isinstance(m0, dict) else {}
+    mm["management_id"] = mid0
+    mm["confidence"] = max(float(mm.get("confidence") or 0), 0.78)
+    ly = _finite_int(row.get(COL_PRICE_EXCL), 0)
+    if ly > 0:
+        mm["line_price_excl"] = ly
+    if COL_CATEGORY in row.index:
+        ic = str(row.get(COL_CATEGORY, "") or "").strip()
+        if ic:
+            mm["inventory_category"] = ic
+    result["match"] = mm
+    return result
 
 
 def _infer_tax_rate_from_lines_vectorized(
@@ -5916,6 +6023,9 @@ def main():
                         inventory_context=inv_ctx or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
+                    result = _apply_purchase_ledger_match_supplement(
+                        result, df_ledger_hint
+                    )
                     _apply_gemini_json_to_session(result, df_ledger_hint)
                     _refresh_ledger_quick_search_candidates(df_ledger_hint)
                     st.success(
