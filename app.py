@@ -245,9 +245,9 @@ TZ_JP = pytz.timezone("Asia/Tokyo")
 LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
 INV_GALLERY_PAGE_SIZE = 30
 STOCKTAKE_CAND_PAGE_SIZE = 5
-# 棚卸しスキャン: AI が返す候補の最大件数（UI は STOCKTAKE_CAND_PAGE_SIZE 件ずつページング）
+# 棚卸し登録: AI が返す候補の最大件数（UI は STOCKTAKE_CAND_PAGE_SIZE 件ずつページング）
 STOCKTAKE_CAND_AI_MAX = 40
-# 棚卸しスキャン: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
+# 棚卸し登録: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
 STOCKTAKE_CAND_MIN_CONFIDENCE = 0.14
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
@@ -5747,7 +5747,7 @@ def render_inventory_list_page(*, view_mode: str = "table") -> None:
             "対象リストは **`"
             + STOCKTAKE_WORK_SESSION_FILENAME
             + "`** に保存されるため、ブラウザやアプリを閉じてもリセットされません。"
-            "「今回の棚卸を開始」で在庫中の全管理IDを対象にし、棚卸しスキャンの確定・一括棚卸日・台帳保存で棚卸日を付けた行は自動でリストから外れます。"
+            "「今回の棚卸を開始」で在庫中の全管理IDを対象にし、棚卸し登録の確定・一括棚卸日・台帳保存で棚卸日を付けた行は自動でリストから外れます。"
             "残りがゼロになった時点でもセッションは終了します（全数確認済み）。手動で閉じる場合は「今回の対象リストを終了」を押してください（台帳の日付は変わりません）。"
         )
         ss1, ss2 = st.columns(2)
@@ -6083,8 +6083,8 @@ def render_stocktake_scan_tab(
     uploaded,
     df_ledger_hint: pd.DataFrame | None,
 ) -> None:
-    """棚卸しスキャン: 共通アップロード画像で AI 照合 → 棚卸日の確定更新のみ。"""
-    st.markdown("##### 棚卸しスキャン（AI 照合）")
+    """棚卸し登録: 共通アップロード画像で AI 照合 → 棚卸日の確定更新のみ。"""
+    st.markdown("##### 棚卸し登録（AI 照合）")
     st_rem_scan = _inv_stocktake_work_remaining_get()
     _scan_targets_ok = st_rem_scan is not None and len(st_rem_scan) > 0
     if not _scan_targets_ok:
@@ -6226,7 +6226,7 @@ def render_stocktake_scan_tab(
             ).strip():
                 _tsm = str(st.session_state["_stocktake_selected_mid"]).strip()
                 st.caption(f"選択中の管理ID（補助）: **{_tsm}**")
-            if st.button("棚卸入力補助の選択をクリア", key="stocktake_assist_clear_btn"):
+            if st.button("入力をクリア", key="stocktake_assist_clear_btn"):
                 st.session_state.stocktake_hint_filter_product_name = ""
                 st.session_state.stocktake_hint_filter_supplier = ""
                 st.session_state.stocktake_hint_filter_inventory_category = ""
@@ -6246,6 +6246,10 @@ def render_stocktake_scan_tab(
                 st.session_state.pop("stocktake_assist_quick_candidates", None)
                 st.session_state.pop("stocktake_assist_last_n_matching_mids", None)
                 st.session_state.pop("_stocktake_selected_mid", None)
+                st.session_state.pop("_stocktake_scan_candidates", None)
+                st.session_state.pop("stocktake_multi_done_mids", None)
+                st.session_state.pop("stocktake_cand_page", None)
+                st.session_state.pop("_stocktake_scan_warn", None)
                 st.rerun()
             _refresh_stocktake_assist_quick_candidates(df_ledger_hint, st_rem_scan)
             _stk_c = st.session_state.get("stocktake_assist_quick_candidates")
@@ -6868,7 +6872,7 @@ def _render_sales_management_tab(
                 expanded=False,
             ):
                 st.caption(
-                    "入力補助で確定した項目と表記が近い **在庫中** を表示します（棚卸しスキャンの照合と同レイアウト）。"
+                    "入力補助で確定した項目と表記が近い **在庫中** を表示します（棚卸し登録の照合と同レイアウト）。"
                 )
                 _s_hits = [_sale_card_hit_from_series(row) for _, row in _sac.iterrows()]
                 _render_mid_pick_candidate_cards(
@@ -7265,7 +7269,7 @@ def main():
     st.markdown("## 入力モード")
     st.caption("タブで入力モードを切り替えます。")
     tab_purchase, tab_sales, tab_stock = st.tabs(
-        ("仕入れ登録", "販売管理", "棚卸しスキャン")
+        ("仕入れ登録", "販売管理", "棚卸し登録")
     )
 
     with tab_purchase:
