@@ -1915,15 +1915,14 @@ def _ledger_stocktake_date_token_for_mid(df: pd.DataFrame, mid: str) -> str:
     return _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
 
 
-def _count_stocktake_today_confirmed_since_session_start(
+def _count_stocktake_confirmed_this_session(
     df: pd.DataFrame,
     origin_ids: set[str],
     start_tokens: dict[str, str],
 ) -> int:
-    """今回セッション開始時点の棚卸日と比べ、本日中（JST）に変わった在庫中の件数（同一暦日の再セッションで前回分を数えない）。"""
+    """今回セッション開始時の棚卸日と比べ、**在庫中のまま** 棚卸日が変わった件数（開始時対象 ID のみ。日付の中身は問わない）。"""
     if df.empty or not origin_ids or COL_MANAGEMENT_ID not in df.columns:
         return 0
-    today_s = _today_jst_date().isoformat()
     n = 0
     for mid in origin_ids:
         row = lookup_ledger_row_by_management_id(df, mid)
@@ -1932,25 +1931,22 @@ def _count_stocktake_today_confirmed_since_session_start(
         if _normalize_stock_status(str(row.get(COL_STOCK_STATUS, ""))) != STATUS_IN_STOCK:
             continue
         cur_tok = _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
-        if cur_tok != today_s:
-            continue
         prev_tok = start_tokens.get(mid, "")
         if cur_tok != prev_tok:
             n += 1
     return n
 
 
-def _management_ids_stocktake_today_confirmed_since_session_start(
+def _management_ids_stocktake_confirmed_this_session(
     df: pd.DataFrame,
     origin_ids: set[str],
     start_tokens: dict[str, str],
     *,
     limit: int = 24,
 ) -> list[str]:
-    """上記カウントに該当する管理ID（表示用・先頭 limit 件）。"""
+    """`_count_stocktake_confirmed_this_session` に該当する管理ID（表示用・先頭 limit 件）。"""
     if df.empty or not origin_ids or COL_MANAGEMENT_ID not in df.columns:
         return []
-    today_s = _today_jst_date().isoformat()
     out: list[str] = []
     for mid in sorted(origin_ids):
         row = lookup_ledger_row_by_management_id(df, mid)
@@ -1959,8 +1955,6 @@ def _management_ids_stocktake_today_confirmed_since_session_start(
         if _normalize_stock_status(str(row.get(COL_STOCK_STATUS, ""))) != STATUS_IN_STOCK:
             continue
         cur_tok = _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
-        if cur_tok != today_s:
-            continue
         prev_tok = start_tokens.get(mid, "")
         if cur_tok != prev_tok:
             out.append(str(mid).strip())
@@ -4836,10 +4830,8 @@ def render_inventory_list_page() -> None:
     )
     n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
     n_today_global = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
-    n_session_today_done = (
-        _count_stocktake_today_confirmed_since_session_start(
-            df_sheet, st_origin, st_snap
-        )
+    n_session_stocktake_done = (
+        _count_stocktake_confirmed_this_session(df_sheet, st_origin, st_snap)
         if st_active and st_origin
         else 0
     )
@@ -4858,11 +4850,11 @@ def render_inventory_list_page() -> None:
     sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
     sk2.metric("今回の作業でまだ未確認（在庫中）", f"{n_session_in_stock_pending:,}")
     sk3.metric(
-        "今回リストで本セッション中に今日確認済（在庫中・JST）",
-        f"{n_session_today_done:,}",
+        "今回の作業で確認済（在庫中）",
+        f"{n_session_stocktake_done:,}",
         help=(
-            "「今回の棚卸を開始」を押した時点の棚卸日と比べ、今日（JST）に変わった件数だけです。"
-            "前のセッションで今日付けした分は、新しいセッション開始後はここに含まれません。"
+            "「今回の棚卸を開始」を押した時点の棚卸日と比べ、**現在の台帳で棚卸日が変わっている在庫中** の件数です。"
+            "本日（JST）に限りません。新しいセッションを開始するとスナップショットが作り直されるため、前セッションの更新はここに含まれません。"
         ),
     )
     with sk4:
@@ -4957,13 +4949,13 @@ def render_inventory_list_page() -> None:
                 st.dataframe(sess_df[_ucols], use_container_width=True, hide_index=True)
 
     if st_active and st_origin and COL_MANAGEMENT_ID in df_sheet.columns:
-        if n_session_today_done > 0:
-            _ids_show = _management_ids_stocktake_today_confirmed_since_session_start(
+        if n_session_stocktake_done > 0:
+            _ids_show = _management_ids_stocktake_confirmed_this_session(
                 df_sheet, st_origin, st_snap, limit=18
             )
-            tail = " …" if n_session_today_done > len(_ids_show) else ""
+            tail = " …" if n_session_stocktake_done > len(_ids_show) else ""
             st.caption(
-                f"今回セッション開始後に、棚卸日が今日（JST {_today_jst_date().isoformat()}）に更新された在庫中: **{n_session_today_done}** 件。"
+                f"今回の作業セッションで棚卸日が更新された在庫中（開始時リスト由来）: **{n_session_stocktake_done}** 件。"
                 f"管理IDの例: {', '.join(_ids_show)}{tail}"
             )
     elif n_today_global > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
