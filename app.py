@@ -3523,8 +3523,8 @@ def apply_outbound_sale_to_ledger_by_management_id(
             f"管理ID {sid} は「{cur_st}」のため、販売反映の対象外です（在庫中の行のみ更新します）。"
         )
     av = _finite_int(actual_sale_unit_excl_yen, 0)
-    if av < 1:
-        raise RuntimeError("実売金額（税抜）は1円以上にしてください。")
+    if av < 0:
+        raise RuntimeError("実売金額（税抜）は0円以上にしてください。")
 
     now_exec = jst_now_str()
     _prev_row_dt = str(df_src.loc[msk, COL_DATETIME].iloc[0] or "")
@@ -6807,7 +6807,7 @@ def _render_sales_management_tab(
         key="field_actual_sale_excl",
         disabled=_loan_keep_stock,
         help=(
-            "出庫（販売）または出庫（浮貸）で **販売済** のとき必須（1円以上）。"
+            "出庫（販売）または出庫（浮貸）で **販売済** のときに使用（0円以上）。"
             "出庫（浮貸）で **在庫中** のときは不要です。"
         ),
     )
@@ -7000,8 +7000,8 @@ def _render_sales_management_tab(
         if not _sale_src_save:
             st.error("**販売する管理ID** の入力が必須です。")
             validation_ok = False
-        elif _need_actual and _act_ex2 < 1:
-            st.error("**実売金額（税抜）** を1円以上で入力してください。")
+        elif _need_actual and _act_ex2 < 0:
+            st.error("**実売金額（税抜）** を0円以上で入力してください。")
             validation_ok = False
         elif df_ledger_hint is None:
             st.error("台帳を読み込めないため、反映できません。")
