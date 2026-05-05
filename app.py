@@ -741,6 +741,7 @@ def _apply_gemini_json_to_session(
     st.session_state.ai_parse_ran = True
     feat_list = _extract_distinctive_features_from_result(r)
     st.session_state["_ai_distinctive_features"] = feat_list
+    st.session_state["_ai_feature_profile"] = _extract_feature_profile_from_result(r)
 
     ic = str(
         r.get("inventory_category")
@@ -799,8 +800,9 @@ def _apply_gemini_sale_link_to_session(
             or ""
         ).strip()
         ft0 = _extract_distinctive_features_from_result(r)
+        fp0 = _extract_feature_profile_from_result(r)
         fr = _single_row_fuzzy_ledger_match(
-            df_ledger, pn0, su0, ft0, only_in_stock=True, limit=14
+            df_ledger, pn0, su0, ft0, fp0, only_in_stock=True, limit=14
         )
         if fr is not None:
             mid = str(fr.get(COL_MANAGEMENT_ID, "") or "").strip()
@@ -1114,6 +1116,13 @@ JSON だけを返してください（説明文・コードフェンス禁止）
 - "condition" (string): 状態の推定。不明なら ""
 - "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
 - "distinctive_features" (array of string): この個体だけの識別に使える物理的特徴を3件以上（例: 染み/傷/刻印/縫い目のズレ）。短文で具体的に。
+- "feature_profile" (object): 個体特徴を次のキーで整理して返す（空文字可）:
+  - "category": 商品のカテゴリー
+  - "overall_shape": 全体の形
+  - "major_shape_feature": 大きな形状特徴（例: エンブレム）
+  - "material": 素材の違い
+  - "color": 色
+  - "other": その他の識別点
 """
     schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
@@ -2377,6 +2386,7 @@ def _fuzzy_ledger_match_rows(
     product_name: str,
     supplier: str,
     features: list[str] | None = None,
+    feature_profile: dict[str, str] | None = None,
     *,
     limit: int | None = 8,
 ) -> pd.DataFrame:
@@ -2386,7 +2396,8 @@ def _fuzzy_ledger_match_rows(
     pn = (product_name or "").strip().casefold()
     su = (supplier or "").strip().casefold()
     ft_list = [str(x or "").strip().casefold() for x in (features or []) if str(x or "").strip()]
-    if not pn and not su and not ft_list:
+    fprof = {str(k): str(v).strip().casefold() for k, v in (feature_profile or {}).items() if str(v).strip()}
+    if not pn and not su and not ft_list and not fprof:
         return df.iloc[:0]
 
     def _feature_tokens(txt: str) -> set[str]:
@@ -2399,6 +2410,8 @@ def _fuzzy_ledger_match_rows(
     q_feat_tokens: set[str] = set()
     for f in ft_list:
         q_feat_tokens.update(_feature_tokens(f))
+    for v in fprof.values():
+        q_feat_tokens.update(_feature_tokens(v))
 
     scored: list[tuple[int, float, Any]] = []
     for i, row in df.iterrows():
@@ -2410,12 +2423,17 @@ def _fuzzy_ledger_match_rows(
         row_feat_tokens = _feature_tokens(rft)
         feat_hits = len(q_feat_tokens & row_feat_tokens)
         feat_ok = feat_hits >= 1
+        profile_hits = 0
+        if fprof:
+            for _k, _v in fprof.items():
+                if _v and _v in rft_l:
+                    profile_hits += 1
         both_ok = bool(pn and su and (pn in rpn_l) and (su in rsu_l))
         name_ok = bool(pn and (pn in rpn_l))
         sup_ok = bool(su and (su in rsu_l))
-        if not (feat_ok or both_ok or name_ok or sup_ok):
+        if not (feat_ok or profile_hits > 0 or both_ok or name_ok or sup_ok):
             continue
-        if name_ok and feat_ok:
+        if name_ok and (feat_ok or profile_hits > 0):
             prio = 0
         elif both_ok:
             prio = 1
@@ -2429,7 +2447,9 @@ def _fuzzy_ledger_match_rows(
         if su:
             sim += 0.4 * difflib.SequenceMatcher(None, rsu_l, su).ratio()
         if q_feat_tokens:
-            sim += 0.85 * (feat_hits / max(1, len(q_feat_tokens)))
+            sim += 0.70 * (feat_hits / max(1, len(q_feat_tokens)))
+        if fprof:
+            sim += 0.95 * (profile_hits / max(1, len(fprof)))
         scored.append((prio, -sim, i))
 
     scored.sort(key=lambda x: (x[0], x[1], _management_id_sort_key(str(df.loc[x[2]].get(COL_MANAGEMENT_ID, "") or "").strip())))
@@ -2447,6 +2467,7 @@ def _single_row_fuzzy_ledger_match(
     product_name: str,
     supplier: str,
     features: list[str] | None = None,
+    feature_profile: dict[str, str] | None = None,
     *,
     only_in_stock: bool,
     limit: int = 12,
@@ -2461,7 +2482,9 @@ def _single_row_fuzzy_ledger_match(
     su = (supplier or "").strip()
     if not pn and not su:
         return None
-    cand = _fuzzy_ledger_match_rows(base, pn, su, features, limit=limit)
+    cand = _fuzzy_ledger_match_rows(
+        base, pn, su, features, feature_profile, limit=limit
+    )
     if cand.shape[0] != 1:
         return None
     row = cand.iloc[0]
@@ -2495,8 +2518,9 @@ def _apply_purchase_ledger_match_supplement(
         or ""
     ).strip()
     ft = _extract_distinctive_features_from_result(result)
+    fp = _extract_feature_profile_from_result(result)
     row = _single_row_fuzzy_ledger_match(
-        df_ledger, pn, su, ft, only_in_stock=False, limit=12
+        df_ledger, pn, su, ft, fp, only_in_stock=False, limit=12
     )
     if row is None:
         return result
@@ -2924,7 +2948,8 @@ def _refresh_ledger_quick_search_candidates(df_ledger: pd.DataFrame | None) -> N
     ft = _extract_distinctive_features_from_result(
         {"distinctive_features": st.session_state.get("_ai_distinctive_features", [])}
     )
-    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, ft, limit=None)
+    fp = st.session_state.get("_ai_feature_profile") or {}
+    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, ft, fp, limit=None)
     if cand.empty:
         st.session_state.pop("ledger_quick_candidates", None)
     else:
@@ -3203,7 +3228,7 @@ def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None
     if sub.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
         return
-    cand = _fuzzy_ledger_match_rows(sub, pn, su, None, limit=None)
+    cand = _fuzzy_ledger_match_rows(sub, pn, su, None, None, limit=None)
     if cand.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
     else:
@@ -3291,7 +3316,7 @@ def _refresh_stocktake_assist_quick_candidates(
         return
     pn = str(st.session_state.get("stocktake_assist_buf_product_name", "") or "").strip()
     su = str(st.session_state.get("stocktake_assist_buf_supplier", "") or "").strip()
-    cand = _fuzzy_ledger_match_rows(base, pn, su, None, limit=None)
+    cand = _fuzzy_ledger_match_rows(base, pn, su, None, None, limit=None)
     if cand.empty:
         st.session_state.pop("stocktake_assist_quick_candidates", None)
     else:
@@ -5077,6 +5102,59 @@ def _extract_distinctive_features_from_result(result: dict[str, Any]) -> list[st
     return out
 
 
+def _extract_feature_profile_from_result(result: dict[str, Any]) -> dict[str, str]:
+    """Gemini結果から特徴プロファイルを抽出（カテゴリ別）。"""
+    if not isinstance(result, dict):
+        return {}
+    src = result.get("feature_profile")
+    if not isinstance(src, dict):
+        src = {}
+    key_map = {
+        "category": ("category", "カテゴリー"),
+        "overall_shape": ("overall_shape", "全体の形"),
+        "major_shape_feature": ("major_shape_feature", "大きな形状特徴"),
+        "material": ("material", "素材"),
+        "color": ("color", "色"),
+        "other": ("other", "その他"),
+    }
+    out: dict[str, str] = {}
+    for k, aliases in key_map.items():
+        v = ""
+        for a in aliases:
+            vv = src.get(a)
+            if vv is not None and str(vv).strip():
+                v = str(vv).strip()
+                break
+        if not v and k == "category":
+            v = str(
+                result.get("inventory_category")
+                or result.get("在庫カテゴリー")
+                or ""
+            ).strip()
+        if v:
+            out[k] = v[:120]
+    return out
+
+
+def _feature_profile_to_text(profile: dict[str, str]) -> str:
+    if not profile:
+        return ""
+    labels = (
+        ("category", "カテゴリー"),
+        ("overall_shape", "全体の形"),
+        ("major_shape_feature", "大きな形状特徴"),
+        ("material", "素材"),
+        ("color", "色"),
+        ("other", "その他"),
+    )
+    lines: list[str] = []
+    for k, lb in labels:
+        v = str(profile.get(k, "") or "").strip()
+        if v:
+            lines.append(f"{lb}: {v}")
+    return "\n".join(lines)
+
+
 def _render_inventory_gallery_thumbnail(image_url: str, *, width: int, sold: bool) -> None:
     """ギャラリー用。Drive 直リンクは ``st.image(URL)`` が効かないことが多いため、取得して JPEG 化して表示する。"""
     iu = (image_url or "").strip()
@@ -5307,9 +5385,10 @@ def _sales_photo_match_card_hits_from_result(
         or ""
     ).strip()
     ft0 = _extract_distinctive_features_from_result(result)
+    fp0 = _extract_feature_profile_from_result(result)
     conf = float(m.get("confidence") or result.get("confidence") or 0)
     mid_primary = str(m.get("management_id") or "").strip()
-    cand = _fuzzy_ledger_match_rows(sub, pn0, su0, ft0, limit=None)
+    cand = _fuzzy_ledger_match_rows(sub, pn0, su0, ft0, fp0, limit=None)
     if cand.empty:
         return []
     hits: list[dict[str, Any]] = []
@@ -7419,6 +7498,7 @@ def main():
                 st.session_state.pop("ledger_quick_candidates", None)
                 st.session_state.pop("_gemini_match_management_id", None)
                 st.session_state.pop("_ai_distinctive_features", None)
+                st.session_state.pop("_ai_feature_profile", None)
                 st.session_state.pop("_sale_link_management_id", None)
                 st.session_state.pop("_sale_link_warn", None)
                 st.rerun()
@@ -7512,17 +7592,22 @@ def main():
         ):
             with st.expander("近い候補（写真解析・入力文字から照合・カード）", expanded=False):
                 st.caption(
-                    "Gemini で管理IDが一致しないときは、**名前＋個体特徴** → **名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
+                    "Gemini で管理IDが一致しないときは、**名前＋個体特徴（カテゴリー/形状/素材/色）** → **名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
                     "カードから選ぶと、仕入入力の必須項目へ反映されます（在庫中・販売済どちらも候補対象）。"
                 )
                 _qf = _extract_distinctive_features_from_result(
                     {"distinctive_features": st.session_state.get("_ai_distinctive_features", [])}
                 )
+                _qprof = dict(st.session_state.get("_ai_feature_profile") or {})
                 _p_hits: list[dict[str, Any]] = []
                 for _, row in _cand.iterrows():
                     _raw = str(row.get(COL_FEATURES, "") or "").strip()
                     _rfs = [x.strip(" ・-\t") for x in _raw.splitlines() if x.strip()]
                     _m = [f for f in _qf if any(f.casefold() in rf.casefold() or rf.casefold() in f.casefold() for rf in _rfs)]
+                    for _k, _v in _qprof.items():
+                        _vv = str(_v or "").strip()
+                        if _vv and _vv.casefold() in _raw.casefold() and _vv not in _m:
+                            _m.append(_vv)
                     _miss = [f for f in _qf if f not in _m]
                     _p_hits.append(
                         _sale_card_hit_from_series(
@@ -7714,7 +7799,14 @@ def main():
                         )
                     }
                 )
-                _feat_text = "\n".join(f"- {x}" for x in _feat_list) if _feat_list else ""
+                _feat_profile = dict(
+                    st.session_state.get("_ai_feature_profile") or {}
+                )
+                _feat_text = _feature_profile_to_text(_feat_profile)
+                if not _feat_text:
+                    _feat_text = (
+                        "\n".join(f"- {x}" for x in _feat_list) if _feat_list else ""
+                    )
     
                 _rq2 = max(1, min(2000, int(st.session_state.get("field_row_quantity", 1))))
                 _icat2 = str(
@@ -7821,6 +7913,7 @@ def main():
                                 st.caption("記録した個体特徴（デジタル指紋）:")
                                 for _f in _feat_list:
                                     st.write(f"- {_f}")
+                            _qr_codes_for_ui = [b for b in _qr_codes_for_ui if b]
                             if _qr_codes_for_ui:
                                 st.caption("生成したQRコード（管理ID）")
                                 _qcols = st.columns(min(3, len(_qr_codes_for_ui)))
