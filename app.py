@@ -248,6 +248,7 @@ TZ_JP = pytz.timezone("Asia/Tokyo")
 LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
 INV_GALLERY_PAGE_SIZE = 30
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
+SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 
@@ -613,8 +614,7 @@ def _apply_gemini_json_to_session(
         mid_hit = str(m.get("management_id") or m.get("管理ID") or "").strip()
         if mid_hit and COL_MANAGEMENT_ID in df_ledger.columns:
             mask_id = df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid_hit
-            mask_in = _mask_ledger_in_stock(df_ledger)
-            sub_hit = df_ledger.loc[mask_id & mask_in]
+            sub_hit = df_ledger.loc[mask_id]
             if len(sub_hit) == 1:
                 row_hit = sub_hit.iloc[0]
                 st.session_state["_gemini_match_management_id"] = mid_hit
@@ -921,7 +921,7 @@ def analyze_image_with_gemini(
     inv_block = ""
     if inventory_context and inventory_context.strip():
         inv_block = f"""
-次のリストは、すでに台帳にある **在庫中** の行の抜粋です（**販売済は含みません**。最大約90件。写真と同一・類似の商品がありそうなら必ず照合してください）。
+次のリストは、すでに台帳にある行の抜粋です（**在庫中・販売済などステータス付き**。最大約90件。写真と同一・類似の商品がありそうなら必ず照合してください）。
 {inventory_context.strip()}
 
 照合するときは必ず "match" オブジェクトを付け、少なくとも次を含めてください:
@@ -1796,9 +1796,17 @@ def _ledger_in_stock_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[_mask_ledger_in_stock(df)].copy()
 
 
-def _build_gemini_inventory_context(df: pd.DataFrame, *, max_lines: int = 90) -> str:
-    """在庫中の行だけを短い箇条書きにし、画像照合用プロンプトへ埋め込む。"""
-    sub = _ledger_in_stock_rows(df)
+def _build_gemini_inventory_context(
+    df: pd.DataFrame, *, max_lines: int = 90, only_in_stock: bool = True
+) -> str:
+    """台帳行を短い箇条書きにし、画像照合用プロンプトへ埋め込む。
+
+    ``only_in_stock=True`` … 販売照合・棚卸し用（在庫中のみ）。
+    ``only_in_stock=False`` … 登録画面の AI 解析用（在庫中・販売済など全行を最大 max_lines 件）。
+    """
+    if df.empty:
+        return ""
+    sub = _ledger_in_stock_rows(df) if only_in_stock else df
     if sub.empty:
         return ""
     lines: list[str] = []
@@ -1809,11 +1817,15 @@ def _build_gemini_inventory_context(df: pd.DataFrame, *, max_lines: int = 90) ->
         pn = str(row.get(COL_NAME, "") or "").strip().replace("\n", " ")
         su = str(row.get(COL_SUPPLIER, "") or "").strip().replace("\n", " ")
         cogs = _int_from_cell(row.get(COL_PRICE_EXCL))
+        st_lbl = ""
+        if COL_STOCK_STATUS in row.index:
+            st_lbl = _normalize_stock_status(str(row.get(COL_STOCK_STATUS, "") or ""))
+        st_seg = f" 状態={json.dumps(st_lbl, ensure_ascii=False)}" if st_lbl else ""
         lines.append(
             f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
             f"商品名={json.dumps(pn, ensure_ascii=False)} "
             f"仕入先={json.dumps(su, ensure_ascii=False)} "
-            f"仕入金額税抜={cogs}"
+            f"仕入金額税抜={cogs}{st_seg}"
         )
     return "\n".join(lines)
 
@@ -1825,10 +1837,10 @@ def _fuzzy_ledger_match_rows(
     *,
     limit: int = 8,
 ) -> pd.DataFrame:
-    """在庫中の行から、商品名・仕入先の近い候補を返す（写真解析後の補助）。"""
-    sub = _ledger_in_stock_rows(df)
-    if sub.empty:
-        return sub.iloc[:0]
+    """台帳の全行から、商品名・仕入先の近い候補を返す（写真解析後の補助。ステータスは問わない）。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    sub = df
     pn = (product_name or "").strip().casefold()
     su = (supplier or "").strip().casefold()
     if not pn and not su:
@@ -4015,18 +4027,35 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         "**棚卸を確定** でその行の「最後に確認した日付（棚卸日）」だけを **本日（JST）** に更新します（新規行は追加しません）。"
     )
     cam = st.camera_input("現物を撮影", key="stocktake_camera_input")
+    if cam is not None:
+        st.session_state[SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES] = cam.getvalue()
+    elif st.session_state.get(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES):
+        st.caption("直前に撮影した画像（**AIで台帳と照合** にそのまま使われます）")
+        st.image(
+            st.session_state[SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES],
+            width=320,
+        )
+
     if st.button("AIで台帳と照合", type="primary", key="stocktake_ai_match_btn"):
         st.session_state.pop("_stocktake_scan_result", None)
         st.session_state.pop("_stocktake_scan_warn", None)
-        if cam is None:
-            st.session_state["_stocktake_scan_warn"] = "先にカメラで撮影してください。"
+        img_b = (
+            cam.getvalue()
+            if cam is not None
+            else st.session_state.get(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES)
+        )
+        if not img_b:
+            st.session_state["_stocktake_scan_warn"] = (
+                "先にカメラで撮影するか、直前に保存した撮影データがありません。"
+            )
         elif df_ledger_hint is None or df_ledger_hint.empty:
             st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
         else:
             with st.spinner("画像を解析して台帳と照合しています…"):
                 try:
-                    inv_ctx = _build_gemini_inventory_context(df_ledger_hint)
-                    img_b = cam.getvalue()
+                    inv_ctx = _build_gemini_inventory_context(
+                        df_ledger_hint, only_in_stock=True
+                    )
 
                     class _CamBytes:
                         __slots__ = ("_b",)
@@ -4079,7 +4108,6 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                             }
                 except Exception as e:
                     st.session_state["_stocktake_scan_warn"] = str(e)
-        st.rerun()
 
     wn = st.session_state.pop("_stocktake_scan_warn", None)
     if wn:
@@ -4117,6 +4145,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                     st.error(str(e))
                 else:
                     st.session_state.pop("_stocktake_scan_result", None)
+                    st.session_state.pop(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES, None)
                     st.success(f"管理ID **{mid}** の棚卸日を更新しました。")
                     st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
                     st.rerun()
@@ -4227,7 +4256,9 @@ def _render_sales_management_tab(
                 img = _gemini_input_image_from_upload(uploaded)
                 inv_ctx = ""
                 if df_ledger_hint is not None and not df_ledger_hint.empty:
-                    inv_ctx = _build_gemini_inventory_context(df_ledger_hint)
+                    inv_ctx = _build_gemini_inventory_context(
+                        df_ledger_hint, only_in_stock=True
+                    )
                 raw_text = analyze_image_with_gemini(
                     img,
                     inventory_context=inv_ctx or None,
@@ -4670,7 +4701,7 @@ def main():
         st.markdown("##### クイック検索（写真から検索）")
         st.caption(
             "**AIで画像を解析** で商品名・柄色などを推定しつつ在庫中と照合します。"
-            "解析後は下の「在庫中の近い候補」も併せて確認してください。"
+            "解析後は下の「近い候補」も併せて確認してください。"
         )
 
         movement = st.radio(
@@ -4719,7 +4750,9 @@ def main():
                     img = _gemini_input_image_from_upload(uploaded)
                     inv_ctx = ""
                     if df_ledger_hint is not None and not df_ledger_hint.empty:
-                        inv_ctx = _build_gemini_inventory_context(df_ledger_hint)
+                        inv_ctx = _build_gemini_inventory_context(
+                            df_ledger_hint, only_in_stock=False
+                        )
                     raw_text = analyze_image_with_gemini(
                         img,
                         inventory_context=inv_ctx or None,
@@ -4813,9 +4846,9 @@ def main():
             and not _cand.empty
             and df_ledger_hint is not None
         ):
-            with st.expander("在庫中の近い候補（写真解析・入力文字から照合）", expanded=False):
+            with st.expander("近い候補（写真解析・入力文字から照合）", expanded=False):
                 st.caption(
-                    "商品名・仕入先の表記が近い **在庫中** の行を最大8件表示しています。"
+                    "商品名・仕入先の表記が近い台帳行を最大8件表示しています（**在庫中・販売済** などステータスは問いません）。"
                     "上の「台帳から入力補助」で同じ文言を選ぶか、管理IDを手元で確認して台帳一覧と突き合わせてください。"
                 )
                 _show_cols = [
@@ -4824,6 +4857,7 @@ def main():
                         COL_MANAGEMENT_ID,
                         COL_NAME,
                         COL_SUPPLIER,
+                        COL_STOCK_STATUS,
                         COL_PRICE_EXCL,
                         COL_PLANNED_SALE,
                         COL_LAST_STOCKTAKE,
