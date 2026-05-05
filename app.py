@@ -268,10 +268,36 @@ SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 STOCKTAKE_WORK_SESSION_FILENAME = "stocktake_work_session.json"
 # 分析ダッシュボード: 商品名＋仕入先をキーにしたカテゴリー推定キャッシュ（.gitignore の *.json でコミットされない想定）
 INVENTORY_CATEGORY_CACHE_FILENAME = "inventory_category_cache.json"
+NORMALIZATION_DICTIONARY_FILENAME = "normalization_dictionary.json"
+NORMALIZATION_PENDING_FILENAME = "normalization_pending.json"
+NORMALIZATION_AUTO_ACCEPT_MIN_CONFIDENCE = 0.90
+NORMALIZATION_AUTO_ACCEPT_MIN_COUNT = 5
 # 移行前の session_state キー（読み込み時にファイルへ移す）
 _SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY = "_inv_stocktake_work_remaining_mids"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
+
+_NORMALIZATION_BASE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("アイボリー", "ベージュ"),
+    ("生成り", "ベージュ"),
+    ("きなり", "ベージュ"),
+    ("オフホワイト", "ホワイト"),
+    ("白色", "ホワイト"),
+    ("黒色", "ブラック"),
+    ("灰色", "グレー"),
+    ("ねずみ", "グレー"),
+    ("紺", "ネイビー"),
+    ("ベースボールキャップ型", "ベースボールキャップ"),
+    ("キャップ型", "キャップ"),
+    ("フラットに近い", "フラット"),
+    ("つば", "バイザー"),
+    ("コンビネーション", "コンビ"),
+    ("メッシュ素材", "メッシュ"),
+    ("布地", "布"),
+    ("立体刺繍", "刺繍"),
+    ("ロゴ刺繍", "刺繍"),
+    ("エンブレム", "ロゴ"),
+)
 
 # 写真→台帳照合（仕入 AI・棚卸し・販売の写真紐付け）向け。和装専門店以外・雑貨・アパレルでも迷いにくくする。
 _GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA = """
@@ -787,12 +813,19 @@ def _apply_gemini_sale_link_to_session(
         and not df_ledger.empty
     ):
         pn0 = str(
+            m.get("normalized_name")
+            or r.get("normalized_name")
+            or r.get("normalized_product_name")
+            or
             m.get("product_name")
             or r.get("product_name")
             or r.get("商品名")
             or ""
         ).strip()
         su0 = str(
+            m.get("normalized_supplier")
+            or r.get("normalized_supplier")
+            or
             m.get("supplier")
             or r.get("supplier")
             or r.get("仕入先・取引先")
@@ -801,6 +834,9 @@ def _apply_gemini_sale_link_to_session(
         ).strip()
         ft0 = _extract_distinctive_features_from_result(r)
         fp0 = _extract_feature_profile_from_result(r)
+        nfp0 = r.get("normalized_feature_profile")
+        if isinstance(nfp0, dict):
+            fp0 = {**fp0, **{str(k): str(v) for k, v in nfp0.items() if str(v).strip()}}
         fr = _single_row_fuzzy_ledger_match(
             df_ledger, pn0, su0, ft0, fp0, only_in_stock=True, limit=14
         )
@@ -1070,6 +1106,7 @@ def analyze_image_with_gemini(
   各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
 
 任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
+        prompt += "\n任意: normalization_suggestions（表記ゆれ正規化提案の配列）"
         response = model.generate_content([prompt, subject])
         return response.text or ""
 
@@ -1097,6 +1134,9 @@ JSON だけを返してください（説明文・コードフェンス禁止）
   - "line_price_excl" (integer or null): 選んだ行の仕入金額（税抜）を台帳どおり（**写真と金額が一致するかで行を決めない**）。不明なら null
   - "feature_observation" (string): 現在画像で確認できた個体特徴（メモ追記用）。なければ ""
 
+任意:
+- "normalization_suggestions" (array): 表記ゆれ正規化の提案。
+
 該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
         response = model.generate_content([prompt, subject])
         return response.text or ""
@@ -1123,6 +1163,11 @@ JSON だけを返してください（説明文・コードフェンス禁止）
   - "material": 素材の違い
   - "color": 色
   - "other": その他の識別点
+- "normalized_name" (string): 照合用に正規化した商品名（表記ゆれを吸収）
+- "normalized_supplier" (string): 照合用に正規化した仕入先
+- "normalized_feature_profile" (object): feature_profile と同じキーで、照合用の正規化値
+- "normalization_suggestions" (array): 任意。辞書追加候補を返す。
+  各要素は {"source": "...", "normalized": "...", "type": "color|shape|material|feature|supplier|other", "confidence": 0.0-1.0}
 """
     schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
@@ -2393,15 +2438,37 @@ def _fuzzy_ledger_match_rows(
     """台帳候補を返す（優先順: 名前+特徴 → 名前+仕入先 → 名前 → 仕入先）。"""
     if df is None or df.empty:
         return pd.DataFrame()
+    learned = _normalization_dictionary_load()
+    learned_pairs = tuple((k, v) for k, v in learned.items() if k and v)
+    norm_pairs: tuple[tuple[str, str], ...] = _NORMALIZATION_BASE_REPLACEMENTS + learned_pairs
+
+    def _normalize_for_match(txt: str) -> str:
+        s = (txt or "").strip().casefold()
+        if not s:
+            return ""
+        for src, dst in norm_pairs:
+            s = s.replace(src.casefold(), dst.casefold())
+        return s
+
     pn = (product_name or "").strip().casefold()
     su = (supplier or "").strip().casefold()
-    ft_list = [str(x or "").strip().casefold() for x in (features or []) if str(x or "").strip()]
-    fprof = {str(k): str(v).strip().casefold() for k, v in (feature_profile or {}).items() if str(v).strip()}
+    pn = _normalize_for_match(pn)
+    su = _normalize_for_match(su)
+    ft_list = [
+        _normalize_for_match(str(x or ""))
+        for x in (features or [])
+        if str(x or "").strip()
+    ]
+    fprof = {
+        str(k): _normalize_for_match(str(v))
+        for k, v in (feature_profile or {}).items()
+        if str(v).strip()
+    }
     if not pn and not su and not ft_list and not fprof:
         return df.iloc[:0]
 
     def _feature_tokens(txt: str) -> set[str]:
-        s = (txt or "").strip().casefold()
+        s = _normalize_for_match(txt or "")
         if not s:
             return set()
         parts = re.split(r"[\s,;:/|・、。\n\t=\-()\[\]{}]+", s)
@@ -2418,9 +2485,9 @@ def _fuzzy_ledger_match_rows(
         rpn = str(row.get(COL_NAME, "") or "").strip()
         rsu = str(row.get(COL_SUPPLIER, "") or "").strip()
         rft = str(row.get(COL_FEATURES, "") or "").strip()
-        rpn_l = rpn.casefold()
-        rsu_l = rsu.casefold()
-        rft_l = rft.casefold()
+        rpn_l = _normalize_for_match(rpn)
+        rsu_l = _normalize_for_match(rsu)
+        rft_l = _normalize_for_match(rft)
         row_feat_tokens = _feature_tokens(rft)
         feat_hits = len(q_feat_tokens & row_feat_tokens)
         feat_ok = feat_hits >= 1
@@ -2505,12 +2572,19 @@ def _apply_purchase_ledger_match_supplement(
     if str(m.get("management_id") or m.get("管理ID") or "").strip():
         return result
     pn = str(
+        result.get("normalized_name")
+        or result.get("normalized_product_name")
+        or result.get("normalized_product")
+        or
         result.get("product_name")
         or result.get("商品名")
         or m.get("product_name")
         or ""
     ).strip()
     su = str(
+        result.get("normalized_supplier")
+        or result.get("normalized_vendor")
+        or
         result.get("supplier")
         or result.get("仕入先・取引先")
         or result.get("仕入先")
@@ -2520,6 +2594,9 @@ def _apply_purchase_ledger_match_supplement(
     ).strip()
     ft = _extract_distinctive_features_from_result(result)
     fp = _extract_feature_profile_from_result(result)
+    nfp = result.get("normalized_feature_profile")
+    if isinstance(nfp, dict):
+        fp = {**fp, **{str(k): str(v) for k, v in nfp.items() if str(v).strip()}}
     row = _single_row_fuzzy_ledger_match(
         df_ledger, pn, su, ft, fp, only_in_stock=False, limit=12
     )
@@ -4541,6 +4618,80 @@ def _inventory_category_cache_path() -> Path:
     return Path(__file__).resolve().parent / INVENTORY_CATEGORY_CACHE_FILENAME
 
 
+def _normalization_dictionary_path() -> Path:
+    return Path(__file__).resolve().parent / NORMALIZATION_DICTIONARY_FILENAME
+
+
+def _normalization_pending_path() -> Path:
+    return Path(__file__).resolve().parent / NORMALIZATION_PENDING_FILENAME
+
+
+def _normalization_dictionary_load() -> dict[str, str]:
+    p = _normalization_dictionary_path()
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        ks = str(k).strip()
+        vs = str(v).strip()
+        if ks and vs:
+            out[ks] = vs
+    return out
+
+
+def _normalization_dictionary_write(mapping: dict[str, str]) -> None:
+    p = _normalization_dictionary_path()
+    data = {k: mapping[k] for k in sorted(mapping.keys())}
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(p)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _normalization_pending_load() -> dict[str, dict[str, Any]]:
+    p = _normalization_pending_path()
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            out[str(k)] = dict(v)
+    return out
+
+
+def _normalization_pending_write(mapping: dict[str, dict[str, Any]]) -> None:
+    p = _normalization_pending_path()
+    data = {k: mapping[k] for k in sorted(mapping.keys())}
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(p)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
 def _inventory_category_cache_key(product_name: str, supplier: str = "") -> str:
     """商品名＋仕入先でキャッシュ参照用のキー（大小・前後空白は正規化）。"""
     n = (product_name or "").strip()
@@ -5137,6 +5288,82 @@ def _extract_feature_profile_from_result(result: dict[str, Any]) -> dict[str, st
     return out
 
 
+def _extract_normalization_suggestions_from_result(
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return []
+    raw = result.get("normalization_suggestions")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        src = str(it.get("source") or "").strip()
+        dst = str(it.get("normalized") or "").strip()
+        typ = str(it.get("type") or "other").strip()[:40]
+        try:
+            cf = float(it.get("confidence") or 0)
+        except (TypeError, ValueError):
+            cf = 0.0
+        if not src or not dst or src == dst:
+            continue
+        out.append(
+            {
+                "source": src[:120],
+                "normalized": dst[:120],
+                "type": typ,
+                "confidence": max(0.0, min(1.0, cf)),
+            }
+        )
+    return out
+
+
+def _record_normalization_suggestions_auto_accept(
+    suggestions: list[dict[str, Any]],
+) -> int:
+    """AI提案を pending に蓄積し、条件達成時に辞書へ自動採用する。"""
+    if not suggestions:
+        return 0
+    pending = _normalization_pending_load()
+    dictionary = _normalization_dictionary_load()
+    accepted = 0
+    for s in suggestions:
+        src = str(s.get("source") or "").strip()
+        dst = str(s.get("normalized") or "").strip()
+        typ = str(s.get("type") or "other").strip()
+        cf = float(s.get("confidence") or 0)
+        if not src or not dst or src == dst:
+            continue
+        # 固有識別系は誤学習を避けるため自動採用対象外
+        if re.search(r"(管理id|g\d{4,}|型番|sku|jan|barcode)", src, re.I):
+            continue
+        key = f"{src}\t{dst}\t{typ}"
+        rec = pending.get(key) or {
+            "source": src,
+            "normalized": dst,
+            "type": typ,
+            "count": 0,
+            "max_confidence": 0.0,
+        }
+        rec["count"] = int(rec.get("count") or 0) + 1
+        rec["max_confidence"] = max(float(rec.get("max_confidence") or 0), cf)
+        pending[key] = rec
+        if (
+            float(rec["max_confidence"]) >= NORMALIZATION_AUTO_ACCEPT_MIN_CONFIDENCE
+            and int(rec["count"]) >= NORMALIZATION_AUTO_ACCEPT_MIN_COUNT
+        ):
+            cur = dictionary.get(src, "")
+            if not cur:
+                dictionary[src] = dst
+                accepted += 1
+    _normalization_pending_write(pending)
+    if accepted > 0:
+        _normalization_dictionary_write(dictionary)
+    return accepted
+
+
 def _feature_profile_to_text(profile: dict[str, str]) -> str:
     if not profile:
         return ""
@@ -5373,12 +5600,19 @@ def _sales_photo_match_card_hits_from_result(
     if not isinstance(m, dict):
         m = {}
     pn0 = str(
+        m.get("normalized_name")
+        or result.get("normalized_name")
+        or result.get("normalized_product_name")
+        or
         m.get("product_name")
         or result.get("product_name")
         or result.get("商品名")
         or ""
     ).strip()
     su0 = str(
+        m.get("normalized_supplier")
+        or result.get("normalized_supplier")
+        or
         m.get("supplier")
         or result.get("supplier")
         or result.get("仕入先・取引先")
@@ -5387,6 +5621,9 @@ def _sales_photo_match_card_hits_from_result(
     ).strip()
     ft0 = _extract_distinctive_features_from_result(result)
     fp0 = _extract_feature_profile_from_result(result)
+    nfp0 = result.get("normalized_feature_profile")
+    if isinstance(nfp0, dict):
+        fp0 = {**fp0, **{str(k): str(v) for k, v in nfp0.items() if str(v).strip()}}
     conf = float(m.get("confidence") or result.get("confidence") or 0)
     mid_primary = str(m.get("management_id") or "").strip()
     cand = _fuzzy_ledger_match_rows(sub, pn0, su0, ft0, fp0, limit=None)
@@ -6523,6 +6760,9 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                             prompt_mode="stocktake_match",
                         )
                         res = _parse_json_from_model(raw or "")
+                        _record_normalization_suggestions_auto_accept(
+                            _extract_normalization_suggestions_from_result(res)
+                        )
                         if not isinstance(res, dict):
                             res = {}
                         cand_list = _stocktake_candidates_from_gemini_response(
@@ -6943,6 +7183,9 @@ def _render_sales_management_tab(
                         prompt_mode="sale_link",
                     )
                     result = _parse_json_from_model(raw_text or "")
+                    _record_normalization_suggestions_auto_accept(
+                        _extract_normalization_suggestions_from_result(result)
+                    )
                     _apply_gemini_sale_link_to_session(
                         result,
                         df_ledger_hint,
@@ -7518,6 +7761,9 @@ def main():
                         inventory_context=inv_ctx or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
+                    _record_normalization_suggestions_auto_accept(
+                        _extract_normalization_suggestions_from_result(result)
+                    )
                     result = _apply_purchase_ledger_match_supplement(
                         result, df_ledger_hint
                     )
