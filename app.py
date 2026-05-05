@@ -81,6 +81,12 @@ import requests
 import streamlit as st
 from google.oauth2 import service_account
 from PIL import Image, ImageOps
+import qrcode
+
+try:
+    from pyzbar.pyzbar import decode as _pyzbar_decode
+except Exception:
+    _pyzbar_decode = None
 
 # --- スプレッドシート列・税率（app 単体で完結：サブモジュール未コミットでも Cloud で動く） ---
 COL_DATETIME = "日時"
@@ -101,8 +107,10 @@ COL_GROSS_PROFIT = "粗利"
 COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
 COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
+COL_FEATURES = "個体特徴（デジタル指紋）"
 COL_CATEGORY = "在庫カテゴリー"
 COL_MANAGEMENT_ID = "管理ID"
+COL_QR_CODE = "QRコード"
 COL_LAST_STOCKTAKE = "最後に確認した日付（棚卸日）"
 COL_LOAN_DATETIME = "浮貸日時"
 # 証憑取込（recorded_at / evidence_url に相当）
@@ -144,9 +152,11 @@ EXPECTED_HEADERS: list[str] = [
     COL_GROSS_PROFIT,
     COL_STOCK_STATUS,
     COL_MEMO,
+    COL_FEATURES,
     COL_CATEGORY,
     COL_IMAGE_URL,
     COL_MANAGEMENT_ID,
+    COL_QR_CODE,
     COL_LAST_STOCKTAKE,
     COL_VOUCHER_RECORDED_AT,
     COL_VOUCHER_EVIDENCE_URL,
@@ -726,6 +736,15 @@ def _apply_gemini_json_to_session(
         vf = " / ".join(str(p) for p in parts)
     st.session_state.ai_features = str(vf or "")
     st.session_state.ai_parse_ran = True
+    feat_list = _extract_distinctive_features_from_result(r)
+    st.session_state["_ai_distinctive_features"] = feat_list
+    if feat_list:
+        existing_memo = str(st.session_state.get("field_memo", "") or "").strip()
+        blk = _memo_features_block(feat_list)
+        if blk and blk not in existing_memo:
+            st.session_state.field_memo = (
+                existing_memo + ("\n" if existing_memo else "") + blk
+            )
 
     ic = str(
         r.get("inventory_category")
@@ -1035,6 +1054,7 @@ def analyze_image_with_gemini(
 次の **続きのテキスト** に示すリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定します（販売済は含みません。リスト外の管理IDは返さない）。
 同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
 **どの行が写真の品かは、金額の一致では判断しない**（商品名・メモ・カテゴリー・仕入先・タグ・色形などで推測する）。
+とくに各行メモ内の「個体特徴（染み・傷・刻印・縫い目・ほつれ）」と、現在画像に見える特徴が一致するかを最優先で評価する。
 **リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
 ---
 {inv_stripped}
@@ -1045,6 +1065,7 @@ def analyze_image_with_gemini(
   - "confidence" (number): 0.0〜1.0（写真と同一在庫である確信度。表示順はアプリ側で管理IDの昇順に整列する）
   - "product_name" (string): その行の商品名（参考）
   - "supplier" (string): その行の仕入先（参考）
+  - "feature_observation" (string): この画像で見えた個体特徴（染み/傷/刻印/縫い目等）。メモに追記できる短文。なければ ""
   該当が1件も無いときは空配列 []。
   迷う場合は複数入れてよい（confidence が低いものも列挙してよい。ただし無関係な行は入れない）。
   各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
@@ -1063,6 +1084,7 @@ def analyze_image_with_gemini(
 {_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
 
 次の **続きのテキスト** のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。**行の選定に金額の一致は使わない。** 必ずこのリストの中からだけ management_id を選べ。
+各行のメモに記録された「個体特徴（染み・傷・刻印・縫い目等）」が現在画像でも確認できるかを最優先の根拠として一致判定する。
 JSON だけを返してください（説明文・コードフェンス禁止）。
 ---
 {inv_stripped}
@@ -1074,6 +1096,7 @@ JSON だけを返してください（説明文・コードフェンス禁止）
   - "product_name" (string): その行の商品名（参考）
   - "supplier" (string): その行の仕入先（参考）
   - "line_price_excl" (integer or null): 選んだ行の仕入金額（税抜）を台帳どおり（**写真と金額が一致するかで行を決めない**）。不明なら null
+  - "feature_observation" (string): 現在画像で確認できた個体特徴（メモ追記用）。なければ ""
 
 該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
         response = model.generate_content([prompt, subject])
@@ -1093,6 +1116,7 @@ JSON だけを返してください（説明文・コードフェンス禁止）
 - "material" (string): 素材の推定。不明なら ""
 - "condition" (string): 状態の推定。不明なら ""
 - "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
+- "distinctive_features" (array of string): この個体だけの識別に使える物理的特徴を3件以上（例: 染み/傷/刻印/縫い目のズレ）。短文で具体的に。
 """
     schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
@@ -2311,11 +2335,18 @@ def _inventory_line_text_for_gemini_prompt(row: pd.Series) -> str:
             if len(memo) > 56:
                 memo = memo[:53] + "…"
             memo_seg = f" メモ={json.dumps(memo, ensure_ascii=False)}"
+    feat_seg = ""
+    if COL_FEATURES in row.index:
+        feat = str(row.get(COL_FEATURES, "") or "").strip().replace("\n", " ")
+        if feat:
+            if len(feat) > 72:
+                feat = feat[:69] + "…"
+            feat_seg = f" 個体特徴={json.dumps(feat, ensure_ascii=False)}"
     return (
         f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
         f"商品名={json.dumps(pn, ensure_ascii=False)} "
         f"仕入先={json.dumps(su, ensure_ascii=False)}"
-        f"{st_seg}{cat_seg}{memo_seg}"
+        f"{st_seg}{cat_seg}{memo_seg}{feat_seg}"
     )
 
 
@@ -2649,6 +2680,8 @@ def _inventory_row_values_for_append(
     loan_datetime: str = "",
     voucher_recorded_at: str = "",
     voucher_evidence_url: str = "",
+    features: str = "",
+    qr_code: str = "",
 ) -> list[Any]:
     """台帳 EXPECTED_HEADERS 順の1行分セル値を組み立てる（追記用）。"""
     cogs = _finite_int(line_price_excl_yen, 0)
@@ -2698,9 +2731,11 @@ def _inventory_row_values_for_append(
         gross_cell,
         stt,
         memo,
+        (features or "").strip(),
         (inventory_category or "").strip(),
         image_url,
         management_id,
+        (qr_code or "").strip(),
         "",
         (voucher_recorded_at or "").strip(),
         (voucher_evidence_url or "").strip(),
@@ -3601,6 +3636,8 @@ def apply_outbound_loan_in_stock_datetime_by_management_id(
 
 def apply_last_stocktake_jst_for_management_ids(
     management_ids: Iterable[str],
+    *,
+    feature_updates_by_management_id: dict[str, str] | None = None,
 ) -> tuple[int, list[str]]:
     """複数の在庫中の行について棚卸日を本日（JST）にし、1回の読込・保存で反映する。
 
@@ -3634,6 +3671,15 @@ def apply_last_stocktake_jst_for_management_ids(
             continue
         if COL_LAST_STOCKTAKE in df_src.columns:
             df_src.loc[msk, COL_LAST_STOCKTAKE] = today_s
+        if feature_updates_by_management_id:
+            obs = str(feature_updates_by_management_id.get(sid, "") or "").strip()
+            if obs:
+                tag = f"[{today_s} 棚卸し時] {obs}"
+                old_memo = str(df_src.loc[msk, COL_MEMO].iloc[0] or "").strip()
+                if tag not in old_memo:
+                    df_src.loc[msk, COL_MEMO] = (
+                        old_memo + ("\n" if old_memo else "") + tag
+                    )
         df_src.loc[msk, COL_DATETIME] = now_exec
         updated.add(sid)
     if not updated:
@@ -4936,6 +4982,85 @@ def _google_drive_file_id_from_url(url: str) -> str | None:
     return None
 
 
+def _qr_png_bytes_for_management_id(management_id: str) -> bytes:
+    """管理ID文字列をQR(PNG)化して返す。"""
+    data = str(management_id or "").strip()
+    if not data:
+        return b""
+    img = qrcode.make(data)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _qr_data_url_for_management_id(management_id: str) -> str:
+    """管理IDのQRを data URL 形式で返す（シート保存用）。"""
+    b = _qr_png_bytes_for_management_id(management_id)
+    if not b:
+        return ""
+    return "data:image/png;base64," + base64.b64encode(b).decode("ascii")
+
+
+def _extract_qr_management_id_from_image(image_data: Any) -> str:
+    """画像からQRを読み、G######## 形式の管理IDを返す（無ければ空）。"""
+    if _pyzbar_decode is None:
+        return ""
+    try:
+        im = _pil_image_for_gemini(image_data)
+        decoded = _pyzbar_decode(im)
+    except Exception:
+        return ""
+    for d in decoded or []:
+        try:
+            txt = d.data.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            txt = ""
+        if re.fullmatch(r"(?i)G\d{8}", txt):
+            return txt.upper()
+    return ""
+
+
+def _extract_distinctive_features_from_result(result: dict[str, Any]) -> list[str]:
+    """Gemini結果から個体特徴を抽出（3件まで）。"""
+    if not isinstance(result, dict):
+        return []
+    raw = result.get("distinctive_features")
+    feats: list[str] = []
+    if isinstance(raw, list):
+        for v in raw:
+            s = str(v or "").strip()
+            if s:
+                feats.append(s)
+    if not feats:
+        alt = str(
+            result.get("feature_note")
+            or result.get("feature_notes")
+            or result.get("個体特徴")
+            or ""
+        ).strip()
+        if alt:
+            feats = [x.strip(" ・-\t") for x in re.split(r"[\n;,、]+", alt) if x.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for f in feats:
+        if f in seen:
+            continue
+        seen.add(f)
+        out.append(f[:120])
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _memo_features_block(features: list[str]) -> str:
+    if not features:
+        return ""
+    lines = ["[個体特徴/仕入時]"]
+    for f in features[:6]:
+        lines.append(f"- {f}")
+    return "\n".join(lines)
+
+
 def _render_inventory_gallery_thumbnail(image_url: str, *, width: int, sold: bool) -> None:
     """ギャラリー用。Drive 直リンクは ``st.image(URL)`` が効かないことが多いため、取得して JPEG 化して表示する。"""
     iu = (image_url or "").strip()
@@ -5002,6 +5127,8 @@ def _sale_card_hit_from_series(
         "inventory_category": str(row.get(COL_CATEGORY, "") or "").strip(),
         "line_price_excl": _finite_int(row.get(COL_PRICE_EXCL), 0),
         "planned_sale_excl": _finite_int(row.get(COL_PLANNED_SALE), 0),
+        "memo": str(row.get(COL_MEMO, "") or "").strip(),
+        "features": str(row.get(COL_FEATURES, "") or "").strip(),
         "image_url": str(row.get(COL_IMAGE_URL, "") or "").strip(),
         "confidence": confidence,
         "last_stocktake": str(row.get(COL_LAST_STOCKTAKE, "") or "").strip()
@@ -5078,6 +5205,16 @@ def _render_mid_pick_candidate_cards(
                 lst = str(hit.get("last_stocktake") or "").strip()
                 if lst:
                     st.write(f"**前回の棚卸日:** {lst}")
+                feat_text = str(
+                    hit.get("features")
+                    or hit.get("memo")
+                    or ""
+                ).strip()
+                if feat_text:
+                    st.markdown("**登録時の特徴点:**")
+                    for ln in [x.strip(" ・-\t") for x in feat_text.splitlines()]:
+                        if ln:
+                            st.write(f"- {ln}")
                 xc = str(hit.get("extra_caption") or "").strip()
                 if xc:
                     st.caption(xc)
@@ -6047,6 +6184,11 @@ def _stocktake_candidates_from_gemini_response(
                 "supplier": su,
                 "last_stocktake": str(tr.get(COL_LAST_STOCKTAKE, "") or "").strip(),
                 "image_url": str(tr.get(COL_IMAGE_URL, "") or "").strip(),
+                "memo": str(tr.get(COL_MEMO, "") or "").strip(),
+                "features": str(tr.get(COL_FEATURES, "") or "").strip(),
+                "feature_observation": str(
+                    it.get("feature_observation") or ""
+                ).strip(),
             }
         )
     out.sort(key=lambda x: _management_id_sort_key(str(x.get("management_id") or "")))
@@ -6208,6 +6350,28 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             st.session_state["_stocktake_scan_warn"] = (
                 "先にカメラで撮影するか、直前に保存した撮影データがありません。"
             )
+        elif (_qr_mid := _extract_qr_management_id_from_image(img_b)):
+            if _qr_mid not in st_rem_run:
+                st.session_state["_stocktake_scan_warn"] = (
+                    f"QRで管理ID **{_qr_mid}** を検出しましたが、今回の棚卸対象リストには含まれていません。"
+                )
+            else:
+                _tr = lookup_ledger_row_by_management_id(df_ledger_hint, _qr_mid)
+                st.session_state["_stocktake_selected_mid"] = _qr_mid
+                st.session_state["_stocktake_scan_candidates"] = [
+                    {
+                        "management_id": _qr_mid,
+                        "confidence": 1.0,
+                        "product_name": str(_tr.get(COL_NAME, "") if _tr is not None else ""),
+                        "supplier": str(_tr.get(COL_SUPPLIER, "") if _tr is not None else ""),
+                        "last_stocktake": str(_tr.get(COL_LAST_STOCKTAKE, "") if _tr is not None else ""),
+                        "image_url": str(_tr.get(COL_IMAGE_URL, "") if _tr is not None else ""),
+                        "memo": str(_tr.get(COL_MEMO, "") if _tr is not None else ""),
+                        "features": str(_tr.get(COL_FEATURES, "") if _tr is not None else ""),
+                        "feature_observation": "QRコード一致で同一商品を確認",
+                    }
+                ]
+                st.session_state["stocktake_cand_page"] = 0
         elif df_ledger_hint is None or df_ledger_hint.empty:
             st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
         else:
@@ -6392,6 +6556,20 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                     st.write(
                         f"**前回の棚卸日:** {hit.get('last_stocktake') or '—（未入力）'}"
                     )
+                    feat_text = str(
+                        hit.get("features")
+                        or hit.get("memo")
+                        or ""
+                    ).strip()
+                    if feat_text:
+                        st.markdown("**登録時の特徴点:**")
+                        for ln in [x.strip(" ・-\t") for x in feat_text.splitlines()]:
+                            if not ln:
+                                continue
+                            st.write(f"- {ln}")
+                    obs = str(hit.get("feature_observation") or "").strip()
+                    if obs:
+                        st.caption(f"今回画像で確認した特徴: {obs}")
                     st.caption(
                         f"AI 確信度: {float(hit.get('confidence') or 0):.2f}（参考）"
                     )
@@ -6406,6 +6584,12 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         if _st_batch:
             _picked = list(st.session_state.get("stocktake_multi_done_mids") or [])
             _picked = [str(x).strip() for x in _picked if str(x).strip()]
+            _obs_map: dict[str, str] = {}
+            for _h in cands:
+                _mid = str(_h.get("management_id") or "").strip()
+                _ob = str(_h.get("feature_observation") or "").strip()
+                if _mid and _ob:
+                    _obs_map[_mid] = _ob
             if st.button(
                 "選択した候補をまとめて棚卸確定（棚卸日を本日・JST）",
                 type="primary",
@@ -6414,7 +6598,10 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             ):
                 try:
                     with st.spinner("台帳を更新しています…"):
-                        n_ok, skips = apply_last_stocktake_jst_for_management_ids(_picked)
+                        n_ok, skips = apply_last_stocktake_jst_for_management_ids(
+                            _picked,
+                            feature_updates_by_management_id=_obs_map,
+                        )
                 except Exception as e:
                     st.error(str(e))
                 else:
@@ -6440,9 +6627,17 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             disabled=not str(st.session_state.get("_stocktake_selected_mid") or "").strip(),
         ):
             mid = str(st.session_state.get("_stocktake_selected_mid") or "").strip()
+            _obs = ""
+            for _h in cands:
+                if str(_h.get("management_id") or "").strip() == mid:
+                    _obs = str(_h.get("feature_observation") or "").strip()
+                    break
             try:
                 with st.spinner("台帳を更新しています…"):
-                    apply_last_stocktake_jst_for_management_id(mid)
+                    apply_last_stocktake_jst_for_management_ids(
+                        [mid],
+                        feature_updates_by_management_id=({mid: _obs} if _obs else None),
+                    )
             except Exception as e:
                 st.error(str(e))
             else:
@@ -6602,18 +6797,24 @@ def _render_sales_management_tab(
             st.rerun()
 
     if do_match and uploaded is not None:
+        _qr_mid = _extract_qr_management_id_from_image(uploaded)
+        if _qr_mid:
+            st.session_state.field_sale_source_mgmt_id = _qr_mid
+            st.success(f"QRコードから管理ID **{_qr_mid}** を読み取りました。")
+            st.session_state.pop("_sales_photo_match_card_hits", None)
+            do_match = False
         inv_ctx_sale = ""
         if df_ledger_hint is not None and not df_ledger_hint.empty:
             inv_ctx_sale = _build_gemini_inventory_context(
                 df_ledger_hint, only_in_stock=True
             )
-        if not (inv_ctx_sale or "").strip():
+        if do_match and not (inv_ctx_sale or "").strip():
             st.warning(
                 "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です。"
                 "在庫がすべて販売済の場合や、**管理ID** が空の行しかない場合はリストを作れません。"
                 "ページ先頭の台帳読み込みエラーが出ていないかも確認してください。"
             )
-        else:
+        elif do_match:
             with st.spinner("画像を解析して販売元を照合しています…"):
                 try:
                     img = _gemini_input_image_from_upload(uploaded)
@@ -7175,6 +7376,7 @@ def main():
                 st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
                 st.session_state.pop("ledger_quick_candidates", None)
                 st.session_state.pop("_gemini_match_management_id", None)
+                st.session_state.pop("_ai_distinctive_features", None)
                 st.session_state.pop("_sale_link_management_id", None)
                 st.session_state.pop("_sale_link_warn", None)
                 st.rerun()
@@ -7448,6 +7650,17 @@ def main():
                 _plan2 = int(st.session_state.get("field_planned_sale_excl", 0))
                 _stat2 = STATUS_IN_STOCK
                 memo_s = (memo or "").strip()
+                _feat_list = _extract_distinctive_features_from_result(
+                    {
+                        "distinctive_features": st.session_state.get(
+                            "_ai_distinctive_features", []
+                        )
+                    }
+                )
+                _feat_text = "\n".join(f"- {x}" for x in _feat_list) if _feat_list else ""
+                _memo_feat_blk = _memo_features_block(_feat_list)
+                if _memo_feat_blk and _memo_feat_blk not in memo_s:
+                    memo_s = memo_s + ("\n" if memo_s else "") + _memo_feat_blk
     
                 _rq2 = max(1, min(2000, int(st.session_state.get("field_row_quantity", 1))))
                 _icat2 = str(
@@ -7507,7 +7720,11 @@ def main():
                             with st.spinner(_spin_msg):
                                 _reg_row_dt = jst_now_str()
                                 _reg_batch: list[list[Any]] = []
+                                _qr_codes_for_ui: list[bytes] = []
                                 for i in range(n_save):
+                                    _qr_data_url = _qr_data_url_for_management_id(ids[i])
+                                    _qr_png = _qr_png_bytes_for_management_id(ids[i])
+                                    _qr_codes_for_ui.append(_qr_png)
                                     _reg_batch.append(
                                         _inventory_row_values_for_append(
                                             _reg_row_dt,
@@ -7526,6 +7743,8 @@ def main():
                                             actual_sale_unit_excl_yen=_act_ex2,
                                             stock_status=_stat2,
                                             consumption_tax_rate=_tax_r2,
+                                            features=_feat_text,
+                                            qr_code=_qr_data_url,
                                         )
                                     )
                                 _append_inventory_data_rows(_reg_batch)
@@ -7544,6 +7763,17 @@ def main():
                             _link_urls = list(dict.fromkeys(u for u in urls if u))
                             for _uurl in _link_urls[:8]:
                                 st.markdown(f"[保存した画像を開く]({_uurl})")
+                            if _feat_list:
+                                st.caption("記録した個体特徴（デジタル指紋）:")
+                                for _f in _feat_list:
+                                    st.write(f"- {_f}")
+                            if _qr_codes_for_ui:
+                                st.caption("生成したQRコード（管理ID）")
+                                _qcols = st.columns(min(3, len(_qr_codes_for_ui)))
+                                for _qi, _qb in enumerate(_qr_codes_for_ui[:9]):
+                                    with _qcols[_qi % len(_qcols)]:
+                                        st.image(_qb, width=120)
+                                        st.caption(ids[_qi])
                             if len(_link_urls) > 8:
                                 st.caption(
                                     f"ほか {len(_link_urls) - 8} 件の画像URLは台帳の「{COL_IMAGE_URL}」列を参照してください。"
