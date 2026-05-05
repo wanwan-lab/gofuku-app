@@ -6096,16 +6096,13 @@ def render_stocktake_scan_tab(
             st.session_state.pop(_k, None)
         if st_rem_scan is not None:
             st.session_state.pop("_stocktake_selected_mid", None)
-    st.caption(
-        "上部の共通アップロード画像を使い、**今回の棚卸対象リストにまだ残っている在庫中の行** だけを AI に渡し、複数候補を返します。"
-        "照合は **和装に限らず** 洋服・帽子・雑貨・アパレル・一点物も想定しています。"
-        "飲料・カップ麺のようにパッケージ文字が読める品より、**無包装の衣料**は難しいため、台帳の **メモ・カテゴリー・商品名・仕入先** を手がかりにします（**金額の一致は照合に使いません**）。"
-        "**タグが写る撮影**を推奨します。"
-        "照合には **アップロード画像** と **対象リストのテキスト** のみを 1 回の Gemini API で送ります。"
-        f"候補は **{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、ページを切り替えて全件を確認できます（AI は最大 "
-        f"**{STOCKTAKE_CAND_AI_MAX}** 件まで）。"
-        "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
-    )
+    st.caption("共通アップロード画像で照合し、候補から1件または複数件を棚卸確定できます。")
+    with st.expander("使い方", expanded=False):
+        st.markdown(
+            f"- 候補は {STOCKTAKE_CAND_PAGE_SIZE} 件ずつ表示します（最大 {STOCKTAKE_CAND_AI_MAX} 件）。\n"
+            "- 候補は管理ID昇順で表示されます。\n"
+            "- 確定は棚卸日の更新のみで、新規行は追加しません。"
+        )
     if not _scan_targets_ok:
         if st_rem_scan is None:
             st.info(
@@ -6117,9 +6114,69 @@ def render_stocktake_scan_tab(
                 "今回の対象リストに **残っている行がありません**（すべて棚卸済みか、台帳更新でリストから外れました）。"
                 "続ける場合は **今回の棚卸を開始** でリストを作り直してください。"
             )
-    st.caption(
-        "写真取り込みは販売管理と同じ仕様です。ページ上部の共通アップローダで画像を選んでから照合してください。"
-    )
+    st.caption("写真はページ上部の共通アップローダを使用します。")
+
+    if st.button(
+        "AIで台帳と照合",
+        type="primary",
+        key="stocktake_ai_match_btn",
+        disabled=(not _scan_targets_ok) or (uploaded is None),
+    ):
+        st.session_state.pop("_stocktake_scan_candidates", None)
+        st.session_state.pop("_stocktake_selected_mid", None)
+        st.session_state.pop("stocktake_multi_done_mids", None)
+        st.session_state.pop("_stocktake_scan_warn", None)
+        st.session_state.pop("stocktake_cand_page", None)
+        st_rem_run = _inv_stocktake_work_remaining_get()
+        if st_rem_run is None or not st_rem_run:
+            st.session_state["_stocktake_scan_warn"] = (
+                "今回の棚卸対象リストがありません。**今回の棚卸を開始** からやり直してください。"
+            )
+        elif uploaded is None:
+            st.session_state["_stocktake_scan_warn"] = (
+                "上部の共通アップローダで写真を選択してください。"
+            )
+        elif df_ledger_hint is None or df_ledger_hint.empty:
+            st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
+        else:
+            inv_ctx_st = _build_gemini_inventory_context(
+                df_ledger_hint,
+                only_in_stock=True,
+                management_ids_filter=st_rem_run,
+            )
+            if not (inv_ctx_st or "").strip():
+                st.session_state["_stocktake_scan_warn"] = (
+                    "今回の対象リストに **在庫中として残っている行** がありません。"
+                    "在庫一覧で対象を開始し直すか、残リストを確認してください。"
+                )
+            else:
+                with st.spinner("画像を解析して台帳と照合しています…"):
+                    try:
+                        img_pil = _gemini_input_image_from_upload(uploaded)
+                        raw = analyze_image_with_gemini(
+                            img_pil,
+                            inventory_context=inv_ctx_st or None,
+                            prompt_mode="stocktake_match",
+                        )
+                        res = _parse_json_from_model(raw or "")
+                        if not isinstance(res, dict):
+                            res = {}
+                        cand_list = _stocktake_candidates_from_gemini_response(
+                            res,
+                            df_ledger_hint,
+                            allowed_management_ids=st_rem_run,
+                        )
+                        if not cand_list:
+                            st.session_state["_stocktake_scan_warn"] = (
+                                "今回の対象リストの在庫中の行で、写真に合いそうな候補が得られませんでした。"
+                                "明るさ・距離を変えて再撮影するか、在庫一覧で管理IDを確認してください。"
+                            )
+                        else:
+                            st.session_state["_stocktake_scan_candidates"] = cand_list
+                            st.session_state["stocktake_cand_page"] = 0
+                            st.session_state.pop("_stocktake_selected_mid", None)
+                    except Exception as e:
+                        st.session_state["_stocktake_scan_warn"] = str(e)
 
     if _scan_targets_ok and df_ledger_hint is not None and not df_ledger_hint.empty:
         st.markdown("##### 台帳から入力補助（任意）")
@@ -6201,68 +6258,6 @@ def render_stocktake_scan_tab(
         st.caption(
             "**今回の棚卸を開始** して対象リストがあるときだけ、ここに仕入タブと同様の台帳入力補助が表示されます。"
         )
-
-    if st.button(
-        "AIで台帳と照合",
-        type="primary",
-        key="stocktake_ai_match_btn",
-        disabled=(not _scan_targets_ok) or (uploaded is None),
-    ):
-        st.session_state.pop("_stocktake_scan_candidates", None)
-        st.session_state.pop("_stocktake_selected_mid", None)
-        st.session_state.pop("stocktake_multi_done_mids", None)
-        st.session_state.pop("_stocktake_scan_warn", None)
-        st.session_state.pop("stocktake_cand_page", None)
-        st_rem_run = _inv_stocktake_work_remaining_get()
-        if st_rem_run is None or not st_rem_run:
-            st.session_state["_stocktake_scan_warn"] = (
-                "今回の棚卸対象リストがありません。**今回の棚卸を開始** からやり直してください。"
-            )
-        elif uploaded is None:
-            st.session_state["_stocktake_scan_warn"] = (
-                "上部の共通アップローダで写真を選択してください。"
-            )
-        elif df_ledger_hint is None or df_ledger_hint.empty:
-            st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
-        else:
-            inv_ctx_st = _build_gemini_inventory_context(
-                df_ledger_hint,
-                only_in_stock=True,
-                management_ids_filter=st_rem_run,
-            )
-            if not (inv_ctx_st or "").strip():
-                st.session_state["_stocktake_scan_warn"] = (
-                    "今回の対象リストに **在庫中として残っている行** がありません。"
-                    "在庫一覧で対象を開始し直すか、残リストを確認してください。"
-                )
-            else:
-                with st.spinner("画像を解析して台帳と照合しています…"):
-                    try:
-                        img_pil = _gemini_input_image_from_upload(uploaded)
-                        raw = analyze_image_with_gemini(
-                            img_pil,
-                            inventory_context=inv_ctx_st or None,
-                            prompt_mode="stocktake_match",
-                        )
-                        res = _parse_json_from_model(raw or "")
-                        if not isinstance(res, dict):
-                            res = {}
-                        cand_list = _stocktake_candidates_from_gemini_response(
-                            res,
-                            df_ledger_hint,
-                            allowed_management_ids=st_rem_run,
-                        )
-                        if not cand_list:
-                            st.session_state["_stocktake_scan_warn"] = (
-                                "今回の対象リストの在庫中の行で、写真に合いそうな候補が得られませんでした。"
-                                "明るさ・距離を変えて再撮影するか、在庫一覧で管理IDを確認してください。"
-                            )
-                        else:
-                            st.session_state["_stocktake_scan_candidates"] = cand_list
-                            st.session_state["stocktake_cand_page"] = 0
-                            st.session_state.pop("_stocktake_selected_mid", None)
-                    except Exception as e:
-                        st.session_state["_stocktake_scan_warn"] = str(e)
 
     wn = st.session_state.pop("_stocktake_scan_warn", None)
     if wn:
@@ -6545,11 +6540,14 @@ def _render_sales_management_tab(
     """販売管理タブ: 出庫（販売）／出庫（浮貸）と管理ID・実売または浮貸日時の更新。"""
     st.markdown("##### 販売管理")
     st.caption(
-        "**出庫（販売）** … 在庫行を **販売済** にし、実売と販売日時（確定の JST）を記録します（新規行なし）。"
-        "**出庫（浮貸）** … **在庫中** のままなら **浮貸日時** 列へ日時を記録し、**販売済** を選ぶ場合は **出庫（販売）と同様** に在庫行を販売済へ更新します（出庫種別はいずれも記録）。"
-        "写真は任意（上の共通アップローダ）。"
-        "**販売元を写真で照合** は **アップロード画像** と **在庫中の台帳行テキスト** のみで 1 回の Gemini に照合させます。"
+        "在庫中の管理IDを指定して、1件または複数件をまとめて反映できます。"
     )
+    with st.expander("使い方", expanded=False):
+        st.markdown(
+            "- **出庫（販売）**: 在庫行を販売済に更新します。\n"
+            "- **出庫（浮貸）**: 在庫中のまま浮貸日時を記録、または販売済へ更新できます。\n"
+            "- 写真照合は上部の共通アップローダ画像を使用します。"
+        )
     outbound_kind = st.radio(
         "出庫区分",
         ("出庫（販売）", "出庫（浮貸）"),
@@ -6597,6 +6595,8 @@ def _render_sales_management_tab(
             st.session_state.sales_assist_buf_supplier = ""
             st.session_state.sales_assist_buf_inventory_category = ""
             st.session_state.sales_assist_buf_management_id = ""
+            st.session_state.sales_pick_mode = "1件選択"
+            st.session_state["sales_multi_selected_ids"] = []
             st.session_state.pop("sales_assist_quick_candidates", None)
             st.session_state.pop("sales_assist_last_n_matching_mids", None)
             st.session_state.pop("_sale_link_management_id", None)
@@ -6716,20 +6716,48 @@ def _render_sales_management_tab(
                     pick_mode="sale",
                 )
 
+    _sale_id_opts: list[str] = []
     if df_ledger_hint is not None and not df_ledger_hint.empty:
         _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
+    _sale_pick_mode = st.radio(
+        "販売対象の選択",
+        ("1件選択", "複数選択（一括反映）"),
+        horizontal=True,
+        key="sales_pick_mode",
+    )
+    if _sale_pick_mode.startswith("複数"):
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("在庫中をすべて選択", key="sales_pick_all_ids", disabled=not _sale_id_opts):
+                st.session_state["sales_multi_selected_ids"] = list(_sale_id_opts)
+                st.session_state.field_sale_source_mgmt_id = ", ".join(_sale_id_opts)
+                st.rerun()
+        with s2:
+            if st.button("選択をクリア", key="sales_pick_clear_ids"):
+                st.session_state["sales_multi_selected_ids"] = []
+                st.session_state.field_sale_source_mgmt_id = ""
+                st.rerun()
+        st.multiselect(
+            "一括反映する管理ID",
+            options=_sale_id_opts,
+            key="sales_multi_selected_ids",
+        )
+        _picked_ids = [str(x).strip() for x in st.session_state.get("sales_multi_selected_ids", []) if str(x).strip()]
+        st.session_state.field_sale_source_mgmt_id = ", ".join(_picked_ids)
+    else:
         if _sale_id_opts:
             st.selectbox(
-                "在庫中の管理ID（すぐ選ぶ・入力補助と同じ候補）",
+                "在庫中の管理ID（すぐ選ぶ）",
                 options=[LEDGER_PICK_PLACEHOLDER] + _sale_id_opts,
                 key="sale_pick_source_id",
                 on_change=_on_sale_pick_source_id,
             )
 
     st.text_input(
-        "販売する管理ID（手入力・複数はカンマ等で区切り）",
+        "販売する管理ID（手入力可）",
         key="field_sale_source_mgmt_id",
         placeholder="例: G00000001 または G00000001, G00000002",
+        help="複数選択モードではこの欄に自動反映されます。",
     )
     if _loan_keep_stock:
         st.text_input(
@@ -7099,29 +7127,18 @@ def main():
 
     st.markdown("## 台帳登録")
     st.caption(
-        "仕入れ・販売・棚卸しは **下の大きなタブ** で切り替えます。"
-        "下の **1枚の写真** は全タブ共通です（AI 解析は長辺最大"
-        f"{UPLOAD_JPEG_MAX_LONG_EDGE}px・品質{UPLOAD_JPEG_QUALITY}％、"
-        f"仕入れ確定で Drive 保存するときは長辺{PURCHASE_DRIVE_JPEG_MAX_LONG_EDGE}px・品質{PURCHASE_DRIVE_JPEG_QUALITY}％に変換します）。"
+        "仕入れ・販売・棚卸しは下のタブで切り替えます。写真は1枚を全タブで共通利用します。"
     )
     uploaded = st.file_uploader(
         "商品写真（任意・1枚まで・カメラやギャラリーから）",
         type=["jpg", "jpeg", "png", "webp"],
         key="shared_reg_photo_uploader",
     )
-    st.caption(
-        "写真は **1枚まで** です。**複数行を同時に登録する** ときは、その1枚をドライブに保存し、"
-        "作成する **全行に同じ画像URL** を入れます。"
-        "台帳の日時は写真の EXIF 撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
-        "**衣料・帽子**で台帳照合する場合は、**タグや品番が読める**ように寄せると一致しやすいです（パッケージ商品より判別が難しいことがあります）。"
-    )
+    st.caption("写真は1枚まで。複数行登録時は同じ画像URLを各行に保存します。")
 
     _inject_prominent_main_tabs_style()
     st.markdown("## 入力モード")
-    st.caption(
-        "**上の大きなタブ** で切り替えます。**仕入れ登録** で証憑・入庫と新規行、**販売管理** で販売・浮貸の反映、"
-        "**棚卸しスキャン** で棚卸日の確定（いずれも **上の1枚の写真** を共通で使えます）。"
-    )
+    st.caption("タブで入力モードを切り替えます。")
     tab_purchase, tab_sales, tab_stock = st.tabs(
         ("仕入れ登録", "販売管理", "棚卸しスキャン")
     )
