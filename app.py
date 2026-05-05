@@ -30,7 +30,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 ※ 証憑ファイルを台帳に確定反映するとき、Drive 保存用には画像のみ長辺最大2000px・JPEG品質75に再圧縮します（PDF/xlsx/docx は原本のまま）。
 ※ 台帳日時・撮影日時未取得時の現在時刻は **pytz** の ``Asia/Tokyo``（JST）です。
 
-サイドバーで **登録（インプット）** / **ギャラリー（カタログ）・在庫一覧** / **集計・分析（ダッシュボード）** を切り替えられます。
+サイドバーで **登録（インプット）** / **ギャラリー（カタログ）** / **在庫一覧** / **集計・分析（ダッシュボード）** を切り替えられます。
 在庫データは **共有の inventory.csv**（ローカル）または **Google スプレッドシート**（``INVENTORY_SOURCE`` で選択）に読み書きします。
 列定義・CSV 入出力は **app.py 内に内包**しています。
 
@@ -4418,7 +4418,7 @@ def render_analytics_dashboard_page() -> None:
 
 
 def _inject_prominent_main_tabs_style() -> None:
-    """メインエリアの ``st.tabs`` ラベルを大きく太字にする（登録・在庫一覧で共通）。"""
+    """メインエリアの ``st.tabs`` ラベルを大きく太字にする（登録画面のタブ用）。"""
     st.markdown(
         """
         <style>
@@ -4747,20 +4747,217 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
         st.rerun()
 
 
-def render_inventory_list_page() -> None:
-    st.markdown("## 在庫一覧")
+def _render_inventory_gallery_body(df_sorted_calc: pd.DataFrame) -> None:
+    """並び替え済み台帳からギャラリー（タイル）だけを描画する。"""
+    st.markdown("### ギャラリー（カタログ）")
     st.caption(
-        "共有の **inventory.csv** または **スプレッドシート**の全データを編集できます。行の追加・削除は表から操作し、"
-        "「台帳を更新する」で保存します。"
-        "「日時」は **保存時にセル内容が変わった行**（および表で追加した新規行）で **JST の現在時刻** に自動更新されます。"
-        "「証憑記録日時」は証憑取込の確定時刻、「証憑URL」は Drive 上の証憑です（"
-        "台帳内の値がすべて空または http(s) のときはリンク列として表示されクリックで開けます。"
-        "http 以外の文字が混ざる行がある場合はテキスト列のままです）。"
-        "棚卸し用の「最後に確認した日付（棚卸日）」は **YYYY-MM-DD** 推奨です（例: 今日なら "
-        f"{_today_jst_date().isoformat()}）。"
-        "既定は **ギャラリー（カタログ）** タブです。**在庫一覧** タブの表は **全行** を表示します。"
-        "棚卸の参照一覧・作業セッションは展開パネル、ギャラリーの棚卸し絞り込みから使えます。"
+        "Google ドライブの画像 URL はサーバー側で取得して表示します（表示できない場合は **画像を開く** からブラウザで確認できます）。"
     )
+    g1, g2, g3 = st.columns([2, 2, 1])
+    with g1:
+        st.text_input(
+            "フリーワード（商品名・管理ID・メモ）",
+            key="inv_gallery_search_text",
+            placeholder="部分一致で検索",
+        )
+    with g2:
+        sup_opts: list[str] = []
+        if COL_SUPPLIER in df_sorted_calc.columns:
+            sup_opts = sorted(
+                {
+                    x
+                    for x in df_sorted_calc[COL_SUPPLIER]
+                    .astype(str)
+                    .str.strip()
+                    .tolist()
+                    if x
+                }
+            )
+        st.multiselect(
+            "仕入先で絞り込み（複数可）",
+            options=sup_opts,
+            key="inv_gallery_suppliers_filter",
+        )
+    with g3:
+        st.selectbox(
+            "ステータス",
+            ("すべて", "在庫中", "販売済"),
+            key="inv_gallery_status_filter",
+        )
+    gal_f1, gal_f2 = st.columns(2)
+    with gal_f1:
+        st.selectbox(
+            "浮貸で絞り込み（ギャラリー）",
+            ("指定なし", "浮貸あり", "浮貸なし"),
+            key="inv_gallery_loan_filter",
+            help="**浮貸あり** … 浮貸日時が入っている行のみ。**浮貸なし** … 浮貸日時が空の行のみ（販売済も含みます）。",
+        )
+    with gal_f2:
+        st.selectbox(
+            "棚卸しで絞り込み（ギャラリー）",
+            (
+                "指定なし",
+                "台帳で棚卸日が未入力の在庫中のみ",
+                "今回の作業でまだ未確認（在庫中）",
+            ),
+            key="inv_gallery_stocktake_filter",
+        )
+
+    _fw = str(st.session_state.get("inv_gallery_search_text", "") or "")
+    _sup_f = list(st.session_state.get("inv_gallery_suppliers_filter") or [])
+    _st_f = str(st.session_state.get("inv_gallery_status_filter", "すべて") or "すべて")
+    _stk_f = str(
+        st.session_state.get("inv_gallery_stocktake_filter", "指定なし") or "指定なし"
+    )
+    _loan_f = str(
+        st.session_state.get("inv_gallery_loan_filter", "指定なし") or "指定なし"
+    )
+    _rem_gal = _inv_stocktake_work_remaining_get()
+    if _stk_f == "今回の作業でまだ未確認（在庫中）" and _rem_gal is None:
+        st.info("「今回の棚卸を開始」を押すと、この絞り込みが使えます。")
+    df_view = _filter_inventory_df_for_view(
+        df_sorted_calc,
+        q=_fw,
+        suppliers=_sup_f,
+        status_mode=_st_f,
+        stocktake_filter=_stk_f,
+        stocktake_session_remaining=_rem_gal,
+        loan_filter=_loan_f,
+    )
+    n_total = len(df_view)
+    st.caption(
+        f"該当 **{n_total:,}** 行（台帳全体 {len(df_sorted_calc):,} 行・粗利は再計算済み）。"
+        f"表示は **{INV_GALLERY_PAGE_SIZE}** 件ずつです。"
+    )
+
+    if "inv_gallery_page" not in st.session_state:
+        st.session_state.inv_gallery_page = 0
+    _fp_gal = f"{_fw!r}|{repr(_sup_f)}|{_st_f!r}|{_stk_f!r}|{_loan_f!r}"
+    if st.session_state.get("_inv_gallery_filter_fp") != _fp_gal:
+        st.session_state._inv_gallery_filter_fp = _fp_gal
+        st.session_state.inv_gallery_page = 0
+
+    n_pages = max(1, (n_total + INV_GALLERY_PAGE_SIZE - 1) // INV_GALLERY_PAGE_SIZE)
+    page_idx = int(st.session_state.inv_gallery_page)
+    if page_idx >= n_pages:
+        page_idx = n_pages - 1
+        st.session_state.inv_gallery_page = page_idx
+    if page_idx < 0:
+        page_idx = 0
+        st.session_state.inv_gallery_page = 0
+
+    start_idx = page_idx * INV_GALLERY_PAGE_SIZE
+    end_idx = min(n_total, start_idx + INV_GALLERY_PAGE_SIZE)
+    df_tiles = df_view.iloc[start_idx:end_idx].reset_index(drop=True)
+
+    if n_pages > 1:
+        p1, p2, p3 = st.columns([1, 3, 1])
+        with p1:
+            if st.button(
+                "◀ 前のページ",
+                disabled=page_idx <= 0,
+                key="inv_gallery_prev_page",
+            ):
+                st.session_state.inv_gallery_page = max(0, page_idx - 1)
+                st.rerun()
+        with p2:
+            st.markdown(
+                f"**ページ {page_idx + 1} / {n_pages}**　"
+                f"（{n_total:,} 件中 **{start_idx + 1}〜{end_idx}** 件を表示）"
+            )
+        with p3:
+            if st.button(
+                "次のページ ▶",
+                disabled=page_idx >= n_pages - 1,
+                key="inv_gallery_next_page",
+            ):
+                st.session_state.inv_gallery_page = min(n_pages - 1, page_idx + 1)
+                st.rerun()
+
+    ncols = 4
+    for i in range(0, len(df_tiles), ncols):
+        gc = st.columns(ncols)
+        for j in range(ncols):
+            ridx = i + j
+            if ridx >= len(df_tiles):
+                break
+            row = df_tiles.iloc[ridx]
+            sold = (
+                _normalize_stock_status(str(row.get(COL_STOCK_STATUS, "")))
+                == STATUS_SOLD
+            )
+            mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip() or f"_{ridx}"
+            safe_key = re.sub(r"[^\w\-]", "_", mid)[:48]
+            with gc[j]:
+                with st.container(border=True):
+                    if sold:
+                        st.caption("販売済")
+                    iu = str(row.get(COL_IMAGE_URL, "") or "").strip()
+                    _img_w = 200 if sold else 240
+                    _render_inventory_gallery_thumbnail(
+                        iu, width=_img_w, sold=sold
+                    )
+                    st.markdown(
+                        f'<p style="opacity:{"0.55" if sold else "1"};margin:0.2rem 0 0 0;font-size:1.05rem;">'
+                        f"<b>{mid}</b></p>",
+                        unsafe_allow_html=True,
+                    )
+                    nm = str(row.get(COL_NAME, "") or "").strip() or "—"
+                    st.markdown(
+                        f'<p style="opacity:{"0.55" if sold else "1"};margin:0;font-size:0.98rem;">'
+                        f"{(nm if len(nm) <= 96 else nm[:93] + '…')}</p>",
+                        unsafe_allow_html=True,
+                    )
+                    ps_raw = row.get(COL_PLANNED_SALE, "")
+                    try:
+                        psv = int(float(ps_raw)) if str(ps_raw).strip() != "" else 0
+                    except (TypeError, ValueError):
+                        psv = 0
+                    _pl_lbl = (
+                        f"販売予定（税抜） ¥{psv:,}"
+                        if psv > 0
+                        else "販売予定（税抜） —"
+                    )
+                    st.markdown(
+                        f'<p style="opacity:{"0.55" if sold else "1"};margin:0;font-size:0.95rem;">'
+                        f"{_pl_lbl}</p>",
+                        unsafe_allow_html=True,
+                    )
+                    rd = {str(c): row.get(c) for c in EXPECTED_HEADERS if c in row.index}
+                    if st.button(
+                        "詳細",
+                        key=f"inv_gal_dlg_{ridx}_{safe_key}",
+                        use_container_width=True,
+                    ):
+                        _inventory_gallery_detail_dialog(rd)
+
+
+def render_inventory_list_page(*, view_mode: str = "table") -> None:
+    """在庫データの閲覧・編集。``view_mode`` は ``gallery``（カタログ）または ``table``（台帳表）。"""
+    _vm = (view_mode or "table").strip().casefold()
+    if _vm not in ("gallery", "table"):
+        _vm = "table"
+    if _vm == "gallery":
+        st.markdown("## ギャラリー（カタログ）")
+        st.caption(
+            "共有の **inventory.csv** または **スプレッドシート**から読み込んだ在庫を、接客向けに **カード型** で表示します。"
+            "上の **再読込**・メトリクス・棚卸し作業セッションは **在庫一覧** ページと共通です。"
+            f"1ページ **{INV_GALLERY_PAGE_SIZE}** 件ずつ切り替えられます。下の **表示の並び順** はこのページのタイル順にも反映されます。"
+        )
+    else:
+        st.markdown("## 在庫一覧")
+        st.caption(
+            "共有の **inventory.csv** または **スプレッドシート**の全データを編集できます。行の追加・削除は表から操作し、"
+            "「台帳を更新する」で保存します。"
+            "「日時」は **保存時にセル内容が変わった行**（および表で追加した新規行）で **JST の現在時刻** に自動更新されます。"
+            "「証憑記録日時」は証憑取込の確定時刻、「証憑URL」は Drive 上の証憑です（"
+            "台帳内の値がすべて空または http(s) のときはリンク列として表示されクリックで開けます。"
+            "http 以外の文字が混ざる行がある場合はテキスト列のままです）。"
+            "棚卸し用の「最後に確認した日付（棚卸日）」は **YYYY-MM-DD** 推奨です（例: 今日なら "
+            f"{_today_jst_date().isoformat()}）。"
+            "カタログ表示はサイドバーの **ギャラリー（カタログ）** から開けます。"
+            "棚卸の参照一覧・作業セッションは下の展開パネルから使えます。"
+        )
 
     if msg := st.session_state.pop("_ledger_saved_flash", None):
         st.success(msg)
@@ -4983,203 +5180,12 @@ def render_inventory_list_page() -> None:
 
     df_sorted_calc = _recalc_gross_profit_dataframe(df_sorted.copy())
 
-    _inject_prominent_main_tabs_style()
-    st.markdown("## 表示形式")
-    st.caption(
-        "**上の大きなタブ** で切り替えます（先頭タブが既定表示）。**ギャラリー（カタログ）** は接客用プレビュー（"
-        f"1ページ **{INV_GALLERY_PAGE_SIZE}** 件・ページ切替で全件）、**在庫一覧** は全行の表で編集・保存します。"
-    )
-    tab_ledger_gallery, tab_ledger_table = st.tabs(
-        ("ギャラリー（カタログ）", "在庫一覧"),
-    )
-
-    with tab_ledger_gallery:
-        st.markdown("### ギャラリー（カタログ）")
+    if _vm == "gallery":
+        _render_inventory_gallery_body(df_sorted_calc)
+    else:
+        st.markdown("### 在庫一覧（表）")
         st.caption(
-            "Google ドライブの画像 URL はサーバー側で取得して表示します（表示できない場合は **画像を開く** からブラウザで確認できます）。"
-        )
-        g1, g2, g3 = st.columns([2, 2, 1])
-        with g1:
-            st.text_input(
-                "フリーワード（商品名・管理ID・メモ）",
-                key="inv_gallery_search_text",
-                placeholder="部分一致で検索",
-            )
-        with g2:
-            sup_opts: list[str] = []
-            if COL_SUPPLIER in df_sorted_calc.columns:
-                sup_opts = sorted(
-                    {
-                        x
-                        for x in df_sorted_calc[COL_SUPPLIER]
-                        .astype(str)
-                        .str.strip()
-                        .tolist()
-                        if x
-                    }
-                )
-            st.multiselect(
-                "仕入先で絞り込み（複数可）",
-                options=sup_opts,
-                key="inv_gallery_suppliers_filter",
-            )
-        with g3:
-            st.selectbox(
-                "ステータス",
-                ("すべて", "在庫中", "販売済"),
-                key="inv_gallery_status_filter",
-            )
-        gal_f1, gal_f2 = st.columns(2)
-        with gal_f1:
-            st.selectbox(
-                "浮貸で絞り込み（ギャラリー）",
-                ("指定なし", "浮貸あり", "浮貸なし"),
-                key="inv_gallery_loan_filter",
-                help="**浮貸あり** … 浮貸日時が入っている行のみ。**浮貸なし** … 浮貸日時が空の行のみ（販売済も含みます）。",
-            )
-        with gal_f2:
-            st.selectbox(
-                "棚卸しで絞り込み（ギャラリー）",
-                (
-                    "指定なし",
-                    "台帳で棚卸日が未入力の在庫中のみ",
-                    "今回の作業でまだ未確認（在庫中）",
-                ),
-                key="inv_gallery_stocktake_filter",
-            )
-
-        _fw = str(st.session_state.get("inv_gallery_search_text", "") or "")
-        _sup_f = list(st.session_state.get("inv_gallery_suppliers_filter") or [])
-        _st_f = str(st.session_state.get("inv_gallery_status_filter", "すべて") or "すべて")
-        _stk_f = str(
-            st.session_state.get("inv_gallery_stocktake_filter", "指定なし") or "指定なし"
-        )
-        _loan_f = str(
-            st.session_state.get("inv_gallery_loan_filter", "指定なし") or "指定なし"
-        )
-        _rem_gal = _inv_stocktake_work_remaining_get()
-        if _stk_f == "今回の作業でまだ未確認（在庫中）" and _rem_gal is None:
-            st.info("「今回の棚卸を開始」を押すと、この絞り込みが使えます。")
-        df_view = _filter_inventory_df_for_view(
-            df_sorted_calc,
-            q=_fw,
-            suppliers=_sup_f,
-            status_mode=_st_f,
-            stocktake_filter=_stk_f,
-            stocktake_session_remaining=_rem_gal,
-            loan_filter=_loan_f,
-        )
-        n_total = len(df_view)
-        st.caption(
-            f"該当 **{n_total:,}** 行（台帳全体 {len(df_sorted_calc):,} 行・粗利は再計算済み）。"
-            f"表示は **{INV_GALLERY_PAGE_SIZE}** 件ずつです。"
-        )
-
-        if "inv_gallery_page" not in st.session_state:
-            st.session_state.inv_gallery_page = 0
-        _fp_gal = f"{_fw!r}|{repr(_sup_f)}|{_st_f!r}|{_stk_f!r}|{_loan_f!r}"
-        if st.session_state.get("_inv_gallery_filter_fp") != _fp_gal:
-            st.session_state._inv_gallery_filter_fp = _fp_gal
-            st.session_state.inv_gallery_page = 0
-
-        n_pages = max(1, (n_total + INV_GALLERY_PAGE_SIZE - 1) // INV_GALLERY_PAGE_SIZE)
-        page_idx = int(st.session_state.inv_gallery_page)
-        if page_idx >= n_pages:
-            page_idx = n_pages - 1
-            st.session_state.inv_gallery_page = page_idx
-        if page_idx < 0:
-            page_idx = 0
-            st.session_state.inv_gallery_page = 0
-
-        start_idx = page_idx * INV_GALLERY_PAGE_SIZE
-        end_idx = min(n_total, start_idx + INV_GALLERY_PAGE_SIZE)
-        df_tiles = df_view.iloc[start_idx:end_idx].reset_index(drop=True)
-
-        if n_pages > 1:
-            p1, p2, p3 = st.columns([1, 3, 1])
-            with p1:
-                if st.button(
-                    "◀ 前のページ",
-                    disabled=page_idx <= 0,
-                    key="inv_gallery_prev_page",
-                ):
-                    st.session_state.inv_gallery_page = max(0, page_idx - 1)
-                    st.rerun()
-            with p2:
-                st.markdown(
-                    f"**ページ {page_idx + 1} / {n_pages}**　"
-                    f"（{n_total:,} 件中 **{start_idx + 1}〜{end_idx}** 件を表示）"
-                )
-            with p3:
-                if st.button(
-                    "次のページ ▶",
-                    disabled=page_idx >= n_pages - 1,
-                    key="inv_gallery_next_page",
-                ):
-                    st.session_state.inv_gallery_page = min(n_pages - 1, page_idx + 1)
-                    st.rerun()
-
-        ncols = 4
-        for i in range(0, len(df_tiles), ncols):
-            gc = st.columns(ncols)
-            for j in range(ncols):
-                ridx = i + j
-                if ridx >= len(df_tiles):
-                    break
-                row = df_tiles.iloc[ridx]
-                sold = (
-                    _normalize_stock_status(str(row.get(COL_STOCK_STATUS, "")))
-                    == STATUS_SOLD
-                )
-                mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip() or f"_{ridx}"
-                safe_key = re.sub(r"[^\w\-]", "_", mid)[:48]
-                with gc[j]:
-                    with st.container(border=True):
-                        if sold:
-                            st.caption("販売済")
-                        iu = str(row.get(COL_IMAGE_URL, "") or "").strip()
-                        _img_w = 200 if sold else 240
-                        _render_inventory_gallery_thumbnail(
-                            iu, width=_img_w, sold=sold
-                        )
-                        st.markdown(
-                            f'<p style="opacity:{"0.55" if sold else "1"};margin:0.2rem 0 0 0;font-size:1.05rem;">'
-                            f"<b>{mid}</b></p>",
-                            unsafe_allow_html=True,
-                        )
-                        nm = str(row.get(COL_NAME, "") or "").strip() or "—"
-                        st.markdown(
-                            f'<p style="opacity:{"0.55" if sold else "1"};margin:0;font-size:0.98rem;">'
-                            f"{(nm if len(nm) <= 96 else nm[:93] + '…')}</p>",
-                            unsafe_allow_html=True,
-                        )
-                        ps_raw = row.get(COL_PLANNED_SALE, "")
-                        try:
-                            psv = int(float(ps_raw)) if str(ps_raw).strip() != "" else 0
-                        except (TypeError, ValueError):
-                            psv = 0
-                        _pl_lbl = (
-                            f"販売予定（税抜） ¥{psv:,}"
-                            if psv > 0
-                            else "販売予定（税抜） —"
-                        )
-                        st.markdown(
-                            f'<p style="opacity:{"0.55" if sold else "1"};margin:0;font-size:0.95rem;">'
-                            f"{_pl_lbl}</p>",
-                            unsafe_allow_html=True,
-                        )
-                        rd = {str(c): row.get(c) for c in EXPECTED_HEADERS if c in row.index}
-                        if st.button(
-                            "詳細",
-                            key=f"inv_gal_dlg_{ridx}_{safe_key}",
-                            use_container_width=True,
-                        ):
-                            _inventory_gallery_detail_dialog(rd)
-
-    with tab_ledger_table:
-        st.markdown("### 在庫一覧")
-        st.caption(
-            "全列・全行を表示します。行数が多いときは表の **縦スクロール** で移動してください（保存はこのタブから）。"
+            "全列・全行を表示します。行数が多いときは表の **縦スクロール** で移動してください。"
         )
         _render_inventory_ledger_data_editor_section(df_sorted_calc)
 
@@ -6144,8 +6150,18 @@ def _render_sales_management_tab(
 
 def main():
     st.set_page_config(page_title="商品在庫・販売", layout="wide")
-    _nav_opts = ("登録（インプット）", "ギャラリー（カタログ）・在庫一覧", "集計・分析（ダッシュボード）")
+    _nav_opts = (
+        "登録（インプット）",
+        "ギャラリー（カタログ）",
+        "在庫一覧",
+        "集計・分析（ダッシュボード）",
+    )
+    _nav_legacy = "ギャラリー（カタログ）・在庫一覧"
     if "nav_page" not in st.session_state:
+        st.session_state.nav_page = _nav_opts[0]
+    elif st.session_state.nav_page == _nav_legacy:
+        st.session_state.nav_page = "ギャラリー（カタログ）"
+    elif st.session_state.nav_page not in _nav_opts:
         st.session_state.nav_page = _nav_opts[0]
     with st.sidebar:
         st.markdown("### メニュー")
@@ -6155,8 +6171,11 @@ def main():
         "写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・"
         "**inventory.csv** またはスプレッドシートへの記録ができます。"
     )
-    if page == "ギャラリー（カタログ）・在庫一覧":
-        render_inventory_list_page()
+    if page == "ギャラリー（カタログ）":
+        render_inventory_list_page(view_mode="gallery")
+        return
+    if page == "在庫一覧":
+        render_inventory_list_page(view_mode="table")
         return
     if page == "集計・分析（ダッシュボード）":
         render_analytics_dashboard_page()
