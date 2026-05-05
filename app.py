@@ -2349,39 +2349,48 @@ def _fuzzy_ledger_match_rows(
     product_name: str,
     supplier: str,
     *,
-    limit: int = 8,
+    limit: int | None = 8,
 ) -> pd.DataFrame:
-    """台帳の全行から、商品名・仕入先の近い候補を返す（写真解析後の補助。ステータスは問わない）。"""
+    """台帳候補を返す（優先順: 名前+仕入先部分一致 → 名前部分一致 → 仕入先部分一致）。"""
     if df is None or df.empty:
         return pd.DataFrame()
-    sub = df
     pn = (product_name or "").strip().casefold()
     su = (supplier or "").strip().casefold()
     if not pn and not su:
-        return sub.iloc[:0]
-    scores: list[tuple[float, Any]] = []
-    for i, row in sub.iterrows():
-        rpn = str(row.get(COL_NAME, "") or "").strip().casefold()
-        rsu = str(row.get(COL_SUPPLIER, "") or "").strip().casefold()
-        a = f"{rpn} {rsu}".strip()
-        b = f"{pn} {su}".strip()
-        if not a:
+        return df.iloc[:0]
+
+    scored: list[tuple[int, float, Any]] = []
+    for i, row in df.iterrows():
+        rpn = str(row.get(COL_NAME, "") or "").strip()
+        rsu = str(row.get(COL_SUPPLIER, "") or "").strip()
+        rpn_l = rpn.casefold()
+        rsu_l = rsu.casefold()
+        both_ok = bool(pn and su and (pn in rpn_l) and (su in rsu_l))
+        name_ok = bool(pn and (pn in rpn_l))
+        sup_ok = bool(su and (su in rsu_l))
+        if not (both_ok or name_ok or sup_ok):
             continue
-        r0 = difflib.SequenceMatcher(None, a, b).ratio() if b else 0.0
-        r1 = difflib.SequenceMatcher(None, rpn, pn).ratio() if pn else 0.0
-        r2 = difflib.SequenceMatcher(None, rsu, su).ratio() if su else 0.0
-        bonus = 0.0
-        if pn and pn in rpn:
-            bonus += 0.12
-        if su and su in rsu:
-            bonus += 0.12
-        sc = max(r0, 0.55 * r1 + 0.45 * r2) + bonus
-        scores.append((sc, i))
-    scores.sort(key=lambda x: -x[0])
-    picked = [i for _, i in scores[:limit]]
+        if both_ok:
+            prio = 0
+        elif name_ok:
+            prio = 1
+        else:
+            prio = 2
+        sim = 0.0
+        if pn:
+            sim += 0.6 * difflib.SequenceMatcher(None, rpn_l, pn).ratio()
+        if su:
+            sim += 0.4 * difflib.SequenceMatcher(None, rsu_l, su).ratio()
+        scored.append((prio, -sim, i))
+
+    scored.sort(key=lambda x: (x[0], x[1], _management_id_sort_key(str(df.loc[x[2]].get(COL_MANAGEMENT_ID, "") or "").strip())))
+    if limit is None:
+        picked = [i for _, _, i in scored]
+    else:
+        picked = [i for _, _, i in scored[: max(1, int(limit))]]
     if not picked:
-        return sub.iloc[:0]
-    return sub.loc[picked]
+        return df.iloc[:0]
+    return df.loc[picked]
 
 
 def _single_row_fuzzy_ledger_match(
@@ -2857,7 +2866,7 @@ def _refresh_ledger_quick_search_candidates(df_ledger: pd.DataFrame | None) -> N
         return
     pn = str(st.session_state.get("field_product_name", "") or "").strip()
     su = str(st.session_state.get("field_supplier", "") or "").strip()
-    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, limit=8)
+    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, limit=None)
     if cand.empty:
         st.session_state.pop("ledger_quick_candidates", None)
     else:
@@ -2880,23 +2889,29 @@ def _assist_field_keys(prefix: str) -> dict[str, str]:
             "fp_filter": f"{prefix}hint_filter_product_name",
             "fs_filter": f"{prefix}hint_filter_supplier",
             "fc_filter": f"{prefix}hint_filter_inventory_category",
+            "fm_filter": f"{prefix}hint_filter_management_id",
             "pick_p": f"{prefix}ledger_pick_product_name",
             "pick_s": f"{prefix}ledger_pick_supplier",
             "pick_c": f"{prefix}ledger_pick_inventory_category",
+            "pick_m": f"{prefix}ledger_pick_management_id",
             "seen_fp": f"{prefix}_hint_seen_product",
             "seen_fs": f"{prefix}_hint_seen_supplier",
             "seen_fc": f"{prefix}_hint_seen_category",
+            "seen_fm": f"{prefix}_hint_seen_management_id",
         }
     return {
         "fp_filter": "hint_filter_product_name",
         "fs_filter": "hint_filter_supplier",
         "fc_filter": "hint_filter_inventory_category",
+        "fm_filter": "hint_filter_management_id",
         "pick_p": "ledger_pick_product_name",
         "pick_s": "ledger_pick_supplier",
         "pick_c": "ledger_pick_inventory_category",
+        "pick_m": "ledger_pick_management_id",
         "seen_fp": "_hint_fp_seen",
         "seen_fs": "_hint_fs_seen",
         "seen_fc": "_hint_cat_seen",
+        "seen_fm": "_hint_mid_seen",
     }
 
 
@@ -2908,15 +2923,19 @@ def _render_ledger_pick_assist_three_columns(
     on_pick_product_name: Any,
     on_pick_supplier: Any,
     on_pick_inventory_category: Any,
+    on_pick_management_id: Any,
     empty_message: str = "台帳が空か読み込めないため、入力補助の候補は表示できません。",
 ) -> None:
-    """商品名／仕入先／在庫カテゴリーの絞り込みと台帳プルダウン（仕入・販売・棚卸で共用）。"""
+    """商品名／仕入先／カテゴリー／管理IDの絞り込みと台帳プルダウン（仕入・販売・棚卸で共用）。"""
     if df is None or df.empty:
         st.caption(empty_message)
         return
     k = _assist_field_keys(key_prefix)
     st.caption(body_caption)
-    hc1, hc2, hc3 = st.columns(3)
+    df_mid_scope = df
+    if key_prefix == "sales_" and COL_MANAGEMENT_ID in df.columns:
+        df_mid_scope = df.loc[_mask_ledger_in_stock(df)]
+    hc1, hc2 = st.columns(2)
     with hc1:
         st.text_input(
             "商品名の絞り込み（部分一致）",
@@ -2957,6 +2976,8 @@ def _render_ledger_pick_assist_three_columns(
             key=k["pick_s"],
             on_change=on_pick_supplier,
         )
+
+    hc3, hc4 = st.columns(2)
     with hc3:
         if COL_CATEGORY in df.columns:
             st.text_input(
@@ -2980,6 +3001,50 @@ def _render_ledger_pick_assist_three_columns(
             )
         else:
             st.caption("台帳に在庫カテゴリー列がありません。")
+    with hc4:
+        if COL_MANAGEMENT_ID not in df.columns:
+            st.caption("台帳に管理ID列がありません。")
+        elif df_mid_scope is None or df_mid_scope.empty:
+            st.caption(
+                "在庫中で **管理ID** のある行がありません（すべて販売済みの可能性があります）。"
+                if key_prefix == "sales_"
+                else "管理IDが付いた対象行がありません。"
+            )
+        else:
+            st.text_input(
+                "管理IDの絞り込み（部分一致）",
+                key=k["fm_filter"],
+                placeholder="例: G00042",
+            )
+            fm = str(st.session_state.get(k["fm_filter"], "") or "").strip()
+            if st.session_state.get(k["seen_fm"], "") != fm:
+                st.session_state[k["seen_fm"]] = fm
+                st.session_state[k["pick_m"]] = LEDGER_PICK_PLACEHOLDER
+            opts_ids = sorted(
+                {
+                    str(x).strip()
+                    for x in df_mid_scope[COL_MANAGEMENT_ID].tolist()
+                    if str(x).strip()
+                },
+                key=_management_id_sort_key,
+            )[:600]
+            if fm.casefold():
+                qm = fm.casefold()
+                opts_ids = [
+                    x for x in opts_ids if qm in x.casefold()
+                ][:400]
+            st.selectbox(
+                (
+                    "入力補助：在庫中の管理IDから選ぶ"
+                    if key_prefix == "sales_"
+                    else "入力補助：対象リストの管理IDから選ぶ"
+                    if key_prefix == "stocktake_"
+                    else "入力補助：台帳の管理IDから選ぶ"
+                ),
+                options=[LEDGER_PICK_PLACEHOLDER] + opts_ids,
+                key=k["pick_m"],
+                on_change=on_pick_management_id,
+            )
 
 
 def _stocktake_assist_scope_dataframe(
@@ -3012,6 +3077,9 @@ def _sales_rows_matching_assist_buffers() -> tuple[pd.DataFrame, list[str]]:
     pn = str(st.session_state.get("sales_assist_buf_product_name", "") or "").strip()
     su = str(st.session_state.get("sales_assist_buf_supplier", "") or "").strip()
     cat = str(st.session_state.get("sales_assist_buf_inventory_category", "") or "").strip()
+    midb = str(st.session_state.get("sales_assist_buf_management_id", "") or "").strip()
+    if midb and COL_MANAGEMENT_ID in sub.columns:
+        sub = sub.loc[sub[COL_MANAGEMENT_ID].astype(str).str.strip() == midb]
     if pn and COL_NAME in sub.columns:
         sub = sub.loc[sub[COL_NAME].astype(str).str.strip() == pn]
     if su and COL_SUPPLIER in sub.columns:
@@ -3058,6 +3126,14 @@ def _on_sales_assist_pick_inventory_category() -> None:
     _sales_apply_mgmt_id_after_assist_pick()
 
 
+def _on_sales_assist_pick_management_id() -> None:
+    v = str(st.session_state.get("sales_ledger_pick_management_id", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.sales_assist_buf_management_id = v
+        st.session_state.sales_ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
+    _sales_apply_mgmt_id_after_assist_pick()
+
+
 def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None:
     """販売タブ・入力補助バッファから在庫中の近い行を一覧用に格納する。"""
     if df_hint is None or df_hint.empty:
@@ -3069,7 +3145,7 @@ def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None
     if sub.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
         return
-    cand = _fuzzy_ledger_match_rows(sub, pn, su, limit=8)
+    cand = _fuzzy_ledger_match_rows(sub, pn, su, limit=None)
     if cand.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
     else:
@@ -3086,6 +3162,9 @@ def _stocktake_rows_matching_assist_buffers(
     pn = str(st.session_state.get("stocktake_assist_buf_product_name", "") or "").strip()
     su = str(st.session_state.get("stocktake_assist_buf_supplier", "") or "").strip()
     cat = str(st.session_state.get("stocktake_assist_buf_inventory_category", "") or "").strip()
+    midb = str(st.session_state.get("stocktake_assist_buf_management_id", "") or "").strip()
+    if midb and COL_MANAGEMENT_ID in sub.columns:
+        sub = sub.loc[sub[COL_MANAGEMENT_ID].astype(str).str.strip() == midb]
     if pn and COL_NAME in sub.columns:
         sub = sub.loc[sub[COL_NAME].astype(str).str.strip() == pn]
     if su and COL_SUPPLIER in sub.columns:
@@ -3134,6 +3213,14 @@ def _on_stocktake_assist_pick_inventory_category() -> None:
     _stocktake_apply_selected_mid_after_assist_pick()
 
 
+def _on_stocktake_assist_pick_management_id() -> None:
+    v = str(st.session_state.get("stocktake_ledger_pick_management_id", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.stocktake_assist_buf_management_id = v
+        st.session_state.stocktake_ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
+    _stocktake_apply_selected_mid_after_assist_pick()
+
+
 def _refresh_stocktake_assist_quick_candidates(
     df_hint: pd.DataFrame | None, remaining: set[str] | None
 ) -> None:
@@ -3146,7 +3233,7 @@ def _refresh_stocktake_assist_quick_candidates(
         return
     pn = str(st.session_state.get("stocktake_assist_buf_product_name", "") or "").strip()
     su = str(st.session_state.get("stocktake_assist_buf_supplier", "") or "").strip()
-    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=8)
+    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=None)
     if cand.empty:
         st.session_state.pop("stocktake_assist_quick_candidates", None)
     else:
@@ -3219,6 +3306,46 @@ def _on_ledger_pick_inventory_category() -> None:
     if v and v != LEDGER_PICK_PLACEHOLDER:
         st.session_state.field_inventory_category = v
         st.session_state.ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+
+
+def _apply_ledger_row_to_purchase_session(row: pd.Series) -> None:
+    """入力補助で選んだ台帳1行から、仕入フォームの主項目へ反映する。"""
+    pn = str(row.get(COL_NAME, "") or "").strip()
+    su = str(row.get(COL_SUPPLIER, "") or "").strip()
+    if pn:
+        st.session_state.field_product_name = pn
+    if su:
+        st.session_state.field_supplier = su
+    if COL_CATEGORY in row.index:
+        rc = str(row.get(COL_CATEGORY, "") or "").strip()
+        if rc:
+            st.session_state.field_inventory_category = rc
+    ly = _finite_int(row.get(COL_PRICE_EXCL), 0)
+    if ly > 0:
+        st.session_state.field_line_excl_yen = ly
+    pl = _finite_int(row.get(COL_PLANNED_SALE), 0)
+    st.session_state.field_planned_sale_excl = max(0, int(pl))
+
+
+def _on_ledger_pick_management_id() -> None:
+    v = str(st.session_state.get("ledger_pick_management_id", "") or "")
+    if not v or v == LEDGER_PICK_PLACEHOLDER:
+        return
+    try:
+        df = load_inventory_dataframe()
+    except Exception:
+        st.session_state.ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
+        return
+    if df is None or df.empty or COL_MANAGEMENT_ID not in df.columns:
+        st.session_state.ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
+        return
+    m = df[COL_MANAGEMENT_ID].astype(str).str.strip() == v
+    hits = df.loc[m]
+    if len(hits) != 1:
+        st.session_state.ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
+        return
+    _apply_ledger_row_to_purchase_session(hits.iloc[0])
+    st.session_state.ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
 
 
 def _on_sale_pick_source_id() -> None:
@@ -4861,6 +4988,192 @@ def _render_inventory_gallery_thumbnail(image_url: str, *, width: int, sold: boo
     st.link_button("画像を開く", iu, use_container_width=True)
 
 
+def _sale_card_hit_from_series(
+    row: pd.Series,
+    *,
+    confidence: float | None = None,
+    extra_caption: str | None = None,
+) -> dict[str, Any]:
+    """販売候補カード1件分の表示用 dict。"""
+    return {
+        "management_id": str(row.get(COL_MANAGEMENT_ID, "") or "").strip(),
+        "product_name": str(row.get(COL_NAME, "") or "").strip(),
+        "supplier": str(row.get(COL_SUPPLIER, "") or "").strip(),
+        "inventory_category": str(row.get(COL_CATEGORY, "") or "").strip(),
+        "line_price_excl": _finite_int(row.get(COL_PRICE_EXCL), 0),
+        "planned_sale_excl": _finite_int(row.get(COL_PLANNED_SALE), 0),
+        "image_url": str(row.get(COL_IMAGE_URL, "") or "").strip(),
+        "confidence": confidence,
+        "last_stocktake": str(row.get(COL_LAST_STOCKTAKE, "") or "").strip()
+        if COL_LAST_STOCKTAKE in row.index
+        else "",
+        "extra_caption": extra_caption or "",
+    }
+
+
+def _render_mid_pick_candidate_cards(
+    hits: list[dict[str, Any]],
+    *,
+    widget_key_namespace: str,
+    sold: bool = False,
+    pick_mode: str = "sale",
+    page_size: int = 5,
+) -> None:
+    """管理IDを選ぶ候補をカード表示（5件ページング付き）。"""
+    valid_hits = [
+        h for h in (hits or []) if str(h.get("management_id") or "").strip()
+    ]
+    if not valid_hits:
+        return
+    psize = max(1, int(page_size))
+    page_key = f"_{widget_key_namespace}_page"
+    total = len(valid_hits)
+    n_pages = max(1, (total + psize - 1) // psize)
+    cur = int(st.session_state.get(page_key, 0) or 0)
+    cur = max(0, min(n_pages - 1, cur))
+    st.session_state[page_key] = cur
+    start_i = cur * psize
+    end_i = min(total, start_i + psize)
+    page_hits = valid_hits[start_i:end_i]
+
+    st.caption(
+        f"候補 **{total}** 件（1ページ最大 **{psize}** 件） / "
+        f"ページ **{cur + 1} / {n_pages}**"
+    )
+    if n_pages > 1:
+        p1, p2, p3 = st.columns([1, 2, 1])
+        with p1:
+            if st.button("◀ 前へ", disabled=cur <= 0, key=f"{widget_key_namespace}_prev"):
+                st.session_state[page_key] = max(0, cur - 1)
+                st.rerun()
+        with p2:
+            st.caption(f"{start_i + 1}〜{end_i} 件を表示")
+        with p3:
+            if st.button("次へ ▶", disabled=cur >= n_pages - 1, key=f"{widget_key_namespace}_next"):
+                st.session_state[page_key] = min(n_pages - 1, cur + 1)
+                st.rerun()
+
+    if pick_mode == "stocktake":
+        btn_label = "この候補を選ぶ"
+    elif pick_mode == "purchase":
+        btn_label = "この候補を仕入入力へ反映"
+    else:
+        btn_label = "この候補を販売元にする"
+
+    for j, hit in enumerate(page_hits):
+        mid = str(hit.get("management_id") or "").strip()
+        abs_idx = start_i + j
+        with st.container(border=True):
+            h1, h2 = st.columns([1, 2])
+            with h1:
+                _render_inventory_gallery_thumbnail(
+                    str(hit.get("image_url") or ""),
+                    width=200,
+                    sold=sold,
+                )
+            with h2:
+                st.markdown(f"**管理ID:** `{mid}`")
+                st.write(f"**商品名:** {hit.get('product_name') or '—'}")
+                st.write(f"**仕入先:** {hit.get('supplier') or '—'}")
+                lst = str(hit.get("last_stocktake") or "").strip()
+                if lst:
+                    st.write(f"**前回の棚卸日:** {lst}")
+                xc = str(hit.get("extra_caption") or "").strip()
+                if xc:
+                    st.caption(xc)
+                cf = hit.get("confidence")
+                try:
+                    cfn = float(cf) if cf is not None else None
+                except (TypeError, ValueError):
+                    cfn = None
+                if cfn is not None and math.isfinite(cfn):
+                    st.caption(f"AI 確信度（参考）: {cfn:.2f}")
+                if st.button(
+                    btn_label,
+                    key=f"{widget_key_namespace}_mid_card_{abs_idx}_{mid}",
+                    type="secondary",
+                ):
+                    if pick_mode == "stocktake":
+                        st.session_state["_stocktake_selected_mid"] = mid
+                    elif pick_mode == "purchase":
+                        st.session_state.field_product_name = str(
+                            hit.get("product_name") or ""
+                        ).strip()
+                        st.session_state.field_supplier = str(
+                            hit.get("supplier") or ""
+                        ).strip()
+                        cat = str(hit.get("inventory_category") or "").strip()
+                        if cat:
+                            st.session_state.field_inventory_category = cat
+                        lp = _finite_int(hit.get("line_price_excl"), 0)
+                        if lp > 0:
+                            st.session_state.field_line_excl_yen = lp
+                        ps = _finite_int(hit.get("planned_sale_excl"), 0)
+                        if ps > 0:
+                            st.session_state.field_planned_sale_excl = ps
+                        st.session_state["_gemini_match_management_id"] = mid
+                    else:
+                        st.session_state.field_sale_source_mgmt_id = mid
+                    st.rerun()
+
+
+def _sales_photo_match_card_hits_from_result(
+    result: dict[str, Any],
+    df_ledger: pd.DataFrame | None,
+) -> list[dict[str, Any]]:
+    """写真照合 JSON と在庫中台帳から、カード候補（全件）を組み立てる。"""
+    if df_ledger is None or df_ledger.empty:
+        return []
+    sub = df_ledger.loc[_mask_ledger_in_stock(df_ledger)]
+    if sub.empty:
+        return []
+    m = result.get("match")
+    if not isinstance(m, dict):
+        m = {}
+    pn0 = str(
+        m.get("product_name")
+        or result.get("product_name")
+        or result.get("商品名")
+        or ""
+    ).strip()
+    su0 = str(
+        m.get("supplier")
+        or result.get("supplier")
+        or result.get("仕入先・取引先")
+        or result.get("仕入先")
+        or ""
+    ).strip()
+    conf = float(m.get("confidence") or result.get("confidence") or 0)
+    mid_primary = str(m.get("management_id") or "").strip()
+    cand = _fuzzy_ledger_match_rows(sub, pn0, su0, limit=None)
+    if cand.empty:
+        return []
+    hits: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _, row in cand.iterrows():
+        mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        c = conf if mid_primary and mid == mid_primary else None
+        xc = (
+            "写真照合で推定した行（同一管理ID）"
+            if mid_primary and mid == mid_primary
+            else ""
+        )
+        hits.append(_sale_card_hit_from_series(row, confidence=c, extra_caption=xc or None))
+
+    def _sort_key(h: dict[str, Any]) -> tuple[int, Any]:
+        mid_h = str(h.get("management_id") or "")
+        return (
+            0 if mid_primary and mid_h == mid_primary else 1,
+            _management_id_sort_key(mid_h),
+        )
+
+    hits.sort(key=_sort_key)
+    return hits
+
+
 def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> None:
     """在庫一覧の表形式: data_editor と保存ボタン。"""
     _ledger_base_for_save = df_sorted
@@ -5593,8 +5906,12 @@ def _init_registration_form_session_state() -> None:
         st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
     if "hint_filter_inventory_category" not in st.session_state:
         st.session_state.hint_filter_inventory_category = ""
+    if "hint_filter_management_id" not in st.session_state:
+        st.session_state.hint_filter_management_id = ""
     if "ledger_pick_inventory_category" not in st.session_state:
         st.session_state.ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+    if "ledger_pick_management_id" not in st.session_state:
+        st.session_state.ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
     if "field_sale_source_mgmt_id" not in st.session_state:
         st.session_state.field_sale_source_mgmt_id = ""
     if "sale_pick_source_id" not in st.session_state:
@@ -5605,36 +5922,48 @@ def _init_registration_form_session_state() -> None:
         st.session_state.sales_hint_filter_supplier = ""
     if "sales_hint_filter_inventory_category" not in st.session_state:
         st.session_state.sales_hint_filter_inventory_category = ""
+    if "sales_hint_filter_management_id" not in st.session_state:
+        st.session_state.sales_hint_filter_management_id = ""
     if "sales_ledger_pick_product_name" not in st.session_state:
         st.session_state.sales_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
     if "sales_ledger_pick_supplier" not in st.session_state:
         st.session_state.sales_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
     if "sales_ledger_pick_inventory_category" not in st.session_state:
         st.session_state.sales_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+    if "sales_ledger_pick_management_id" not in st.session_state:
+        st.session_state.sales_ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
     if "sales_assist_buf_product_name" not in st.session_state:
         st.session_state.sales_assist_buf_product_name = ""
     if "sales_assist_buf_supplier" not in st.session_state:
         st.session_state.sales_assist_buf_supplier = ""
     if "sales_assist_buf_inventory_category" not in st.session_state:
         st.session_state.sales_assist_buf_inventory_category = ""
+    if "sales_assist_buf_management_id" not in st.session_state:
+        st.session_state.sales_assist_buf_management_id = ""
     if "stocktake_hint_filter_product_name" not in st.session_state:
         st.session_state.stocktake_hint_filter_product_name = ""
     if "stocktake_hint_filter_supplier" not in st.session_state:
         st.session_state.stocktake_hint_filter_supplier = ""
     if "stocktake_hint_filter_inventory_category" not in st.session_state:
         st.session_state.stocktake_hint_filter_inventory_category = ""
+    if "stocktake_hint_filter_management_id" not in st.session_state:
+        st.session_state.stocktake_hint_filter_management_id = ""
     if "stocktake_ledger_pick_product_name" not in st.session_state:
         st.session_state.stocktake_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
     if "stocktake_ledger_pick_supplier" not in st.session_state:
         st.session_state.stocktake_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
     if "stocktake_ledger_pick_inventory_category" not in st.session_state:
         st.session_state.stocktake_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+    if "stocktake_ledger_pick_management_id" not in st.session_state:
+        st.session_state.stocktake_ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
     if "stocktake_assist_buf_product_name" not in st.session_state:
         st.session_state.stocktake_assist_buf_product_name = ""
     if "stocktake_assist_buf_supplier" not in st.session_state:
         st.session_state.stocktake_assist_buf_supplier = ""
     if "stocktake_assist_buf_inventory_category" not in st.session_state:
         st.session_state.stocktake_assist_buf_inventory_category = ""
+    if "stocktake_assist_buf_management_id" not in st.session_state:
+        st.session_state.stocktake_assist_buf_management_id = ""
     if "s_reg_qty" not in st.session_state:
         st.session_state.s_reg_qty = 1
     if "s_field_sale_source_mgmt_id" not in st.session_state:
@@ -5782,13 +6111,14 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                 key_prefix="stocktake_",
                 body_caption=(
                     "仕入タブと同じ操作で、**今回の棚卸リストに残っている在庫中行** から絞り込めます。"
-                    "商品名・仕入先・在庫カテゴリーをプルダウンで確定し、**すべて揃ったときに一致が1件だけ** なら "
-                    "下の **この候補を選ぶ** 用に **選択中の管理ID** がセットされます（AI 照合を使わなくても構いません）。"
-                    "複数件のときは一覧で管理IDを確認してください。"
+                    "商品名・仕入先・在庫カテゴリー・**管理ID** は、文字の絞り込みまたはプルダウンから選べます。"
+                    "**組み合わせで一致が1件だけ** のときだけ、**選択中の管理ID** を自動セットします。"
+                    "複数件のときは下の近い候補カードと AI 照合で確認してください。"
                 ),
                 on_pick_product_name=_on_stocktake_assist_pick_product_name,
                 on_pick_supplier=_on_stocktake_assist_pick_supplier,
                 on_pick_inventory_category=_on_stocktake_assist_pick_inventory_category,
+                on_pick_management_id=_on_stocktake_assist_pick_management_id,
             )
             stn = int(
                 st.session_state.get("stocktake_assist_last_n_matching_mids", 0) or 0
@@ -5807,14 +6137,19 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                 st.session_state.stocktake_hint_filter_product_name = ""
                 st.session_state.stocktake_hint_filter_supplier = ""
                 st.session_state.stocktake_hint_filter_inventory_category = ""
+                st.session_state.stocktake_hint_filter_management_id = ""
                 st.session_state.stocktake_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
                 st.session_state.stocktake_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
                 st.session_state.stocktake_ledger_pick_inventory_category = (
                     LEDGER_PICK_PLACEHOLDER
                 )
+                st.session_state.stocktake_ledger_pick_management_id = (
+                    LEDGER_PICK_PLACEHOLDER
+                )
                 st.session_state.stocktake_assist_buf_product_name = ""
                 st.session_state.stocktake_assist_buf_supplier = ""
                 st.session_state.stocktake_assist_buf_inventory_category = ""
+                st.session_state.stocktake_assist_buf_management_id = ""
                 st.session_state.pop("stocktake_assist_quick_candidates", None)
                 st.session_state.pop("stocktake_assist_last_n_matching_mids", None)
                 st.session_state.pop("_stocktake_selected_mid", None)
@@ -5826,27 +6161,20 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                 and not _stk_c.empty
                 and df_ledger_hint is not None
             ):
-                with st.expander("近い候補（補助の商品名・仕入先から照合）", expanded=False):
+                with st.expander("近い候補（補助から照合・カード表示）", expanded=False):
                     st.caption(
-                        "今回のリストの在庫中行のうち、補助で選んだ項目に表記が近い行を最大8件表示しています。"
-                        "管理IDで候補リストの **この候補を選ぶ** と照らし合わせてください。"
+                        "今回のリストの在庫中行のうち、補助で確定した内容に近い行を表示します。"
+                        "**この候補を選ぶ** で **選択中の管理ID** に反映され、下部の確定ボタンに進めます。"
                     )
-                    _stk_show = [
-                        c
-                        for c in (
-                            COL_MANAGEMENT_ID,
-                            COL_NAME,
-                            COL_SUPPLIER,
-                            COL_STOCK_STATUS,
-                            COL_LAST_STOCKTAKE,
-                            COL_CATEGORY,
-                        )
-                        if c in _stk_c.columns
+                    _stk_hits = [
+                        _sale_card_hit_from_series(row)
+                        for _, row in _stk_c.iterrows()
                     ]
-                    st.dataframe(
-                        _stk_c[_stk_show],
-                        use_container_width=True,
-                        hide_index=True,
+                    _render_mid_pick_candidate_cards(
+                        _stk_hits,
+                        widget_key_namespace="stk_assist",
+                        sold=False,
+                        pick_mode="stocktake",
                     )
         else:
             st.caption("今回のリストに該当する在庫中行が台帳にありません。")
@@ -6257,16 +6585,20 @@ def _render_sales_management_tab(
             st.session_state.sales_hint_filter_product_name = ""
             st.session_state.sales_hint_filter_supplier = ""
             st.session_state.sales_hint_filter_inventory_category = ""
+            st.session_state.sales_hint_filter_management_id = ""
             st.session_state.sales_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
             st.session_state.sales_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
             st.session_state.sales_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+            st.session_state.sales_ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
             st.session_state.sales_assist_buf_product_name = ""
             st.session_state.sales_assist_buf_supplier = ""
             st.session_state.sales_assist_buf_inventory_category = ""
+            st.session_state.sales_assist_buf_management_id = ""
             st.session_state.pop("sales_assist_quick_candidates", None)
             st.session_state.pop("sales_assist_last_n_matching_mids", None)
             st.session_state.pop("_sale_link_management_id", None)
             st.session_state.pop("_sale_link_warn", None)
+            st.session_state.pop("_sales_photo_match_card_hits", None)
             st.rerun()
 
     if do_match and uploaded is not None:
@@ -6296,8 +6628,17 @@ def _render_sales_management_tab(
                         df_ledger_hint,
                         fill_product_preview_fields=False,
                     )
+                    _pm_cards = _sales_photo_match_card_hits_from_result(
+                        result,
+                        df_ledger_hint,
+                    )
+                    if _pm_cards:
+                        st.session_state["_sales_photo_match_card_hits"] = _pm_cards
+                    else:
+                        st.session_state.pop("_sales_photo_match_card_hits", None)
                     st.success("照合が完了しました。管理IDを確認してください。")
                 except Exception as e:
+                    st.session_state.pop("_sales_photo_match_card_hits", None)
                     st.warning(
                         "現在混み合っているか、無料枠の上限に達している可能性があります。"
                         "1分ほど待ってから再試行してください。"
@@ -6314,19 +6655,34 @@ def _render_sales_management_tab(
             "内容を確認してから確定してください。"
         )
 
+    _spm_hits = st.session_state.get("_sales_photo_match_card_hits")
+    if isinstance(_spm_hits, list) and _spm_hits:
+        st.markdown("##### 写真照合の近い候補（カード）")
+        st.caption(
+            "AI の商品名・仕入先・管理IDと表記が近い **在庫中** の行です。"
+            "**この候補を販売元にする** でその管理IDへ切り替えられます。"
+        )
+        _render_mid_pick_candidate_cards(
+            _spm_hits,
+            widget_key_namespace="sales_photo_match_cards",
+            sold=False,
+            pick_mode="sale",
+        )
+
     if df_ledger_hint is not None and not df_ledger_hint.empty:
         st.markdown("##### 台帳から入力補助（任意）")
         _render_ledger_pick_assist_three_columns(
             df_ledger_hint,
             key_prefix="sales_",
             body_caption=(
-                "仕入タブと同様に絞り込み・プルダウンで選べます。**在庫中** の行だけを対象に、商品名・仕入先・"
-                f"{COL_CATEGORY} が **すべて選ばれたときに一致する行が1件なら**、下の「販売する管理ID」へその **管理ID** を入れます。"
-                "0件または複数件のときは一覧で確認し、手入力してください。"
+                "仕入タブと同様に、商品名・仕入先・在庫カテゴリー・**管理ID** を、文字での絞り込みまたはプルダウンから選べます。"
+                "**在庫中** に限定した上でフィルタを **AND** した結果がちょうど1件のときのみ、自動で "
+                "**販売する管理ID** に反映します。その他は下のカードから選ぶか手入力してください。"
             ),
             on_pick_product_name=_on_sales_assist_pick_product_name,
             on_pick_supplier=_on_sales_assist_pick_supplier,
             on_pick_inventory_category=_on_sales_assist_pick_inventory_category,
+            on_pick_management_id=_on_sales_assist_pick_management_id,
         )
         nm = int(st.session_state.get("sales_assist_last_n_matching_mids", 0) or 0)
         if nm > 1:
@@ -6342,34 +6698,28 @@ def _render_sales_management_tab(
             and not _sac.empty
             and df_ledger_hint is not None
         ):
-            with st.expander("近い候補（補助で選んだ項目・入力文字から照合）", expanded=False):
+            with st.expander(
+                "近い候補（補助で選んだ項目・入力から照合・カード）",
+                expanded=False,
+            ):
                 st.caption(
-                    "入力補助で確定した **商品名・仕入先** と表記が近い在庫中の行を最大8件表示しています。**管理 ID** で販売元を確認してください。"
+                    "入力補助で確定した項目と表記が近い **在庫中** を表示します（棚卸しスキャンの照合と同レイアウト）。"
                 )
-                _s_show = [
-                    c
-                    for c in (
-                        COL_MANAGEMENT_ID,
-                        COL_NAME,
-                        COL_SUPPLIER,
-                        COL_STOCK_STATUS,
-                        COL_PRICE_EXCL,
-                        COL_PLANNED_SALE,
-                        COL_CATEGORY,
-                    )
-                    if c in _sac.columns
+                _s_hits = [
+                    _sale_card_hit_from_series(row) for _, row in _sac.iterrows()
                 ]
-                st.dataframe(
-                    _sac[_s_show],
-                    use_container_width=True,
-                    hide_index=True,
+                _render_mid_pick_candidate_cards(
+                    _s_hits,
+                    widget_key_namespace="sales_assist_cards",
+                    sold=False,
+                    pick_mode="sale",
                 )
 
     if df_ledger_hint is not None and not df_ledger_hint.empty:
         _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
         if _sale_id_opts:
             st.selectbox(
-                "在庫中の管理IDから選ぶ",
+                "在庫中の管理ID（すぐ選ぶ・入力補助と同じ候補）",
                 options=[LEDGER_PICK_PLACEHOLDER] + _sale_id_opts,
                 key="sale_pick_source_id",
                 on_change=_on_sale_pick_source_id,
@@ -6816,9 +7166,11 @@ def main():
                 st.session_state.hint_filter_product_name = ""
                 st.session_state.hint_filter_supplier = ""
                 st.session_state.hint_filter_inventory_category = ""
+                st.session_state.hint_filter_management_id = ""
                 st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
                 st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
                 st.session_state.ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+                st.session_state.ledger_pick_management_id = LEDGER_PICK_PLACEHOLDER
                 st.session_state.field_sale_source_mgmt_id = ""
                 st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
                 st.session_state.pop("ledger_quick_candidates", None)
@@ -6882,13 +7234,15 @@ def main():
                 df_ledger_hint,
                 key_prefix="",
                 body_caption=(
-                    "絞り込み欄に文字を入れると候補が絞られます。プルダウンで選ぶと下の **必須入力欄** に反映されます（あとから手修正も可能です）。"
+                    "絞り込み欄に文字を入れると候補が絞られます。商品名・仕入先・在庫カテゴリーは個別にプルダウンで選べます。"
+                    "**管理ID** をプルダウンで選ぶと、その台帳1行から **商品名・仕入先・カテゴリー・仕入金額（税抜）・販売予定（税抜）** を一度に反映します。"
                     "在庫中の行に一致したときは **販売予定金額（税抜・任意）** にも、台帳の1点あたりの値を入れます（選んだ行の値をそのまま反映）。"
                     f"**{COL_CATEGORY}** も同様に、台帳の既存値から選べます。"
                 ),
                 on_pick_product_name=_on_ledger_pick_product_name,
                 on_pick_supplier=_on_ledger_pick_supplier,
                 on_pick_inventory_category=_on_ledger_pick_inventory_category,
+                on_pick_management_id=_on_ledger_pick_management_id,
             )
         elif _uses_local_inventory_csv() or _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
             st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
@@ -6912,29 +7266,18 @@ def main():
             and not _cand.empty
             and df_ledger_hint is not None
         ):
-            with st.expander("近い候補（写真解析・入力文字から照合）", expanded=False):
+            with st.expander("近い候補（写真解析・入力文字から照合・カード）", expanded=False):
                 st.caption(
-                    "商品名・仕入先の表記が近い台帳行を最大8件表示しています（**在庫中・販売済** などステータスは問いません）。"
-                    "上の「台帳から入力補助」で同じ文言を選ぶか、管理IDを手元で確認して台帳一覧と突き合わせてください。"
+                    "Gemini で管理IDが一致しないときは、**名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
+                    "カードから選ぶと、仕入入力の必須項目へ反映されます（在庫中・販売済どちらも候補対象）。"
                 )
-                _show_cols = [
-                    c
-                    for c in (
-                        COL_MANAGEMENT_ID,
-                        COL_NAME,
-                        COL_SUPPLIER,
-                        COL_STOCK_STATUS,
-                        COL_PRICE_EXCL,
-                        COL_PLANNED_SALE,
-                        COL_LAST_STOCKTAKE,
-                        COL_CATEGORY,
-                    )
-                    if c in _cand.columns
-                ]
-                st.dataframe(
-                    _cand[_show_cols],
-                    use_container_width=True,
-                    hide_index=True,
+                _p_hits = [_sale_card_hit_from_series(row) for _, row in _cand.iterrows()]
+                _render_mid_pick_candidate_cards(
+                    _p_hits,
+                    widget_key_namespace="purchase_quick_cards",
+                    sold=False,
+                    pick_mode="purchase",
+                    page_size=5,
                 )
     
         st.number_input(
