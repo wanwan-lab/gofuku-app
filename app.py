@@ -22,7 +22,6 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED … GAS 未設定時に台帳の画像URL列へ入れるプレースホルダ URL
   APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
   INVENTORY_SOURCE           … ``csv`` | ``sheet`` 。未指定時は **GOOGLE_SPREADSHEET_ID があるとき sheet**、無いとき **csv**（リポジトリ直下 ``inventory.csv`` または環境変数 ``GOFUKU_INVENTORY_CSV``）。
-  GEMINI_LEDGER_REF_IMAGE_MAX … 1回の Gemini 呼び出しに添付する台帳参照画像の最大枚数（バッチサイズ。未設定時は下記定数。10〜250 にクランプ）。参照枚数がこれを超えるときは **複数回 API を呼び** 結果を統合する
 
 ※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（既定は flash 系プレビュー）。
 ※ **登録（インプット）** ページの証憑取込で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
@@ -223,7 +222,6 @@ SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION = "google_service_account"
 SECRET_APP_PASSWORD = "APP_PASSWORD"
 SECRET_INVENTORY_SOURCE = "INVENTORY_SOURCE"
 SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED = "FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED"
-SECRET_GEMINI_LEDGER_REF_IMAGE_MAX = "GEMINI_LEDGER_REF_IMAGE_MAX"
 
 # --- secrets に無いときの既定（非機密のデフォルトのみ） ---
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
@@ -251,11 +249,6 @@ STOCKTAKE_CAND_PAGE_SIZE = 5
 STOCKTAKE_CAND_AI_MAX = 40
 # 棚卸しスキャン: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
 STOCKTAKE_CAND_MIN_CONFIDENCE = 0.14
-# 1回の Gemini 呼び出しに添付する台帳参照画像の最大枚数（バッチサイズ。secrets の GEMINI_LEDGER_REF_IMAGE_MAX で上書き可）
-GEMINI_LEDGER_REF_IMAGE_MAX = 100
-# 1回の照合で **取得を試みる** 台帳参照画像の安全上限（メモリ・所要時間対策。超える行は打ち切り）
-GEMINI_LEDGER_REF_MAX_COLLECT = 5000
-GEMINI_LEDGER_REF_IMAGE_MAX_EDGE = 768
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
@@ -276,13 +269,7 @@ _GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA = """
 - 商品名が **略称・英字・カタカナ・型番のみ** で、写真の見え方と文字が違っても同一在庫と判断できるならその management_id を選ぶ。
 - 柄は **和柄だけでなく** 無地・ストライプ・チェック・ロゴ・プリント等も手がかりにする。
 - 衣料・帽子で確信が低いときは **候補数を増やし** confidence を **0.12〜0.35** 程度まで下げてよい（明らかに無関係な行は入れない）。
-- **台帳の画像 URL から読み込んだ参考写真** が同じプロンプト内に載るときは、その **形状・色・柄・質感・シルエット** と質問の写真を必ず見比べ、テキストの商品名と矛盾しない範囲で **視覚的に最も同一在庫に近い management_id** を優先して選ぶ。参考写真が読めない行はテキストだけで判断する。
 """.strip()
-
-_GEMINI_LEDGER_REF_IMAGES_NOTICE_JA = (
-    "続く画像は **台帳に登録された画像 URL からサーバー側で取得した参考写真** です。"
-    "**直前に付いた管理 ID** の行が対応します。質問となる **最初の写真** と並べて、形・色・柄・質感で同一在庫か判断してください。\n\n"
-)
 
 # 証憑取込（Gemini への共通指示・JSON 仕様）
 VOUCHER_EXTRACTION_RULES = """注意点:
@@ -522,18 +509,6 @@ def _secret_int(
         return default
 
 
-def _gemini_ledger_ref_image_max() -> int:
-    """1回の **Gemini API 呼び出し** に添付する台帳参照画像の上限＝バッチサイズ（secrets または定数）。
-    参照枚数がこれを超えるときは複数バッチ送信し、結果をマージする。
-    """
-    return _secret_int(
-        SECRET_GEMINI_LEDGER_REF_IMAGE_MAX,
-        GEMINI_LEDGER_REF_IMAGE_MAX,
-        min_value=10,
-        max_value=250,
-    )
-
-
 def _gas_upload_timeout_seconds() -> int:
     return _secret_int(
         SECRET_GAS_UPLOAD_TIMEOUT_SECONDS,
@@ -610,161 +585,6 @@ def _parse_json_from_model(text: str) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise ValueError("JSON がオブジェクト形式ではありません。")
     return obj
-
-
-def _safe_parse_json_object_from_model_text(text: str) -> dict[str, Any]:
-    if not (text or "").strip():
-        return {}
-    try:
-        return _parse_json_from_model(text)
-    except Exception:
-        return {}
-
-
-def _merge_gemini_stocktake_batches(batch_dicts: list[dict[str, Any]]) -> dict[str, Any]:
-    """複数バッチの棚卸し照合 JSON を統合（管理 ID 単位で最高 confidence を採用）。"""
-    by_mid: dict[str, dict[str, Any]] = {}
-    for d in batch_dicts:
-        sc = d.get("stocktake_candidates")
-        if isinstance(sc, list):
-            for item in sc:
-                if isinstance(item, dict):
-                    mid = str(item.get("management_id") or "").strip()
-                    if not mid:
-                        continue
-                    cf = float(item.get("confidence") or 0)
-                    prev = by_mid.get(mid)
-                    prev_cf = float(prev.get("confidence") or 0) if prev else -1.0
-                    if prev is None or cf > prev_cf:
-                        by_mid[mid] = dict(item)
-        m0 = d.get("match")
-        if isinstance(m0, dict):
-            mid = str(m0.get("management_id") or "").strip()
-            if mid:
-                cf = float(m0.get("confidence") or 0)
-                prev = by_mid.get(mid)
-                prev_cf = float(prev.get("confidence") or 0) if prev else -1.0
-                if prev is None or cf > prev_cf:
-                    by_mid[mid] = dict(m0)
-    merged = sorted(
-        by_mid.values(), key=lambda x: -float(x.get("confidence") or 0)
-    )
-    out: dict[str, Any] = {"stocktake_candidates": merged}
-    if merged:
-        top = merged[0]
-        out["match"] = {
-            "management_id": str(top.get("management_id") or ""),
-            "confidence": float(top.get("confidence") or 0),
-            "product_name": str(top.get("product_name") or ""),
-            "supplier": str(top.get("supplier") or ""),
-        }
-    return out
-
-
-def _merge_gemini_sale_link_batches(batch_dicts: list[dict[str, Any]]) -> dict[str, Any]:
-    best: dict[str, Any] | None = None
-    best_cf = -1.0
-    empty_fallback: dict[str, Any] | None = None
-    for d in batch_dicts:
-        m = d.get("match")
-        if not isinstance(m, dict):
-            continue
-        mid = str(m.get("management_id") or "").strip()
-        cf = float(m.get("confidence") or 0)
-        if mid:
-            if cf > best_cf:
-                best_cf = cf
-                best = dict(m)
-        elif empty_fallback is None:
-            empty_fallback = dict(m)
-    pick = best or empty_fallback or {
-        "management_id": "",
-        "confidence": 0.0,
-        "product_name": "",
-        "supplier": "",
-        "line_price_excl": None,
-    }
-    return {"match": pick}
-
-
-def _merge_gemini_full_batches(batch_dicts: list[dict[str, Any]]) -> dict[str, Any]:
-    """仕入写真解析モードで、複数バッチの JSON を 1 つに統合（商品項目は優先順で埋め、match は confidence 最大）。"""
-    if not batch_dicts:
-        return {}
-    out = dict(batch_dicts[0])
-    scalar_keys = (
-        "product_name",
-        "supplier",
-        "inventory_category",
-        "product_kind",
-        "color",
-        "pattern",
-        "material",
-        "condition",
-    )
-    for k in scalar_keys:
-        cur = out.get(k)
-        if cur is None or (isinstance(cur, str) and not str(cur).strip()):
-            for d in batch_dicts[1:]:
-                if k not in d:
-                    continue
-                v = d.get(k)
-                if v is not None and (
-                    not isinstance(v, str) or str(v).strip()
-                ):
-                    out[k] = v
-                    break
-    qty_ok = False
-    for d in batch_dicts:
-        q = d.get("quantity")
-        if q is None:
-            continue
-        try:
-            qi = int(float(str(q)))
-            if qi >= 1:
-                out["quantity"] = qi
-                qty_ok = True
-                break
-        except Exception:
-            continue
-    if not qty_ok and "quantity" not in out:
-        out["quantity"] = 1
-
-    def _unit_price_usable(v: Any) -> bool:
-        if v is None:
-            return False
-        if isinstance(v, str):
-            s = v.strip().lower()
-            return bool(s) and s not in ("null", "none", "-", "不明")
-        try:
-            return math.isfinite(float(v))
-        except (TypeError, ValueError):
-            return False
-
-    upx: Any = batch_dicts[0].get("unit_price_excl")
-    if not _unit_price_usable(upx):
-        for d in batch_dicts[1:]:
-            u = d.get("unit_price_excl")
-            if _unit_price_usable(u):
-                upx = u
-                break
-    out["unit_price_excl"] = upx if _unit_price_usable(upx) else None
-    best_m: dict[str, Any] | None = None
-    best_cf = -1.0
-    for d in batch_dicts:
-        m = d.get("match")
-        if not isinstance(m, dict):
-            continue
-        mid = str(m.get("management_id") or "").strip()
-        cf = float(m.get("confidence") or 0)
-        if mid and cf > best_cf:
-            best_cf = cf
-            best_m = dict(m)
-    if best_m:
-        out["match"] = best_m
-    else:
-        out.pop("match", None)
-    return out
 
 
 def _coerce_positive_int(val: Any, default: int = 1) -> int:
@@ -1174,7 +994,6 @@ def analyze_image_with_gemini(
     *,
     inventory_context: str | None = None,
     prompt_mode: str = "full",
-    ledger_reference_images: list[tuple[str, bytes]] | None = None,
 ) -> str:
     api_key = _secret_str(SECRET_GEMINI_API_KEY)
     if not api_key:
@@ -1184,35 +1003,6 @@ def analyze_image_with_gemini(
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(_gemini_model_name())
     subject = _pil_image_for_gemini(image_data)
-    refs = ledger_reference_images or []
-    batch_sz = max(1, _gemini_ledger_ref_image_max())
-
-    def _ref_batches(seq: list[tuple[str, bytes]]) -> list[list[tuple[str, bytes]]]:
-        if not seq:
-            return [[]]
-        return [seq[i : i + batch_sz] for i in range(0, len(seq), batch_sz)]
-
-    def _ref_parts(seq: list[tuple[str, bytes]]) -> list[Any]:
-        ps: list[Any] = []
-        if not seq:
-            return ps
-        ps.append(_GEMINI_LEDGER_REF_IMAGES_NOTICE_JA)
-        for mid, jpeg_b in seq:
-            ps.append(f"参照・管理ID={json.dumps(mid)}\n")
-            ps.append(Image.open(io.BytesIO(jpeg_b)).convert("RGB"))
-        return ps
-
-    batches = _ref_batches(refs)
-    n_batches = len(batches)
-
-    def _batch_split_notice(batch_index_zero_based: int) -> str:
-        if n_batches <= 1:
-            return ""
-        return (
-            f"※参照画像が多いため **{n_batches}** 回に分けて Gemini に送信しています。"
-            f"これは **第 {batch_index_zero_based + 1} / {n_batches} 回** です。**最初の写真は常に同一の質問画像**であり、続く参照画像だけがこのバッチ分です。"
-            "台帳のテキストリストは共通です。このバッチで考えられる候補を JSON に出力してください（アプリが全バッチを統合します）。\n\n"
-        )
 
     inv_stripped = (inventory_context or "").strip()
     inv_tail_for_match = ""
@@ -1239,17 +1029,14 @@ def analyze_image_with_gemini(
             raise ValueError(
                 "棚卸しの照合には台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
             )
-        intro = f"""**直後の最初の画像** が、棚卸しのために撮影した **現物1点** です（衣料・アパレル・帽子・雑貨・一点物など **業種を限定しない** ）。
+        prompt = f"""**直後の画像** が、棚卸しのために撮影した **現物1点** です（衣料・アパレル・帽子・雑貨・一点物など **業種を限定しない** ）。
 {_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
-続く画像は台帳の **{COL_IMAGE_URL}** 列の URL から取得した参考写真のときがあります（各画像の **直前の参照・管理ID** の行に対応）。**最初の画像** と形・色・柄・質感を見比べて照合してください。
 
 次の **続きのテキスト** に示すリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定します（販売済は含みません。リスト外の管理IDは返さない）。
 同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
-**どの行が写真の品かは、金額の一致では判断しない**（商品名・メモ・カテゴリー・仕入先・タグ・色形・参考写真などで推測する）。
+**どの行が写真の品かは、金額の一致では判断しない**（商品名・メモ・カテゴリー・仕入先・タグ・色形などで推測する）。
 **リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
 ---
-"""
-        tail = f"""
 {inv_stripped}
 
 返却形式（キーは次のみ）:
@@ -1263,19 +1050,8 @@ def analyze_image_with_gemini(
   各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
 
 任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
-        texts: list[str] = []
-        for bi, chunk in enumerate(batches):
-            preamble = _batch_split_notice(bi)
-            response = model.generate_content(
-                [preamble + intro, subject, *_ref_parts(chunk), tail]
-            )
-            texts.append(response.text or "")
-        if n_batches == 1:
-            return texts[0]
-        merged = _merge_gemini_stocktake_batches(
-            [_safe_parse_json_object_from_model_text(t) for t in texts]
-        )
-        return json.dumps(merged, ensure_ascii=False)
+        response = model.generate_content([prompt, subject])
+        return response.text or ""
 
     if prompt_mode == "sale_link":
         if not inv_stripped:
@@ -1283,14 +1059,12 @@ def analyze_image_with_gemini(
                 "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です（管理ID・商品名などが入っている行）。"
                 "在庫がすべて販売済のときや、台帳の読み込みに失敗しているときは使えません。"
             )
-        intro = f"""**直後の最初の画像** は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（衣料・アパレル・帽子・雑貨など **業種を限定しない** 在庫）。
+        prompt = f"""**直後の画像** は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（衣料・アパレル・帽子・雑貨など **業種を限定しない** 在庫）。
 {_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
-続く画像は台帳 **{COL_IMAGE_URL}** 由来の参考写真のときがあります。各画像の **直前の参照・管理ID** の行と対応し、**最初の画像** と見比べて同一在庫か判断してください。
+
 次の **続きのテキスト** のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。**行の選定に金額の一致は使わない。** 必ずこのリストの中からだけ management_id を選べ。
 JSON だけを返してください（説明文・コードフェンス禁止）。
 ---
-"""
-        tail = f"""
 {inv_stripped}
 
 返却形式（キーは次のみ）:
@@ -1302,21 +1076,10 @@ JSON だけを返してください（説明文・コードフェンス禁止）
   - "line_price_excl" (integer or null): 選んだ行の仕入金額（税抜）を台帳どおり（**写真と金額が一致するかで行を決めない**）。不明なら null
 
 該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
-        texts_s: list[str] = []
-        for bi, chunk in enumerate(batches):
-            preamble = _batch_split_notice(bi)
-            response = model.generate_content(
-                [preamble + intro, subject, *_ref_parts(chunk), tail]
-            )
-            texts_s.append(response.text or "")
-        if n_batches == 1:
-            return texts_s[0]
-        merged_s = _merge_gemini_sale_link_batches(
-            [_safe_parse_json_object_from_model_text(t) for t in texts_s]
-        )
-        return json.dumps(merged_s, ensure_ascii=False)
+        response = model.generate_content([prompt, subject])
+        return response.text or ""
 
-    schema_intro = f"""**直後の最初の画像** は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。この画像について次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
+    schema_intro = f"""**直後の画像** は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。この画像について次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
 説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
 
 必須キー（値の型を守ること）:
@@ -1331,34 +1094,13 @@ JSON だけを返してください（説明文・コードフェンス禁止）
 - "condition" (string): 状態の推定。不明なら ""
 - "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
 """
-    texts_f: list[str] = []
-    for bi, chunk in enumerate(batches):
-        preamble = _batch_split_notice(bi)
-        schema_refs_note = ""
-        if chunk:
-            schema_refs_note = (
-                f"\n続く画像に台帳 **{COL_IMAGE_URL}** 由来の参考写真があるときがあります。"
-                "**直前テキストの参照・管理ID** の行に対応し、質問となる **最初の画像** と並べて照合してください。\n\n"
-            )
-        schema_footer = f"""{schema_refs_note}任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
+    schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
   リストの行に **{COL_CATEGORY}** が載っているときは、照合して "match" に management_id を入れる場合 **必ず** 同じ行の値を "inventory_category" に含める。リストにカテゴリーが無いときのみ省略可。
   不要・該当なしのときは "match" キー自体を省略してもよい。"""
-        resp = model.generate_content(
-            [
-                preamble + schema_intro,
-                subject,
-                *_ref_parts(chunk),
-                inv_tail_for_match + schema_footer,
-            ]
-        )
-        texts_f.append(resp.text or "")
-    if n_batches == 1:
-        return texts_f[0]
-    merged_f = _merge_gemini_full_batches(
-        [_safe_parse_json_object_from_model_text(t) for t in texts_f]
-    )
-    return json.dumps(merged_f, ensure_ascii=False)
+    prompt = schema_intro + inv_tail_for_match + schema_footer
+    response = model.generate_content([prompt, subject])
+    return response.text or ""
 
 
 def _voucher_configure_model():
@@ -2602,88 +2344,6 @@ def _build_gemini_inventory_context(
     return "\n".join(lines)
 
 
-def _ledger_image_bytes_for_gemini(image_url: str) -> bytes | None:
-    """ギャラリー表示と同等の URL 解決・取得で読み込み、長辺を抑えて JPEG バイトで返す（Gemini 参照用）。"""
-    iu = (image_url or "").strip()
-    if not (iu.startswith("http://") or iu.startswith("https://")):
-        return None
-    edge = max(320, min(2048, int(GEMINI_LEDGER_REF_IMAGE_MAX_EDGE)))
-    sz = min(edge * 2, 2400)
-    fid = _google_drive_file_id_from_url(iu)
-    candidates: list[str] = []
-    if fid:
-        candidates.append(f"https://drive.google.com/thumbnail?id={fid}&sz=w{sz}")
-        candidates.append(
-            f"https://drive.usercontent.google.com/download?id={fid}&export=view"
-        )
-    candidates.append(iu)
-    ua = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-    }
-    timeout = 20.0
-    for cand in candidates:
-        try:
-            r = requests.get(cand, timeout=timeout, headers=ua, allow_redirects=True)
-        except Exception:
-            continue
-        if r.status_code != 200 or not r.content or len(r.content) < 32:
-            continue
-        low512 = r.content[:512].lower()
-        if b"<html" in low512 or b"<!doctype" in low512:
-            continue
-        try:
-            im = Image.open(io.BytesIO(r.content))
-            im = ImageOps.exif_transpose(im)
-            im.thumbnail((edge, edge), Image.Resampling.LANCZOS)
-            buf = io.BytesIO()
-            im.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
-            return buf.getvalue()
-        except Exception:
-            continue
-    return None
-
-
-def _collect_ledger_reference_images(
-    df: pd.DataFrame,
-    *,
-    max_lines: int = 400,
-    only_in_stock: bool = True,
-    management_ids_filter: set[str] | None = None,
-    max_collect: int | None = None,
-) -> list[tuple[str, bytes]]:
-    """台帳の並び順で http(s) 画像 URL を走査し、(管理ID, JPEG) を順にすべて収集する。
-
-    Gemini へはバッチ送信する（:func:`_gemini_ledger_ref_image_max` 枚ずつ）。
-    ``max_collect`` が None のときは :data:`GEMINI_LEDGER_REF_MAX_COLLECT` 件まで
-    （超える場合は未取得の参照が省略される）。
-    """
-    collect_cap = GEMINI_LEDGER_REF_MAX_COLLECT if max_collect is None else max(0, int(max_collect))
-    out: list[tuple[str, bytes]] = []
-    if collect_cap <= 0:
-        return out
-    for row in _iterate_gemini_inventory_rows(
-        df,
-        max_lines=max_lines,
-        only_in_stock=only_in_stock,
-        management_ids_filter=management_ids_filter,
-    ):
-        if len(out) >= collect_cap:
-            break
-        url = str(row.get(COL_IMAGE_URL, "") or "").strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            continue
-        mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
-        if not mid:
-            continue
-        blob = _ledger_image_bytes_for_gemini(url)
-        if blob:
-            out.append((mid, blob))
-    return out
-
-
 def _fuzzy_ledger_match_rows(
     df: pd.DataFrame,
     product_name: str,
@@ -3211,6 +2871,286 @@ def _ledger_unique_col_values(df: pd.DataFrame, col: str, *, max_n: int = 800) -
     s = df[col].astype(str).str.strip()
     s = s[s != ""]
     return sorted(set(s.tolist()), key=lambda x: (x.casefold(), x))[:max_n]
+
+
+def _assist_field_keys(prefix: str) -> dict[str, str]:
+    """台帳入力補助の session / widget キー（prefix 無しなら仕入タブと同じ名前）。"""
+    if prefix:
+        return {
+            "fp_filter": f"{prefix}hint_filter_product_name",
+            "fs_filter": f"{prefix}hint_filter_supplier",
+            "fc_filter": f"{prefix}hint_filter_inventory_category",
+            "pick_p": f"{prefix}ledger_pick_product_name",
+            "pick_s": f"{prefix}ledger_pick_supplier",
+            "pick_c": f"{prefix}ledger_pick_inventory_category",
+            "seen_fp": f"{prefix}_hint_seen_product",
+            "seen_fs": f"{prefix}_hint_seen_supplier",
+            "seen_fc": f"{prefix}_hint_seen_category",
+        }
+    return {
+        "fp_filter": "hint_filter_product_name",
+        "fs_filter": "hint_filter_supplier",
+        "fc_filter": "hint_filter_inventory_category",
+        "pick_p": "ledger_pick_product_name",
+        "pick_s": "ledger_pick_supplier",
+        "pick_c": "ledger_pick_inventory_category",
+        "seen_fp": "_hint_fp_seen",
+        "seen_fs": "_hint_fs_seen",
+        "seen_fc": "_hint_cat_seen",
+    }
+
+
+def _render_ledger_pick_assist_three_columns(
+    df: pd.DataFrame,
+    *,
+    key_prefix: str,
+    body_caption: str,
+    on_pick_product_name: Any,
+    on_pick_supplier: Any,
+    on_pick_inventory_category: Any,
+    empty_message: str = "台帳が空か読み込めないため、入力補助の候補は表示できません。",
+) -> None:
+    """商品名／仕入先／在庫カテゴリーの絞り込みと台帳プルダウン（仕入・販売・棚卸で共用）。"""
+    if df is None or df.empty:
+        st.caption(empty_message)
+        return
+    k = _assist_field_keys(key_prefix)
+    st.caption(body_caption)
+    hc1, hc2, hc3 = st.columns(3)
+    with hc1:
+        st.text_input(
+            "商品名の絞り込み（部分一致）",
+            key=k["fp_filter"],
+            placeholder="例: 帯",
+        )
+        fp = str(st.session_state.get(k["fp_filter"], "") or "").strip()
+        if st.session_state.get(k["seen_fp"], "") != fp:
+            st.session_state[k["seen_fp"]] = fp
+            st.session_state[k["pick_p"]] = LEDGER_PICK_PLACEHOLDER
+        opts_p = _ledger_unique_col_values(df, COL_NAME)
+        if fp.casefold():
+            q = fp.casefold()
+            opts_p = [x for x in opts_p if q in x.casefold()][:400]
+        st.selectbox(
+            "台帳に登録済みの商品名から選ぶ",
+            options=[LEDGER_PICK_PLACEHOLDER] + opts_p,
+            key=k["pick_p"],
+            on_change=on_pick_product_name,
+        )
+    with hc2:
+        st.text_input(
+            "仕入先・取引先の絞り込み（部分一致）",
+            key=k["fs_filter"],
+            placeholder="例: ⚫︎⚫︎会社",
+        )
+        fs = str(st.session_state.get(k["fs_filter"], "") or "").strip()
+        if st.session_state.get(k["seen_fs"], "") != fs:
+            st.session_state[k["seen_fs"]] = fs
+            st.session_state[k["pick_s"]] = LEDGER_PICK_PLACEHOLDER
+        opts_s = _ledger_unique_col_values(df, COL_SUPPLIER)
+        if fs.casefold():
+            q = fs.casefold()
+            opts_s = [x for x in opts_s if q in x.casefold()][:400]
+        st.selectbox(
+            "台帳に登録済みの仕入先・取引先から選ぶ",
+            options=[LEDGER_PICK_PLACEHOLDER] + opts_s,
+            key=k["pick_s"],
+            on_change=on_pick_supplier,
+        )
+    with hc3:
+        if COL_CATEGORY in df.columns:
+            st.text_input(
+                "在庫カテゴリーの絞り込み（部分一致）",
+                key=k["fc_filter"],
+                placeholder="例: 帯",
+            )
+            fc = str(st.session_state.get(k["fc_filter"], "") or "").strip()
+            if st.session_state.get(k["seen_fc"], "") != fc:
+                st.session_state[k["seen_fc"]] = fc
+                st.session_state[k["pick_c"]] = LEDGER_PICK_PLACEHOLDER
+            opts_c = _ledger_unique_col_values(df, COL_CATEGORY)
+            if fc.casefold():
+                q = fc.casefold()
+                opts_c = [x for x in opts_c if q in x.casefold()][:400]
+            st.selectbox(
+                "台帳の在庫カテゴリーから選ぶ",
+                options=[LEDGER_PICK_PLACEHOLDER] + opts_c,
+                key=k["pick_c"],
+                on_change=on_pick_inventory_category,
+            )
+        else:
+            st.caption("台帳に在庫カテゴリー列がありません。")
+
+
+def _stocktake_assist_scope_dataframe(
+    df: pd.DataFrame | None, remaining_management_ids: set[str] | None
+) -> pd.DataFrame | None:
+    """棚卸入力補助の対象行（在庫中。remaining付きならその管理IDのみ）。"""
+    if df is None or df.empty:
+        return None
+    sub = df.loc[_mask_ledger_in_stock(df)]
+    if COL_MANAGEMENT_ID not in sub.columns:
+        return sub
+    if remaining_management_ids is not None:
+        filt = {str(x).strip() for x in remaining_management_ids if str(x).strip()}
+        if not filt:
+            return sub.iloc[0:0].copy()
+        m = sub[COL_MANAGEMENT_ID].astype(str).str.strip().isin(filt)
+        sub = sub.loc[m].copy()
+    return sub
+
+
+def _sales_rows_matching_assist_buffers() -> tuple[pd.DataFrame, list[str]]:
+    """販売用: 入力補助バッファに一致する在庫中行と管理 ID 一覧。"""
+    try:
+        df = load_inventory_dataframe()
+    except Exception:
+        return pd.DataFrame(), []
+    if df is None or df.empty:
+        return pd.DataFrame(), []
+    sub = df.loc[_mask_ledger_in_stock(df)]
+    pn = str(st.session_state.get("sales_assist_buf_product_name", "") or "").strip()
+    su = str(st.session_state.get("sales_assist_buf_supplier", "") or "").strip()
+    cat = str(st.session_state.get("sales_assist_buf_inventory_category", "") or "").strip()
+    if pn and COL_NAME in sub.columns:
+        sub = sub.loc[sub[COL_NAME].astype(str).str.strip() == pn]
+    if su and COL_SUPPLIER in sub.columns:
+        sub = sub.loc[sub[COL_SUPPLIER].astype(str).str.strip() == su]
+    if cat and COL_CATEGORY in sub.columns:
+        sub = sub.loc[sub[COL_CATEGORY].astype(str).str.strip() == cat]
+    if sub.empty or COL_MANAGEMENT_ID not in sub.columns:
+        return sub, []
+    mids = sorted(
+        {str(x).strip() for x in sub[COL_MANAGEMENT_ID].tolist() if str(x).strip()},
+        key=_management_id_sort_key,
+    )
+    return sub, mids
+
+
+def _sales_apply_mgmt_id_after_assist_pick() -> None:
+    _, mids = _sales_rows_matching_assist_buffers()
+    st.session_state.sales_assist_last_n_matching_mids = len(mids)
+    if len(mids) == 1:
+        st.session_state.field_sale_source_mgmt_id = mids[0]
+
+
+def _on_sales_assist_pick_product_name() -> None:
+    v = str(st.session_state.get("sales_ledger_pick_product_name", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.sales_assist_buf_product_name = v
+        st.session_state.sales_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+    _sales_apply_mgmt_id_after_assist_pick()
+
+
+def _on_sales_assist_pick_supplier() -> None:
+    v = str(st.session_state.get("sales_ledger_pick_supplier", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.sales_assist_buf_supplier = v
+        st.session_state.sales_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+    _sales_apply_mgmt_id_after_assist_pick()
+
+
+def _on_sales_assist_pick_inventory_category() -> None:
+    v = str(st.session_state.get("sales_ledger_pick_inventory_category", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.sales_assist_buf_inventory_category = v
+        st.session_state.sales_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+    _sales_apply_mgmt_id_after_assist_pick()
+
+
+def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None:
+    """販売タブ・入力補助バッファから在庫中の近い行を一覧用に格納する。"""
+    if df_hint is None or df_hint.empty:
+        st.session_state.pop("sales_assist_quick_candidates", None)
+        return
+    pn = str(st.session_state.get("sales_assist_buf_product_name", "") or "").strip()
+    su = str(st.session_state.get("sales_assist_buf_supplier", "") or "").strip()
+    sub = df_hint.loc[_mask_ledger_in_stock(df_hint)]
+    if sub.empty:
+        st.session_state.pop("sales_assist_quick_candidates", None)
+        return
+    cand = _fuzzy_ledger_match_rows(sub, pn, su, limit=8)
+    if cand.empty:
+        st.session_state.pop("sales_assist_quick_candidates", None)
+    else:
+        st.session_state["sales_assist_quick_candidates"] = cand
+
+
+def _stocktake_rows_matching_assist_buffers(
+    df_hint: pd.DataFrame | None, remaining: set[str] | None
+) -> tuple[pd.DataFrame, list[str]]:
+    base = _stocktake_assist_scope_dataframe(df_hint, remaining)
+    if base is None or base.empty:
+        return base or pd.DataFrame(), []
+    sub = base
+    pn = str(st.session_state.get("stocktake_assist_buf_product_name", "") or "").strip()
+    su = str(st.session_state.get("stocktake_assist_buf_supplier", "") or "").strip()
+    cat = str(st.session_state.get("stocktake_assist_buf_inventory_category", "") or "").strip()
+    if pn and COL_NAME in sub.columns:
+        sub = sub.loc[sub[COL_NAME].astype(str).str.strip() == pn]
+    if su and COL_SUPPLIER in sub.columns:
+        sub = sub.loc[sub[COL_SUPPLIER].astype(str).str.strip() == su]
+    if cat and COL_CATEGORY in sub.columns:
+        sub = sub.loc[sub[COL_CATEGORY].astype(str).str.strip() == cat]
+    if sub.empty or COL_MANAGEMENT_ID not in sub.columns:
+        return sub, []
+    mids = sorted(
+        {str(x).strip() for x in sub[COL_MANAGEMENT_ID].tolist() if str(x).strip()},
+        key=_management_id_sort_key,
+    )
+    return sub, mids
+
+
+def _stocktake_apply_selected_mid_after_assist_pick() -> None:
+    st_rem = _inv_stocktake_work_remaining_get()
+    df = _ledger_hint_dataframe()
+    _, mids = _stocktake_rows_matching_assist_buffers(df, st_rem)
+    st.session_state.stocktake_assist_last_n_matching_mids = len(mids)
+    if len(mids) == 1:
+        st.session_state["_stocktake_selected_mid"] = mids[0]
+
+
+def _on_stocktake_assist_pick_product_name() -> None:
+    v = str(st.session_state.get("stocktake_ledger_pick_product_name", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.stocktake_assist_buf_product_name = v
+        st.session_state.stocktake_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+    _stocktake_apply_selected_mid_after_assist_pick()
+
+
+def _on_stocktake_assist_pick_supplier() -> None:
+    v = str(st.session_state.get("stocktake_ledger_pick_supplier", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.stocktake_assist_buf_supplier = v
+        st.session_state.stocktake_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+    _stocktake_apply_selected_mid_after_assist_pick()
+
+
+def _on_stocktake_assist_pick_inventory_category() -> None:
+    v = str(st.session_state.get("stocktake_ledger_pick_inventory_category", "") or "")
+    if v and v != LEDGER_PICK_PLACEHOLDER:
+        st.session_state.stocktake_assist_buf_inventory_category = v
+        st.session_state.stocktake_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+    _stocktake_apply_selected_mid_after_assist_pick()
+
+
+def _refresh_stocktake_assist_quick_candidates(
+    df_hint: pd.DataFrame | None, remaining: set[str] | None
+) -> None:
+    if df_hint is None or df_hint.empty:
+        st.session_state.pop("stocktake_assist_quick_candidates", None)
+        return
+    base = _stocktake_assist_scope_dataframe(df_hint, remaining)
+    if base is None or base.empty:
+        st.session_state.pop("stocktake_assist_quick_candidates", None)
+        return
+    pn = str(st.session_state.get("stocktake_assist_buf_product_name", "") or "").strip()
+    su = str(st.session_state.get("stocktake_assist_buf_supplier", "") or "").strip()
+    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=8)
+    if cand.empty:
+        st.session_state.pop("stocktake_assist_quick_candidates", None)
+    else:
+        st.session_state["stocktake_assist_quick_candidates"] = cand
 
 
 def _ledger_in_stock_management_ids(df: pd.DataFrame, *, max_n: int = 600) -> list[str]:
@@ -5659,6 +5599,42 @@ def _init_registration_form_session_state() -> None:
         st.session_state.field_sale_source_mgmt_id = ""
     if "sale_pick_source_id" not in st.session_state:
         st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
+    if "sales_hint_filter_product_name" not in st.session_state:
+        st.session_state.sales_hint_filter_product_name = ""
+    if "sales_hint_filter_supplier" not in st.session_state:
+        st.session_state.sales_hint_filter_supplier = ""
+    if "sales_hint_filter_inventory_category" not in st.session_state:
+        st.session_state.sales_hint_filter_inventory_category = ""
+    if "sales_ledger_pick_product_name" not in st.session_state:
+        st.session_state.sales_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+    if "sales_ledger_pick_supplier" not in st.session_state:
+        st.session_state.sales_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+    if "sales_ledger_pick_inventory_category" not in st.session_state:
+        st.session_state.sales_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+    if "sales_assist_buf_product_name" not in st.session_state:
+        st.session_state.sales_assist_buf_product_name = ""
+    if "sales_assist_buf_supplier" not in st.session_state:
+        st.session_state.sales_assist_buf_supplier = ""
+    if "sales_assist_buf_inventory_category" not in st.session_state:
+        st.session_state.sales_assist_buf_inventory_category = ""
+    if "stocktake_hint_filter_product_name" not in st.session_state:
+        st.session_state.stocktake_hint_filter_product_name = ""
+    if "stocktake_hint_filter_supplier" not in st.session_state:
+        st.session_state.stocktake_hint_filter_supplier = ""
+    if "stocktake_hint_filter_inventory_category" not in st.session_state:
+        st.session_state.stocktake_hint_filter_inventory_category = ""
+    if "stocktake_ledger_pick_product_name" not in st.session_state:
+        st.session_state.stocktake_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+    if "stocktake_ledger_pick_supplier" not in st.session_state:
+        st.session_state.stocktake_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+    if "stocktake_ledger_pick_inventory_category" not in st.session_state:
+        st.session_state.stocktake_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+    if "stocktake_assist_buf_product_name" not in st.session_state:
+        st.session_state.stocktake_assist_buf_product_name = ""
+    if "stocktake_assist_buf_supplier" not in st.session_state:
+        st.session_state.stocktake_assist_buf_supplier = ""
+    if "stocktake_assist_buf_inventory_category" not in st.session_state:
+        st.session_state.stocktake_assist_buf_inventory_category = ""
     if "s_reg_qty" not in st.session_state:
         st.session_state.s_reg_qty = 1
     if "s_field_sale_source_mgmt_id" not in st.session_state:
@@ -5756,19 +5732,18 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
     if not _scan_targets_ok:
         for _k in (
             "_stocktake_scan_candidates",
-            "_stocktake_selected_mid",
             "stocktake_multi_done_mids",
             "stocktake_cand_page",
         ):
             st.session_state.pop(_k, None)
+        if st_rem_scan is not None:
+            st.session_state.pop("_stocktake_selected_mid", None)
     st.caption(
         "現物を撮影し、**今回の棚卸対象リストにまだ残っている在庫中の行** だけを AI に渡し、複数候補を返します。"
         "照合は **和装に限らず** 洋服・帽子・雑貨・アパレル・一点物も想定しています。"
         "飲料・カップ麺のようにパッケージ文字が読める品より、**無包装の衣料**は難しいため、台帳の **メモ・カテゴリー・商品名・仕入先** を手がかりにします（**金額の一致は照合に使いません**）。"
         "**タグが写る撮影**を推奨します。"
-        f"台帳の **{COL_IMAGE_URL}** に http(s) がある行は、並び順ですべてダウンロードを試み（合計 **{GEMINI_LEDGER_REF_MAX_COLLECT}** 枚を超える分は省略）、"
-        f"**1回の API につき最大 {_gemini_ledger_ref_image_max()} 枚**ずつ複数回 Gemini に送り、応答を統合して照合します。"
-        "取得できない URL はその行だけスキップします。"
+        "照合には **撮影画像** と **対象リストのテキスト** のみを 1 回の Gemini API で送ります。"
         f"候補は **{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、ページを切り替えて全件を確認できます（AI は最大 "
         f"**{STOCKTAKE_CAND_AI_MAX}** 件まで）。"
         "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
@@ -5796,6 +5771,88 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         st.image(
             st.session_state[SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES],
             width=320,
+        )
+
+    if _scan_targets_ok and df_ledger_hint is not None and not df_ledger_hint.empty:
+        st.markdown("##### 台帳から入力補助（任意）")
+        _st_hint_df = _stocktake_assist_scope_dataframe(df_ledger_hint, st_rem_scan)
+        if _st_hint_df is not None and not _st_hint_df.empty:
+            _render_ledger_pick_assist_three_columns(
+                _st_hint_df,
+                key_prefix="stocktake_",
+                body_caption=(
+                    "仕入タブと同じ操作で、**今回の棚卸リストに残っている在庫中行** から絞り込めます。"
+                    "商品名・仕入先・在庫カテゴリーをプルダウンで確定し、**すべて揃ったときに一致が1件だけ** なら "
+                    "下の **この候補を選ぶ** 用に **選択中の管理ID** がセットされます（AI 照合を使わなくても構いません）。"
+                    "複数件のときは一覧で管理IDを確認してください。"
+                ),
+                on_pick_product_name=_on_stocktake_assist_pick_product_name,
+                on_pick_supplier=_on_stocktake_assist_pick_supplier,
+                on_pick_inventory_category=_on_stocktake_assist_pick_inventory_category,
+            )
+            stn = int(
+                st.session_state.get("stocktake_assist_last_n_matching_mids", 0) or 0
+            )
+            if stn > 1:
+                st.info(
+                    f"補助条件に一致する対象行が **{stn}** 件あります。"
+                    "一致が1件だけのときのみ **選択中の管理ID** を自動で入れます。"
+                )
+            elif stn == 1 and str(
+                st.session_state.get("_stocktake_selected_mid", "") or ""
+            ).strip():
+                _tsm = str(st.session_state["_stocktake_selected_mid"]).strip()
+                st.caption(f"選択中の管理ID（補助）: **{_tsm}**")
+            if st.button("棚卸入力補助の選択をクリア", key="stocktake_assist_clear_btn"):
+                st.session_state.stocktake_hint_filter_product_name = ""
+                st.session_state.stocktake_hint_filter_supplier = ""
+                st.session_state.stocktake_hint_filter_inventory_category = ""
+                st.session_state.stocktake_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+                st.session_state.stocktake_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+                st.session_state.stocktake_ledger_pick_inventory_category = (
+                    LEDGER_PICK_PLACEHOLDER
+                )
+                st.session_state.stocktake_assist_buf_product_name = ""
+                st.session_state.stocktake_assist_buf_supplier = ""
+                st.session_state.stocktake_assist_buf_inventory_category = ""
+                st.session_state.pop("stocktake_assist_quick_candidates", None)
+                st.session_state.pop("stocktake_assist_last_n_matching_mids", None)
+                st.session_state.pop("_stocktake_selected_mid", None)
+                st.rerun()
+            _refresh_stocktake_assist_quick_candidates(df_ledger_hint, st_rem_scan)
+            _stk_c = st.session_state.get("stocktake_assist_quick_candidates")
+            if (
+                isinstance(_stk_c, pd.DataFrame)
+                and not _stk_c.empty
+                and df_ledger_hint is not None
+            ):
+                with st.expander("近い候補（補助の商品名・仕入先から照合）", expanded=False):
+                    st.caption(
+                        "今回のリストの在庫中行のうち、補助で選んだ項目に表記が近い行を最大8件表示しています。"
+                        "管理IDで候補リストの **この候補を選ぶ** と照らし合わせてください。"
+                    )
+                    _stk_show = [
+                        c
+                        for c in (
+                            COL_MANAGEMENT_ID,
+                            COL_NAME,
+                            COL_SUPPLIER,
+                            COL_STOCK_STATUS,
+                            COL_LAST_STOCKTAKE,
+                            COL_CATEGORY,
+                        )
+                        if c in _stk_c.columns
+                    ]
+                    st.dataframe(
+                        _stk_c[_stk_show],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+        else:
+            st.caption("今回のリストに該当する在庫中行が台帳にありません。")
+    elif df_ledger_hint is not None and not df_ledger_hint.empty:
+        st.caption(
+            "**今回の棚卸を開始** して対象リストがあるときだけ、ここに仕入タブと同様の台帳入力補助が表示されます。"
         )
 
     if st.button(
@@ -5849,16 +5906,10 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                                 return self._b
 
                         img_pil = _gemini_input_image_from_upload(_CamBytes(img_b))
-                        _ledger_refs = _collect_ledger_reference_images(
-                            df_ledger_hint,
-                            only_in_stock=True,
-                            management_ids_filter=st_rem_run,
-                        )
                         raw = analyze_image_with_gemini(
                             img_pil,
                             inventory_context=inv_ctx_st or None,
                             prompt_mode="stocktake_match",
-                            ledger_reference_images=_ledger_refs or None,
                         )
                         res = _parse_json_from_model(raw or "")
                         if not isinstance(res, dict):
@@ -6166,8 +6217,7 @@ def _render_sales_management_tab(
         "**出庫（販売）** … 在庫行を **販売済** にし、実売と販売日時（確定の JST）を記録します（新規行なし）。"
         "**出庫（浮貸）** … **在庫中** のままなら **浮貸日時** 列へ日時を記録し、**販売済** を選ぶ場合は **出庫（販売）と同様** に在庫行を販売済へ更新します（出庫種別はいずれも記録）。"
         "写真は任意（上の共通アップローダ）。"
-        f"**販売元を写真で照合** でも **{COL_IMAGE_URL}** から参照画像を並び順で最大 **{GEMINI_LEDGER_REF_MAX_COLLECT}** 枚まで取得し、"
-        f"**{_gemini_ledger_ref_image_max()}** 枚ずつ複数回 API を呼んで結果をまとめます。"
+        "**販売元を写真で照合** は **アップロード画像** と **在庫中の台帳行テキスト** のみで 1 回の Gemini に照合させます。"
     )
     outbound_kind = st.radio(
         "出庫区分",
@@ -6204,6 +6254,17 @@ def _render_sales_management_tab(
             st.session_state.sales_tab_memo = ""
             st.session_state.sales_tab_loan_datetime_manual = ""
             st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
+            st.session_state.sales_hint_filter_product_name = ""
+            st.session_state.sales_hint_filter_supplier = ""
+            st.session_state.sales_hint_filter_inventory_category = ""
+            st.session_state.sales_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+            st.session_state.sales_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+            st.session_state.sales_ledger_pick_inventory_category = LEDGER_PICK_PLACEHOLDER
+            st.session_state.sales_assist_buf_product_name = ""
+            st.session_state.sales_assist_buf_supplier = ""
+            st.session_state.sales_assist_buf_inventory_category = ""
+            st.session_state.pop("sales_assist_quick_candidates", None)
+            st.session_state.pop("sales_assist_last_n_matching_mids", None)
             st.session_state.pop("_sale_link_management_id", None)
             st.session_state.pop("_sale_link_warn", None)
             st.rerun()
@@ -6224,15 +6285,10 @@ def _render_sales_management_tab(
             with st.spinner("画像を解析して販売元を照合しています…"):
                 try:
                     img = _gemini_input_image_from_upload(uploaded)
-                    _sale_ledger_refs = _collect_ledger_reference_images(
-                        df_ledger_hint,
-                        only_in_stock=True,
-                    )
                     raw_text = analyze_image_with_gemini(
                         img,
                         inventory_context=inv_ctx_sale or None,
                         prompt_mode="sale_link",
-                        ledger_reference_images=_sale_ledger_refs or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
                     _apply_gemini_sale_link_to_session(
@@ -6257,6 +6313,57 @@ def _render_sales_management_tab(
             f"販売元として **{_sale_link_flash}** をセットしました。"
             "内容を確認してから確定してください。"
         )
+
+    if df_ledger_hint is not None and not df_ledger_hint.empty:
+        st.markdown("##### 台帳から入力補助（任意）")
+        _render_ledger_pick_assist_three_columns(
+            df_ledger_hint,
+            key_prefix="sales_",
+            body_caption=(
+                "仕入タブと同様に絞り込み・プルダウンで選べます。**在庫中** の行だけを対象に、商品名・仕入先・"
+                f"{COL_CATEGORY} が **すべて選ばれたときに一致する行が1件なら**、下の「販売する管理ID」へその **管理ID** を入れます。"
+                "0件または複数件のときは一覧で確認し、手入力してください。"
+            ),
+            on_pick_product_name=_on_sales_assist_pick_product_name,
+            on_pick_supplier=_on_sales_assist_pick_supplier,
+            on_pick_inventory_category=_on_sales_assist_pick_inventory_category,
+        )
+        nm = int(st.session_state.get("sales_assist_last_n_matching_mids", 0) or 0)
+        if nm > 1:
+            st.info(
+                f"補助条件に一致する **在庫中** が **{nm}** 件あります。"
+                "一致が1件だけのときだけ **販売する管理ID** が自動入力されます。それ以外は一覧か手入力で特定してください。"
+            )
+
+        _refresh_sales_assist_quick_candidates(df_ledger_hint)
+        _sac = st.session_state.get("sales_assist_quick_candidates")
+        if (
+            isinstance(_sac, pd.DataFrame)
+            and not _sac.empty
+            and df_ledger_hint is not None
+        ):
+            with st.expander("近い候補（補助で選んだ項目・入力文字から照合）", expanded=False):
+                st.caption(
+                    "入力補助で確定した **商品名・仕入先** と表記が近い在庫中の行を最大8件表示しています。**管理 ID** で販売元を確認してください。"
+                )
+                _s_show = [
+                    c
+                    for c in (
+                        COL_MANAGEMENT_ID,
+                        COL_NAME,
+                        COL_SUPPLIER,
+                        COL_STOCK_STATUS,
+                        COL_PRICE_EXCL,
+                        COL_PLANNED_SALE,
+                        COL_CATEGORY,
+                    )
+                    if c in _sac.columns
+                ]
+                st.dataframe(
+                    _sac[_s_show],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     if df_ledger_hint is not None and not df_ledger_hint.empty:
         _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
@@ -6673,10 +6780,8 @@ def main():
         st.divider()
         st.markdown("##### クイック検索（写真から検索）")
         st.caption(
-            "**AIで画像を解析** で商品名・色・シルエットなどを推定しつつ在庫中と照合します（洋服・帽子・雑貨など **和装以外も** 想定）。"
+            "**AIで画像を解析** で商品名・色・シルエットなどを推定しつつ在庫と照合します（洋服・帽子・雑貨など **和装以外も** 想定）。"
             "パッケージに大きな文字がある商品より、**無包装の衣料**は判別が難しいことがあります。**タグ・下札**が写っていると有利です。"
-            f"台帳の **{COL_IMAGE_URL}** に http(s) があるときは、参照画像を最大 **{GEMINI_LEDGER_REF_MAX_COLLECT}** 枚まで取得し、"
-            f"**{_gemini_ledger_ref_image_max()}** 枚ずつ複数回 API を呼んで照合します。"
             "解析後は下の「近い候補」も併せて確認してください。"
         )
 
@@ -6727,19 +6832,13 @@ def main():
                 try:
                     img = _gemini_input_image_from_upload(uploaded)
                     inv_ctx = ""
-                    _purchase_ledger_refs: list[tuple[str, bytes]] = []
                     if df_ledger_hint is not None and not df_ledger_hint.empty:
                         inv_ctx = _build_gemini_inventory_context(
                             df_ledger_hint, only_in_stock=False
                         )
-                        _purchase_ledger_refs = _collect_ledger_reference_images(
-                            df_ledger_hint,
-                            only_in_stock=False,
-                        )
                     raw_text = analyze_image_with_gemini(
                         img,
                         inventory_context=inv_ctx or None,
-                        ledger_reference_images=_purchase_ledger_refs or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
                     result = _apply_purchase_ledger_match_supplement(
@@ -6779,77 +6878,18 @@ def main():
     
         if df_ledger_hint is not None and not df_ledger_hint.empty:
             st.markdown("##### 台帳から入力補助（任意）")
-            st.caption(
-                "絞り込み欄に文字を入れると候補が絞られます。プルダウンで選ぶと下の **必須入力欄** に反映されます（あとから手修正も可能です）。"
-                "在庫中の行に一致したときは **販売予定金額（税抜・任意）** にも、台帳の1点あたりの値を入れます（選んだ行の値をそのまま反映）。"
-                f"**{COL_CATEGORY}** も同様に、台帳の既存値から選べます。"
+            _render_ledger_pick_assist_three_columns(
+                df_ledger_hint,
+                key_prefix="",
+                body_caption=(
+                    "絞り込み欄に文字を入れると候補が絞られます。プルダウンで選ぶと下の **必須入力欄** に反映されます（あとから手修正も可能です）。"
+                    "在庫中の行に一致したときは **販売予定金額（税抜・任意）** にも、台帳の1点あたりの値を入れます（選んだ行の値をそのまま反映）。"
+                    f"**{COL_CATEGORY}** も同様に、台帳の既存値から選べます。"
+                ),
+                on_pick_product_name=_on_ledger_pick_product_name,
+                on_pick_supplier=_on_ledger_pick_supplier,
+                on_pick_inventory_category=_on_ledger_pick_inventory_category,
             )
-            hc1, hc2, hc3 = st.columns(3)
-            with hc1:
-                st.text_input(
-                    "商品名の絞り込み（部分一致）",
-                    key="hint_filter_product_name",
-                    placeholder="例: 帯",
-                )
-                fp = st.session_state.get("hint_filter_product_name", "")
-                if st.session_state.get("_hint_fp_seen", "") != fp:
-                    st.session_state["_hint_fp_seen"] = fp
-                    st.session_state.ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
-                opts_p = _ledger_unique_col_values(df_ledger_hint, COL_NAME)
-                if fp.strip():
-                    q = fp.strip().casefold()
-                    opts_p = [x for x in opts_p if q in x.casefold()][:400]
-                st.selectbox(
-                    "台帳に登録済みの商品名から選ぶ",
-                    options=[LEDGER_PICK_PLACEHOLDER] + opts_p,
-                    key="ledger_pick_product_name",
-                    on_change=_on_ledger_pick_product_name,
-                )
-            with hc2:
-                st.text_input(
-                    "仕入先・取引先の絞り込み（部分一致）",
-                    key="hint_filter_supplier",
-                    placeholder="例: ⚫︎⚫︎会社",
-                )
-                fs = st.session_state.get("hint_filter_supplier", "")
-                if st.session_state.get("_hint_fs_seen", "") != fs:
-                    st.session_state["_hint_fs_seen"] = fs
-                    st.session_state.ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
-                opts_s = _ledger_unique_col_values(df_ledger_hint, COL_SUPPLIER)
-                if fs.strip():
-                    q = fs.strip().casefold()
-                    opts_s = [x for x in opts_s if q in x.casefold()][:400]
-                st.selectbox(
-                    "台帳に登録済みの仕入先・取引先から選ぶ",
-                    options=[LEDGER_PICK_PLACEHOLDER] + opts_s,
-                    key="ledger_pick_supplier",
-                    on_change=_on_ledger_pick_supplier,
-                )
-            with hc3:
-                if COL_CATEGORY in df_ledger_hint.columns:
-                    st.text_input(
-                        "在庫カテゴリーの絞り込み（部分一致）",
-                        key="hint_filter_inventory_category",
-                        placeholder="例: 帯",
-                    )
-                    fc = st.session_state.get("hint_filter_inventory_category", "")
-                    if st.session_state.get("_hint_cat_seen", "") != fc:
-                        st.session_state["_hint_cat_seen"] = fc
-                        st.session_state.ledger_pick_inventory_category = (
-                            LEDGER_PICK_PLACEHOLDER
-                        )
-                    opts_c = _ledger_unique_col_values(df_ledger_hint, COL_CATEGORY)
-                    if fc.strip():
-                        q = fc.strip().casefold()
-                        opts_c = [x for x in opts_c if q in x.casefold()][:400]
-                    st.selectbox(
-                        "台帳の在庫カテゴリーから選ぶ",
-                        options=[LEDGER_PICK_PLACEHOLDER] + opts_c,
-                        key="ledger_pick_inventory_category",
-                        on_change=_on_ledger_pick_inventory_category,
-                    )
-                else:
-                    st.caption("台帳に在庫カテゴリー列がありません。")
         elif _uses_local_inventory_csv() or _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
             st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
     
