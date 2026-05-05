@@ -247,9 +247,11 @@ SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
 TZ_JP = pytz.timezone("Asia/Tokyo")
 LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
 INV_GALLERY_PAGE_SIZE = 30
-STOCKTAKE_CAND_PAGE_SIZE = 6
+STOCKTAKE_CAND_PAGE_SIZE = 5
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
+# 在庫一覧: 棚卸しを「今回の作業」単位で追う（台帳に棚卸日が入っていてもセッション内では未確認として扱える）
+SESSION_KEY_STOCKTAKE_WORK_REMAINING = "_inv_stocktake_work_remaining_mids"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 
@@ -941,7 +943,7 @@ def analyze_image_with_gemini(
             )
         prompt = f"""この写真は **店舗で棚卸しのために撮影した現物1点** です（呉服・和装の在庫）。
 次のリストは台帳の **在庫中** の行だけです（販売済は含みません）。
-同じ柄・同型で **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大12件）。
+同じ柄・同型で **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大5件）。
 **リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
 
 {inventory_context.strip()}
@@ -949,7 +951,7 @@ def analyze_image_with_gemini(
 返却形式（キーは次のみ）:
 - "stocktake_candidates" (array): 必須。各要素は object で、次のフィールドを持つ:
   - "management_id" (string): リストにある在庫中行の管理ID（G########）
-  - "confidence" (number): 0.0〜1.0（写真と同一在庫である確信度。高い順に並べる）
+  - "confidence" (number): 0.0〜1.0（写真と同一在庫である確信度。表示順はアプリ側で管理IDの昇順に整列する）
   - "product_name" (string): その行の商品名（参考）
   - "supplier" (string): その行の仕入先（参考）
   該当が1件も無いときは空配列 []。
@@ -1794,6 +1796,95 @@ def _mask_ledger_stocktake_today_jst(df: pd.DataFrame) -> pd.Series:
     return m_in & dt.notna() & parts
 
 
+def _all_in_stock_management_ids(df: pd.DataFrame) -> set[str]:
+    """在庫中の行の管理ID（空でないもの）の集合。"""
+    if df.empty or COL_MANAGEMENT_ID not in df.columns:
+        return set()
+    m_in = _mask_ledger_in_stock(df)
+    ids = df.loc[m_in, COL_MANAGEMENT_ID].astype(str).str.strip()
+    return {x for x in ids.tolist() if x}
+
+
+def _inv_stocktake_work_remaining_get() -> set[str] | None:
+    """棚卸し作業セッションの残り管理ID。未開始は None。"""
+    v = st.session_state.get(SESSION_KEY_STOCKTAKE_WORK_REMAINING)
+    if v is None:
+        return None
+    if isinstance(v, set):
+        return set(v)
+    if isinstance(v, (list, tuple)):
+        return {str(x).strip() for x in v if str(x).strip()}
+    return None
+
+
+def _inv_stocktake_work_remaining_start(df: pd.DataFrame) -> None:
+    """在庫中の全管理IDを「今回の作業」の対象にする。"""
+    st.session_state[SESSION_KEY_STOCKTAKE_WORK_REMAINING] = _all_in_stock_management_ids(
+        df
+    )
+
+
+def _inv_stocktake_work_remaining_clear() -> None:
+    st.session_state.pop(SESSION_KEY_STOCKTAKE_WORK_REMAINING, None)
+
+
+def _inv_stocktake_work_remaining_prune(df: pd.DataFrame) -> None:
+    """販売済・削除などで在庫中でなくなった ID を残リストから外す。"""
+    key = SESSION_KEY_STOCKTAKE_WORK_REMAINING
+    if key not in st.session_state:
+        return
+    cur = _inv_stocktake_work_remaining_get()
+    if cur is None:
+        return
+    valid = _all_in_stock_management_ids(df)
+    st.session_state[key] = {m for m in cur if m in valid}
+
+
+def _inv_stocktake_work_remaining_note_done(mids: set[str] | str) -> None:
+    """棚卸日を更新した管理IDを今回の残リストから外す。"""
+    if isinstance(mids, str):
+        s = {mids.strip()} if mids.strip() else set()
+    else:
+        s = {str(x).strip() for x in mids if str(x).strip()}
+    if not s:
+        return
+    cur = _inv_stocktake_work_remaining_get()
+    if cur is None:
+        return
+    st.session_state[SESSION_KEY_STOCKTAKE_WORK_REMAINING] = cur - s
+
+
+def _management_ids_last_stocktake_changed(
+    df_before: pd.DataFrame, df_after: pd.DataFrame
+) -> set[str]:
+    """同一管理IDについて「最後に確認した日付（棚卸日）」の表記が変わった管理ID。"""
+    if (
+        COL_MANAGEMENT_ID not in df_before.columns
+        or COL_MANAGEMENT_ID not in df_after.columns
+        or COL_LAST_STOCKTAKE not in df_before.columns
+        or COL_LAST_STOCKTAKE not in df_after.columns
+    ):
+        return set()
+    bcol = "_stk_prev"
+    acol = "_stk_new"
+    bef = df_before[[COL_MANAGEMENT_ID, COL_LAST_STOCKTAKE]].copy()
+    aft = df_after[[COL_MANAGEMENT_ID, COL_LAST_STOCKTAKE]].copy()
+    bef[COL_MANAGEMENT_ID] = bef[COL_MANAGEMENT_ID].astype(str).str.strip()
+    aft[COL_MANAGEMENT_ID] = aft[COL_MANAGEMENT_ID].astype(str).str.strip()
+    merged = bef.rename(columns={COL_LAST_STOCKTAKE: bcol}).merge(
+        aft.rename(columns={COL_LAST_STOCKTAKE: acol}),
+        on=COL_MANAGEMENT_ID,
+        how="inner",
+    )
+    out: set[str] = set()
+    for _, r in merged.iterrows():
+        if str(r[bcol] or "").strip() != str(r[acol] or "").strip():
+            mid = str(r[COL_MANAGEMENT_ID]).strip()
+            if mid:
+                out.add(mid)
+    return out
+
+
 def _ledger_in_stock_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or COL_STOCK_STATUS not in df.columns:
         return df.iloc[:0].copy()
@@ -2618,6 +2709,7 @@ def apply_last_stocktake_jst_for_management_id(management_id: str) -> None:
     df_src.loc[msk, COL_DATETIME] = now_exec
     df_src = _recalc_gross_profit_dataframe(df_src)
     overwrite_inventory_worksheet_from_dataframe(df_src)
+    _inv_stocktake_work_remaining_note_done(sid)
 
 
 def _apply_ledger_sort(
@@ -3658,6 +3750,14 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
             except Exception as e:
                 st.error(str(e))
             else:
+                filled_mids = set(
+                    edited.loc[m_b, COL_MANAGEMENT_ID]
+                    .astype(str)
+                    .str.strip()
+                    .tolist()
+                )
+                filled_mids.discard("")
+                _inv_stocktake_work_remaining_note_done(filled_mids)
                 st.session_state["_ledger_saved_flash"] = (
                     "棚卸日（今日・JST）を未確認の在庫中に一括入力し、台帳を保存しました。"
                 )
@@ -3676,6 +3776,12 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
             except Exception as e:
                 st.error(str(e))
                 return
+        _inv_stocktake_work_remaining_note_done(
+            _management_ids_last_stocktake_changed(
+                _ledger_base_for_save,
+                edited,
+            )
+        )
         st.session_state["_ledger_saved_flash"] = "台帳を更新しました。"
         st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
         st.rerun()
@@ -3692,7 +3798,8 @@ def render_inventory_list_page() -> None:
         "http 以外の文字が混ざる行がある場合はテキスト列のままです）。"
         "棚卸し用の「最後に確認した日付（棚卸日）」は **YYYY-MM-DD** 推奨です（例: 今日なら "
         f"{_today_jst_date().isoformat()}）。"
-        "既定は **ギャラリー（カタログ）** タブです。**在庫一覧** タブの表は **全行** を表示します（未確認だけの一覧は展開パネルで参照できます）。"
+        "既定は **ギャラリー（カタログ）** タブです。**在庫一覧** タブの表は **全行** を表示します。"
+        "棚卸の参照一覧・作業セッションは展開パネル、ギャラリーの棚卸し絞り込みから使えます。"
     )
 
     if msg := st.session_state.pop("_ledger_saved_flash", None):
@@ -3735,42 +3842,103 @@ def render_inventory_list_page() -> None:
         st.warning("台帳を開けませんでした。サービスアカウントと共有設定を確認してください。")
         return
 
+    _inv_stocktake_work_remaining_prune(df_sheet)
     n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
     n_unverified = int(_mask_ledger_stocktake_unverified(df_sheet).sum())
     n_today_done = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
+    rem = _inv_stocktake_work_remaining_get()
+    n_session_rem = len(rem) if rem is not None else None
     sk1, sk2, sk3, sk4 = st.columns(4)
     sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
-    sk2.metric("棚卸・未確認（在庫中）", f"{n_unverified:,}")
+    sk2.metric("台帳で棚卸日未入力（在庫中）", f"{n_unverified:,}")
     sk3.metric("今日確認済（在庫中・JST）", f"{n_today_done:,}")
     with sk4:
-        if n_in_stock > 0:
-            st.caption("残り（未確認 / 在庫中）")
+        if rem is not None and n_session_rem is not None:
+            st.metric("今回の作業の残り", f"{n_session_rem:,}")
+            if n_in_stock > 0:
+                st.caption("今回の残り / 在庫中")
+                st.markdown(f"**{n_session_rem} / {n_in_stock}**")
+        elif n_in_stock > 0:
+            st.caption("台帳未入力 / 在庫中")
             st.markdown(f"**{n_unverified} / {n_in_stock}**")
         else:
             st.caption("在庫中の行がないため比率は出ません。")
 
-    with st.expander("棚卸し: 在庫中かつ未確認の一覧（参照のみ）", expanded=False):
-        st.caption(
-            "「最後に確認した日付（棚卸日）」が空、または日付として解釈できない **在庫中** だけを表示します。"
-            "1人作業時の残件数の把握用です。日付の入力・保存は下の表で行ってください。"
+    st.markdown("##### 棚卸し作業セッション（任意）")
+    st.caption(
+        "同じ月・年に何度も棚卸しするとき、台帳に前回の棚卸日が入っていても **今回の対象リスト** で追えます。"
+        "「今回の棚卸を開始」で在庫中の全管理IDを対象にし、棚卸しスキャンの確定・一括棚卸日・台帳保存で棚卸日を付けた行は自動でリストから外れます。"
+        "「今回の対象リストを終了」でセッションを閉じます（台帳の日付は変わりません）。"
+    )
+    ss1, ss2 = st.columns(2)
+    with ss1:
+        if st.button(
+            "今回の棚卸を開始（在庫中をすべて今回の対象に）",
+            key="inv_stocktake_work_start",
+        ):
+            _inv_stocktake_work_remaining_start(df_sheet)
+            st.session_state.inv_gallery_page = 0
+            st.rerun()
+    with ss2:
+        if st.button(
+            "今回の対象リストを終了",
+            key="inv_stocktake_work_end",
+            disabled=rem is None,
+        ):
+            _inv_stocktake_work_remaining_clear()
+            st.session_state.inv_gallery_page = 0
+            st.rerun()
+
+    with st.expander("棚卸し: 参照用一覧（台帳未入力 / 今回の作業）", expanded=False):
+        list_kind = st.radio(
+            "表示する一覧",
+            ("台帳で棚卸日が未入力の在庫中", "今回の作業でまだ未確認の在庫中"),
+            horizontal=True,
+            key="inv_stocktake_list_kind_radio",
         )
-        unv = df_sheet.loc[_mask_ledger_stocktake_unverified(df_sheet)].copy()
-        if unv.empty:
-            st.success("在庫中で、かつ棚卸日が未入力の行はありません。")
+        _ucols = [
+            c
+            for c in (
+                COL_MANAGEMENT_ID,
+                COL_NAME,
+                COL_SUPPLIER,
+                COL_DATETIME,
+                COL_LAST_STOCKTAKE,
+            )
+            if c in df_sheet.columns
+        ]
+        if list_kind.startswith("台帳"):
+            st.caption(
+                "「最後に確認した日付（棚卸日）」が空、または日付として解釈できない **在庫中** のみです。"
+                "日付の入力・保存は下の表・スキャン・一括ボタンで行ってください。"
+            )
+            unv = df_sheet.loc[_mask_ledger_stocktake_unverified(df_sheet)].copy()
+            if unv.empty:
+                st.success("在庫中で、かつ棚卸日が未入力の行はありません。")
+            else:
+                st.metric("この一覧の件数", f"{len(unv):,}")
+                st.dataframe(unv[_ucols], use_container_width=True, hide_index=True)
         else:
-            st.metric("この一覧の件数（＝未確認の在庫中）", f"{len(unv):,}")
-            _ucols = [
-                c
-                for c in (
-                    COL_MANAGEMENT_ID,
-                    COL_NAME,
-                    COL_SUPPLIER,
-                    COL_DATETIME,
-                    COL_LAST_STOCKTAKE,
+            st.caption(
+                "上で **今回の棚卸を開始** を押したあとのみ有効です。台帳に棚卸日が入っていても、まだ今回のリストに残っている **在庫中** の行です。"
+            )
+            if rem is None:
+                st.info("作業セッションが未開始です。「今回の棚卸を開始」を押してください。")
+            elif not rem:
+                st.success(
+                    "今回の作業で追っていた在庫中の行は、すべてリストから外れました（または開始時点で在庫中がゼロでした）。"
                 )
-                if c in unv.columns
-            ]
-            st.dataframe(unv[_ucols], use_container_width=True, hide_index=True)
+            else:
+                m_sess = df_sheet[COL_MANAGEMENT_ID].astype(str).str.strip().isin(rem)
+                sess_df = df_sheet.loc[m_sess & _mask_ledger_in_stock(df_sheet)].copy()
+                if COL_MANAGEMENT_ID in sess_df.columns and not sess_df.empty:
+                    sess_df = sess_df.copy()
+                    sess_df["_sk"] = sess_df[COL_MANAGEMENT_ID].astype(str).str.strip().map(
+                        _management_id_sort_key
+                    )
+                    sess_df = sess_df.sort_values("_sk").drop(columns=["_sk"])
+                st.metric("この一覧の件数（今回の残り・在庫中）", f"{len(sess_df):,}")
+                st.dataframe(sess_df[_ucols], use_container_width=True, hide_index=True)
 
     if n_today_done > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
         _td_rows = df_sheet.loc[_mask_ledger_stocktake_today_jst(df_sheet)]
@@ -3857,15 +4025,32 @@ def render_inventory_list_page() -> None:
                 ("すべて", "在庫中", "販売済"),
                 key="inv_gallery_status_filter",
             )
+        st.selectbox(
+            "棚卸しで絞り込み（ギャラリー）",
+            (
+                "指定なし",
+                "台帳で棚卸日が未入力の在庫中のみ",
+                "今回の作業でまだ未確認（在庫中）",
+            ),
+            key="inv_gallery_stocktake_filter",
+        )
 
         _fw = str(st.session_state.get("inv_gallery_search_text", "") or "")
         _sup_f = list(st.session_state.get("inv_gallery_suppliers_filter") or [])
         _st_f = str(st.session_state.get("inv_gallery_status_filter", "すべて") or "すべて")
+        _stk_f = str(
+            st.session_state.get("inv_gallery_stocktake_filter", "指定なし") or "指定なし"
+        )
+        _rem_gal = _inv_stocktake_work_remaining_get()
+        if _stk_f == "今回の作業でまだ未確認（在庫中）" and _rem_gal is None:
+            st.info("「今回の棚卸を開始」を押すと、この絞り込みが使えます。")
         df_view = _filter_inventory_df_for_view(
             df_sorted_calc,
             q=_fw,
             suppliers=_sup_f,
             status_mode=_st_f,
+            stocktake_filter=_stk_f,
+            stocktake_session_remaining=_rem_gal,
         )
         n_total = len(df_view)
         st.caption(
@@ -3875,7 +4060,7 @@ def render_inventory_list_page() -> None:
 
         if "inv_gallery_page" not in st.session_state:
             st.session_state.inv_gallery_page = 0
-        _fp_gal = f"{_fw!r}|{repr(_sup_f)}|{_st_f!r}"
+        _fp_gal = f"{_fw!r}|{repr(_sup_f)}|{_st_f!r}|{_stk_f!r}"
         if st.session_state.get("_inv_gallery_filter_fp") != _fp_gal:
             st.session_state._inv_gallery_filter_fp = _fp_gal
             st.session_state.inv_gallery_page = 0
@@ -4042,12 +4227,21 @@ def _init_registration_form_session_state() -> None:
     st.session_state.pop("field_price_excl", None)
 
 
+def _management_id_sort_key(mid: str) -> tuple[int, str]:
+    """管理ID G######## を数値昇順でソート（非標準形式は末尾）。"""
+    s = str(mid or "").strip()
+    m = re.fullmatch(r"(?i)G(\d+)", s)
+    if m:
+        return (int(m.group(1)), "")
+    return (10**18, s.casefold())
+
+
 def _stocktake_candidates_from_gemini_response(
     res: dict[str, Any],
     df_ledger: pd.DataFrame,
     *,
     min_conf: float = 0.22,
-    max_n: int = 24,
+    max_n: int = STOCKTAKE_CAND_PAGE_SIZE,
 ) -> list[dict[str, Any]]:
     """Gemini の JSON から棚卸し候補を正規化（在庫中・台帳に存在する行のみ、重複除去）。"""
     raw_list: list[dict[str, Any]] = []
@@ -4097,7 +4291,7 @@ def _stocktake_candidates_from_gemini_response(
                 "image_url": str(tr.get(COL_IMAGE_URL, "") or "").strip(),
             }
         )
-    out.sort(key=lambda x: -float(x.get("confidence") or 0))
+    out.sort(key=lambda x: _management_id_sort_key(str(x.get("management_id") or "")))
     return out[:max_n]
 
 
@@ -4181,7 +4375,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
     if isinstance(cands, list) and cands:
         st.markdown("### 照合候補（在庫中）")
         st.caption(
-            f"最大 **{len(cands)}** 件。**この候補を選ぶ** で選択し、下の **棚卸を確定** を押してください。"
+            f"最大 **{len(cands)}** 件（**管理IDの昇順**）。**この候補を選ぶ** で選択し、下の **棚卸を確定** を押してください。"
             f"（{STOCKTAKE_CAND_PAGE_SIZE} 件ずつ表示）"
         )
         sel_cur = str(st.session_state.get("_stocktake_selected_mid") or "").strip()
@@ -4287,6 +4481,8 @@ def _filter_inventory_df_for_view(
     q: str,
     suppliers: list[str],
     status_mode: str,
+    stocktake_filter: str = "指定なし",
+    stocktake_session_remaining: set[str] | None = None,
 ) -> pd.DataFrame:
     """在庫一覧の検索・フィルタ（ギャラリー／表の共通ビュー用）。"""
     out = df.copy()
@@ -4298,6 +4494,16 @@ def _filter_inventory_df_for_view(
                 out[COL_STOCK_STATUS].astype(str).str.strip().map(_normalize_stock_status)
                 == STATUS_SOLD
             ]
+    if stocktake_filter == "台帳で棚卸日が未入力の在庫中のみ":
+        out = out.loc[_mask_ledger_stocktake_unverified(out)]
+    elif (
+        stocktake_filter == "今回の作業でまだ未確認（在庫中）"
+        and stocktake_session_remaining is not None
+        and COL_MANAGEMENT_ID in out.columns
+    ):
+        rem = stocktake_session_remaining
+        m_rem = out[COL_MANAGEMENT_ID].astype(str).str.strip().isin(rem)
+        out = out.loc[m_rem & _mask_ledger_in_stock(out)]
     if suppliers and COL_SUPPLIER in out.columns:
         sup_m = out[COL_SUPPLIER].astype(str).str.strip().isin(set(suppliers))
         out = out.loc[sup_m]
