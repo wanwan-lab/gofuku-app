@@ -3919,18 +3919,24 @@ def render_inventory_list_page() -> None:
     n_unverified = int(_mask_ledger_stocktake_unverified(df_sheet).sum())
     n_today_done = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
     rem = _inv_stocktake_work_remaining_get()
-    n_session_rem = len(rem) if rem is not None else None
+    if rem is not None and COL_MANAGEMENT_ID in df_sheet.columns:
+        _m_sess_ct = (
+            df_sheet[COL_MANAGEMENT_ID]
+            .astype(str)
+            .str.strip()
+            .isin(rem)
+            & _mask_ledger_in_stock(df_sheet)
+        )
+        n_session_in_stock_pending = int(_m_sess_ct.sum())
+    else:
+        n_session_in_stock_pending = 0
     sk1, sk2, sk3, sk4 = st.columns(4)
     sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
-    sk2.metric("台帳で棚卸日未入力（在庫中）", f"{n_unverified:,}")
+    sk2.metric("今回の作業でまだ未確認（在庫中）", f"{n_session_in_stock_pending:,}")
     sk3.metric("今日確認済（在庫中・JST）", f"{n_today_done:,}")
     with sk4:
-        if rem is not None and n_session_rem is not None:
-            st.metric("今回の作業の残り", f"{n_session_rem:,}")
-            if n_in_stock > 0:
-                st.caption("今回の残り / 在庫中")
-                st.markdown(f"**{n_session_rem} / {n_in_stock}**")
-        elif n_in_stock > 0:
+        st.metric("台帳で棚卸日未入力（在庫中）", f"{n_unverified:,}")
+        if n_in_stock > 0:
             st.caption("台帳未入力 / 在庫中")
             st.markdown(f"**{n_unverified} / {n_in_stock}**")
         else:
