@@ -608,7 +608,7 @@ def _apply_gemini_json_to_session(
         r.get("quantity") or r.get("数量") or r.get("qty") or 1,
         default=1,
     )
-    st.session_state.field_qty = _qty_g
+    st.session_state.field_row_quantity = min(2000, _qty_g)
 
     m = r.get("match")
     row_hit: pd.Series | None = None
@@ -4352,11 +4352,12 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
         _editor_kw["column_config"] = _ledger_col_cfg
     edited = st.data_editor(df_sorted, **_editor_kw)
 
-    with st.expander("在庫カテゴリーを AI で一括推定（表に反映・未保存）", expanded=False):
+    with st.expander("在庫カテゴリーを AI で一括推定（表に反映・台帳へ保存）", expanded=False):
         st.caption(
             "この表の **現在の内容**（未保存の編集を含む）に対し、Gemini で商品名＋仕入先から **在庫カテゴリー** を推定してセルに入れます。"
             "ローカルの **inventory_category_cache.json** も更新するため、集計・分析の構成比にも反映されます。"
-            "スプレッドシート／CSV へは **台帳を更新する** を押すまで書き込まれません。"
+            "セルが1件以上更新されたときは、続けて **Google スプレッドシート**（または **inventory.csv**）へ **自動保存** します。"
+            "保存に失敗した場合のみ、反映済みの表を残したうえで「台帳を更新する」から再保存できます。"
         )
         _lc_only_in = st.checkbox("在庫中の行のみ", value=True, key="ledger_cat_bulk_only_in")
         _lc_only_empty = st.checkbox(
@@ -4432,11 +4433,37 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
                         only_empty=_lc_only_empty,
                         overwrite=_lc_overwrite,
                     )
-                    st.session_state[LEDGER_DATA_EDITOR_KEY] = new_ed
-                    st.session_state["_ledger_saved_flash"] = (
-                        f"在庫カテゴリーを AI で **{ncell}** 行更新しました（API {len(upd)} キー・キャッシュ新規/変更 {nmerge}）。"
-                        "「台帳を更新する」で保存してください。"
+                    _dest_lbl = (
+                        "inventory.csv"
+                        if _uses_local_inventory_csv()
+                        else "Google スプレッドシート"
                     )
+                    if ncell > 0:
+                        try:
+                            with st.spinner(f"{_dest_lbl} に保存しています…"):
+                                overwrite_inventory_worksheet_from_dataframe(
+                                    new_ed.reset_index(drop=True),
+                                    previous_df=edited.reset_index(drop=True),
+                                )
+                        except Exception as save_e:
+                            st.session_state[LEDGER_DATA_EDITOR_KEY] = new_ed
+                            st.session_state["_ledger_saved_flash"] = (
+                                f"在庫カテゴリーを AI で **{ncell}** 行は表に反映しましたが、"
+                                f"{_dest_lbl} への保存に失敗しました: {save_e} "
+                                "下の「台帳を更新する」で再保存してください。"
+                            )
+                        else:
+                            st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+                            st.session_state["_ledger_saved_flash"] = (
+                                f"在庫カテゴリーを AI で **{ncell}** 行更新し、**{_dest_lbl}** に保存しました"
+                                f"（API {len(upd)} キー・キャッシュの新規/変更 {nmerge}）。"
+                            )
+                    else:
+                        st.session_state[LEDGER_DATA_EDITOR_KEY] = new_ed
+                        st.session_state["_ledger_saved_flash"] = (
+                            f"API は {len(upd)} 件のキーを返しましたが、選択した条件では表のセルは更新されませんでした"
+                            f"（キャッシュの新規/変更 {nmerge}）。"
+                        )
                 except Exception as e:
                     st.error(str(e))
                 st.rerun()
@@ -4933,8 +4960,6 @@ def _init_registration_form_session_state() -> None:
         st.session_state.field_product_name = ""
     if "field_supplier" not in st.session_state:
         st.session_state.field_supplier = ""
-    if "field_qty" not in st.session_state:
-        st.session_state.field_qty = 1
     if "field_row_quantity" not in st.session_state:
         st.session_state.field_row_quantity = 1
     if "field_inventory_category" not in st.session_state:
@@ -5820,7 +5845,6 @@ def main():
             if st.button("候補の自動入力をクリア"):
                 st.session_state.field_product_name = ""
                 st.session_state.field_supplier = ""
-                st.session_state.field_qty = 1
                 st.session_state.field_row_quantity = 1
                 st.session_state.field_inventory_category = ""
                 st.session_state.ai_kind = ""
@@ -5874,7 +5898,9 @@ def main():
         if st.session_state.get("ai_parse_ran"):
             st.subheader("AI解析結果（参考）")
             st.write(f"**推定種類:** {st.session_state.ai_kind or '—'}")
-            st.write(f"**推定数量:** {int(st.session_state.field_qty)}")
+            st.write(
+                f"**推定数量（同時追記行数）:** {int(st.session_state.field_row_quantity)}"
+            )
             st.write(
                 f"**推定仕入金額（税抜・1点）:** ¥{int(st.session_state.field_line_excl_yen):,}"
             )
@@ -6010,16 +6036,20 @@ def main():
                 )
     
         st.number_input(
-            "数量（台帳の数量列・各行に同じ値を書き込み）",
+            f"数量（{COL_QTY}・同時追記行数）",
             min_value=1,
+            max_value=2000,
             step=1,
             key="field_row_quantity",
-            help="保存する各行の「数量」列です（入出庫集計に使います）。登録する行数とは別です。",
+            help=(
+                f"在庫として計上する点数です。**N にすると同一内容のレコードを N 行** 追記します（1点＝1行）。"
+                f"各行の「{COL_QTY}」列には **1** を入れます。仕入金額（税抜）は各行とも **1点あたり** の金額です。"
+                "写真をアップロードした場合、複数行でも **同じ画像URL** を各行に記録します。"
+                "「AIで画像を解析」の推定数量がここに入ります（いつでも上書きできます）。"
+            ),
         )
         st.caption(
-            "台帳は **複数行** のとき **1点につき1行** で保存します。**保存する行数** は写真解析の推定数量または証憑取込の行数に従います（現在: "
-            f"**{max(1, int(st.session_state.get('field_qty', 1)))}** 行）。"
-            "証憑取込やAI解析で複数行になる場合は自動で増えます。"
+            "2 以上にすると、同じ商品名・仕入先・単価で **管理IDだけ異なる複数行** を一度に作成します。"
         )
 
         line_excl_yen = st.number_input(
@@ -6041,10 +6071,8 @@ def main():
             str(st.session_state.get("field_consumption_tax_choice", "10%"))
         )
     
-        _q = max(1, int(st.session_state.get("field_qty", 1)))
-        _rq = max(1, int(st.session_state.get("field_row_quantity", 1)))
+        _n_save = max(1, min(2000, int(st.session_state.get("field_row_quantity", 1))))
         _lex_inp = int(line_excl_yen)
-        _n_save = _q
         _line_ex_one = _lex_inp
         _line_in_one = price_incl_tax(_line_ex_one, _tax_r)
     
@@ -6052,7 +6080,7 @@ def main():
         with price_row[0]:
             st.metric("仕入金額（税抜・1点）", f"¥{_line_ex_one:,}")
             _cap_rows = (
-                f"確定時は **{_n_save} 行**（各「{COL_QTY}」**{_rq}**）。税抜合計（参考） ¥{_line_ex_one * _rq * _n_save:,}。"
+                f"確定時は **{_n_save} 行**（各行「{COL_QTY}」**1**）。税抜合計（参考） ¥{_line_ex_one * _n_save:,}。"
             )
             if _n_save > 1:
                 _cap_rows += (
@@ -6091,12 +6119,12 @@ def main():
         )
         _pl_u = int(planned_sale_excl)
         _act_u = 0
-        _cogs_preview = _lex_inp * _rq * _q
+        _cogs_preview = _lex_inp * _n_save
         _pl_u_gp = _pl_u
         _tax_preview = _tax_r
         _st_gp = STATUS_IN_STOCK
         _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
-            _q * _rq, _pl_u_gp, _act_u, _st_gp, _tax_preview
+            _n_save, _pl_u_gp, _act_u, _st_gp, _tax_preview
         )
         _gp_preview = _compute_gross_profit_row(
             _cogs_preview,
@@ -6176,12 +6204,11 @@ def main():
                 _stat2 = STATUS_IN_STOCK
                 memo_s = (memo or "").strip()
     
-                _q2 = max(1, int(st.session_state.get("field_qty", 1)))
-                _rq2 = max(1, int(st.session_state.get("field_row_quantity", 1)))
+                _rq2 = max(1, min(2000, int(st.session_state.get("field_row_quantity", 1))))
                 _icat2 = str(
                     st.session_state.get("field_inventory_category", "") or ""
                 ).strip()
-                n_save = _q2
+                n_save = _rq2
                 urls: list[str] = [""] * n_save
                 _record_dt = jst_now_str()
                 ready_for_sheet = True
@@ -6248,7 +6275,7 @@ def main():
                                             urls[i],
                                             ids[i],
                                             memo_s,
-                                            quantity=_rq2,
+                                            quantity=1,
                                             inventory_category=_icat2,
                                             planned_sale_unit_excl_yen=_plan2,
                                             actual_sale_unit_excl_yen=_act_ex2,
