@@ -2389,6 +2389,17 @@ def _fuzzy_ledger_match_rows(
     if not pn and not su and not ft_list:
         return df.iloc[:0]
 
+    def _feature_tokens(txt: str) -> set[str]:
+        s = (txt or "").strip().casefold()
+        if not s:
+            return set()
+        parts = re.split(r"[\s,;:/|・、。\n\t=\-()\[\]{}]+", s)
+        return {p for p in parts if len(p) >= 2}
+
+    q_feat_tokens: set[str] = set()
+    for f in ft_list:
+        q_feat_tokens.update(_feature_tokens(f))
+
     scored: list[tuple[int, float, Any]] = []
     for i, row in df.iterrows():
         rpn = str(row.get(COL_NAME, "") or "").strip()
@@ -2396,9 +2407,9 @@ def _fuzzy_ledger_match_rows(
         rft = str(row.get(COL_FEATURES, "") or "").strip()
         rpn_l = rpn.casefold()
         rsu_l = rsu.casefold()
-        rft_l = rft.casefold()
-        feat_hits = sum(1 for f in ft_list if f and f in rft_l)
-        feat_ok = feat_hits > 0
+        row_feat_tokens = _feature_tokens(rft)
+        feat_hits = len(q_feat_tokens & row_feat_tokens)
+        feat_ok = feat_hits >= 1
         both_ok = bool(pn and su and (pn in rpn_l) and (su in rsu_l))
         name_ok = bool(pn and (pn in rpn_l))
         sup_ok = bool(su and (su in rsu_l))
@@ -2417,8 +2428,8 @@ def _fuzzy_ledger_match_rows(
             sim += 0.6 * difflib.SequenceMatcher(None, rpn_l, pn).ratio()
         if su:
             sim += 0.4 * difflib.SequenceMatcher(None, rsu_l, su).ratio()
-        if ft_list:
-            sim += 0.25 * (feat_hits / max(1, len(ft_list)))
+        if q_feat_tokens:
+            sim += 0.85 * (feat_hits / max(1, len(q_feat_tokens)))
         scored.append((prio, -sim, i))
 
     scored.sort(key=lambda x: (x[0], x[1], _management_id_sort_key(str(df.loc[x[2]].get(COL_MANAGEMENT_ID, "") or "").strip())))
@@ -5123,6 +5134,8 @@ def _sale_card_hit_from_series(
     *,
     confidence: float | None = None,
     extra_caption: str | None = None,
+    matched_features: list[str] | None = None,
+    missing_features: list[str] | None = None,
 ) -> dict[str, Any]:
     """販売候補カード1件分の表示用 dict。"""
     return {
@@ -5140,6 +5153,8 @@ def _sale_card_hit_from_series(
         if COL_LAST_STOCKTAKE in row.index
         else "",
         "extra_caption": extra_caption or "",
+        "matched_features": list(matched_features or []),
+        "missing_features": list(missing_features or []),
     }
 
 
@@ -5223,6 +5238,12 @@ def _render_mid_pick_candidate_cards(
                 xc = str(hit.get("extra_caption") or "").strip()
                 if xc:
                     st.caption(xc)
+                mf = [str(x).strip() for x in (hit.get("matched_features") or []) if str(x).strip()]
+                miss = [str(x).strip() for x in (hit.get("missing_features") or []) if str(x).strip()]
+                if mf:
+                    st.caption("一致した特徴: " + " / ".join(mf[:5]))
+                if miss:
+                    st.caption("未確認の特徴: " + " / ".join(miss[:5]))
                 cf = hit.get("confidence")
                 try:
                     cfn = float(cf) if cf is not None else None
@@ -5299,12 +5320,24 @@ def _sales_photo_match_card_hits_from_result(
             continue
         seen.add(mid)
         c = conf if mid_primary and mid == mid_primary else None
+        row_feat_raw = str(row.get(COL_FEATURES, "") or "").strip()
+        row_feats = [x.strip(" ・-\t") for x in row_feat_raw.splitlines() if x.strip()]
+        matched = [f for f in ft0 if any(f.casefold() in rf.casefold() or rf.casefold() in f.casefold() for rf in row_feats)]
+        missing = [f for f in ft0 if f not in matched]
         xc = (
             "写真照合で推定した行（同一管理ID）"
             if mid_primary and mid == mid_primary
             else ""
         )
-        hits.append(_sale_card_hit_from_series(row, confidence=c, extra_caption=xc or None))
+        hits.append(
+            _sale_card_hit_from_series(
+                row,
+                confidence=c,
+                extra_caption=xc or None,
+                matched_features=matched,
+                missing_features=missing,
+            )
+        )
 
     def _sort_key(h: dict[str, Any]) -> tuple[int, Any]:
         mid_h = str(h.get("management_id") or "")
@@ -6912,9 +6945,7 @@ def _render_sales_management_tab(
                 st.caption(
                     "入力補助で確定した項目と表記が近い **在庫中** を表示します（棚卸しスキャンの照合と同レイアウト）。"
                 )
-                _s_hits = [
-                    _sale_card_hit_from_series(row) for _, row in _sac.iterrows()
-                ]
+                _s_hits = [_sale_card_hit_from_series(row) for _, row in _sac.iterrows()]
                 _render_mid_pick_candidate_cards(
                     _s_hits,
                     widget_key_namespace="sales_assist_cards",
@@ -7282,6 +7313,11 @@ def main():
         "写真は任意。台帳の必須項目のみの記録、または写真＋AI解析・ドライブ保存・"
         "**inventory.csv** またはスプレッドシートへの記録ができます。"
     )
+    if qrcode is None:
+        st.info(
+            "この環境では `qrcode` が未導入のため、QR生成機能は無効です。"
+            "仕入れ・販売・棚卸しの通常機能はそのまま使えます。"
+        )
     if page == "ギャラリー（カタログ）":
         render_inventory_list_page(view_mode="gallery")
         return
@@ -7479,7 +7515,22 @@ def main():
                     "Gemini で管理IDが一致しないときは、**名前＋個体特徴** → **名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
                     "カードから選ぶと、仕入入力の必須項目へ反映されます（在庫中・販売済どちらも候補対象）。"
                 )
-                _p_hits = [_sale_card_hit_from_series(row) for _, row in _cand.iterrows()]
+                _qf = _extract_distinctive_features_from_result(
+                    {"distinctive_features": st.session_state.get("_ai_distinctive_features", [])}
+                )
+                _p_hits: list[dict[str, Any]] = []
+                for _, row in _cand.iterrows():
+                    _raw = str(row.get(COL_FEATURES, "") or "").strip()
+                    _rfs = [x.strip(" ・-\t") for x in _raw.splitlines() if x.strip()]
+                    _m = [f for f in _qf if any(f.casefold() in rf.casefold() or rf.casefold() in f.casefold() for rf in _rfs)]
+                    _miss = [f for f in _qf if f not in _m]
+                    _p_hits.append(
+                        _sale_card_hit_from_series(
+                            row,
+                            matched_features=_m,
+                            missing_features=_miss,
+                        )
+                    )
                 _render_mid_pick_candidate_cards(
                     _p_hits,
                     widget_key_namespace="purchase_quick_cards",
