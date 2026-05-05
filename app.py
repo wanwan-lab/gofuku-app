@@ -2991,6 +2991,11 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
     if not sid:
         return None
     wname = _secret_str(SECRET_GOOGLE_WORKSHEET_NAME, DEFAULT_WORKSHEET_NAME)
+    if SESSION_KEY_INV_SHEET_CACHE_BUST not in st.session_state:
+        # 新しいブラウザセッションが古い cache_data(=bust 0) を拾わないよう初期値を現在時刻にする
+        st.session_state[SESSION_KEY_INV_SHEET_CACHE_BUST] = int(
+            datetime.now().timestamp()
+        )
     bust = int(st.session_state.get(SESSION_KEY_INV_SHEET_CACHE_BUST, 0))
     try:
         raw = _inventory_sheet_get_all_values_cached(str(sid), str(wname), bust)
