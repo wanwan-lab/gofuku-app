@@ -2420,6 +2420,7 @@ def _fuzzy_ledger_match_rows(
         rft = str(row.get(COL_FEATURES, "") or "").strip()
         rpn_l = rpn.casefold()
         rsu_l = rsu.casefold()
+        rft_l = rft.casefold()
         row_feat_tokens = _feature_tokens(rft)
         feat_hits = len(q_feat_tokens & row_feat_tokens)
         feat_ok = feat_hits >= 1
