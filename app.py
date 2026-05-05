@@ -247,6 +247,7 @@ SHEET_AMOUNT_NUMBER_PATTERN = "#,##0"
 TZ_JP = pytz.timezone("Asia/Tokyo")
 LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
 INV_GALLERY_PAGE_SIZE = 30
+STOCKTAKE_CAND_PAGE_SIZE = 6
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
@@ -940,18 +941,21 @@ def analyze_image_with_gemini(
             )
         prompt = f"""この写真は **店舗で棚卸しのために撮影した現物1点** です（呉服・和装の在庫）。
 次のリストは台帳の **在庫中** の行だけです（販売済は含みません）。
-写真と **同一の在庫1行** を特定し、JSON だけを返してください（説明文・Markdown のコードフェンス禁止）。
+同じ柄・同型で **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大12件）。
+**リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
 
 {inventory_context.strip()}
 
 返却形式（キーは次のみ）:
-- "match" (object): 必須。フィールド:
-  - "management_id" (string): 選んだ行の管理ID（G########）。該当なしなら ""
-  - "confidence" (number): 0.0〜1.0
+- "stocktake_candidates" (array): 必須。各要素は object で、次のフィールドを持つ:
+  - "management_id" (string): リストにある在庫中行の管理ID（G########）
+  - "confidence" (number): 0.0〜1.0（写真と同一在庫である確信度。高い順に並べる）
   - "product_name" (string): その行の商品名（参考）
   - "supplier" (string): その行の仕入先（参考）
+  該当が1件も無いときは空配列 []。
+  迷う場合は複数入れてよい（confidence が低いものも列挙してよい。ただし無関係な行は入れない）。
 
-該当がなければ management_id を ""、confidence は 0.35 以下にしてください。"""
+任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
         response = model.generate_content([prompt, image_data])
         return response.text or ""
 
@@ -2790,6 +2794,13 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def _dash_ratio_pct(numer: int, denom: int) -> str:
+    """入庫÷合計の比率表示（分母0はダッシュ）。"""
+    if denom <= 0:
+        return "—"
+    return f"{100.0 * float(numer) / float(denom):.1f}%"
+
+
 def _ledger_dashboard_date_bounds(df: pd.DataFrame) -> tuple[date, date]:
     """ダッシュボード用の日付範囲既定値（販売済は販売日時軸を含む）。"""
     s = _ledger_dashboard_axis_datetime(df).dropna()
@@ -2934,26 +2945,38 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     in_out = _finite_int(flt["_amt_in_out"].sum(), 0)
 
     st.markdown("##### 期間内の数量")
-    m1, m2, m3 = st.columns(3)
+    q_ratio = _dash_ratio_pct(q_in, q_sum)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("入庫 合計数量", f"{q_in:,}")
     m2.metric("出庫 合計数量", f"{q_out:,}")
     m3.metric("合計数量（入+出）", f"{q_sum:,}")
+    m4.metric("入庫÷合計（数量比率）", q_ratio)
 
-    st.markdown("##### 期間内の金額（仕入ベース）")
-    m5, m6, m9 = st.columns(3)
+    ex_sum = ex_in + ex_out
+    in_sum = in_in + in_out
+    ex_ratio = _dash_ratio_pct(ex_in, ex_sum)
+    in_ratio = _dash_ratio_pct(in_in, in_sum)
+
+    st.markdown("##### 期間内の金額（仕入ベース・税抜）")
+    m5, m6, m10, m11 = st.columns(4)
     m5.metric("入庫 合計金額（税抜）", f"¥{ex_in:,}")
     m6.metric("出庫 合計金額（税抜）", f"¥{ex_out:,}")
-    with m9:
-        if COL_GROSS_PROFIT in flt.columns:
-            gp_tot = _finite_int(
-                _series_to_numeric_loose(flt[COL_GROSS_PROFIT]).fillna(0).sum(), 0
-            )
-            st.metric("粗利合計（税抜）", f"¥{gp_tot:,}")
-        else:
-            st.metric("粗利合計（税抜）", "—")
-    m7, m8 = st.columns(2)
+    m10.metric("合計金額（入+出・税抜）", f"¥{ex_sum:,}")
+    m11.metric("入庫÷合計（税抜比率）", ex_ratio)
+    if COL_GROSS_PROFIT in flt.columns:
+        gp_tot = _finite_int(
+            _series_to_numeric_loose(flt[COL_GROSS_PROFIT]).fillna(0).sum(), 0
+        )
+        st.metric("粗利合計（税抜）", f"¥{gp_tot:,}")
+    else:
+        st.metric("粗利合計（税抜）", "—")
+
+    st.markdown("##### 期間内の金額（仕入ベース・税込）")
+    m7, m8, m12, m13 = st.columns(4)
     m7.metric("入庫 合計金額（税込）", f"¥{in_in:,}")
     m8.metric("出庫 合計金額（税込）", f"¥{in_out:,}")
+    m12.metric("合計金額（入+出・税込）", f"¥{in_sum:,}")
+    m13.metric("入庫÷合計（税込比率）", in_ratio)
 
     st.markdown("##### 仕入先・取引先別サマリー（税抜金額・数量・粗利）")
     sup_col = "仕入先・取引先"
@@ -4019,12 +4042,71 @@ def _init_registration_form_session_state() -> None:
     st.session_state.pop("field_price_excl", None)
 
 
+def _stocktake_candidates_from_gemini_response(
+    res: dict[str, Any],
+    df_ledger: pd.DataFrame,
+    *,
+    min_conf: float = 0.22,
+    max_n: int = 24,
+) -> list[dict[str, Any]]:
+    """Gemini の JSON から棚卸し候補を正規化（在庫中・台帳に存在する行のみ、重複除去）。"""
+    raw_list: list[dict[str, Any]] = []
+    if isinstance(res, dict):
+        sc = res.get("stocktake_candidates")
+        if isinstance(sc, list):
+            for item in sc:
+                if isinstance(item, dict):
+                    raw_list.append(item)
+        m0 = res.get("match")
+        if isinstance(m0, dict) and str(m0.get("management_id") or "").strip():
+            raw_list.append(m0)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for it in raw_list:
+        mid = str(it.get("management_id") or "").strip()
+        if not mid or mid in seen:
+            continue
+        try:
+            conf = float(it.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf < min_conf:
+            continue
+        tr = lookup_ledger_row_by_management_id(df_ledger, mid)
+        if tr is None:
+            continue
+        if (
+            _normalize_stock_status(str(tr.get(COL_STOCK_STATUS, "")))
+            != STATUS_IN_STOCK
+        ):
+            continue
+        seen.add(mid)
+        pn = str(it.get("product_name") or "").strip() or str(
+            tr.get(COL_NAME, "") or ""
+        ).strip()
+        su = str(it.get("supplier") or "").strip() or str(
+            tr.get(COL_SUPPLIER, "") or ""
+        ).strip()
+        out.append(
+            {
+                "management_id": mid,
+                "confidence": conf,
+                "product_name": pn,
+                "supplier": su,
+                "last_stocktake": str(tr.get(COL_LAST_STOCKTAKE, "") or "").strip(),
+                "image_url": str(tr.get(COL_IMAGE_URL, "") or "").strip(),
+            }
+        )
+    out.sort(key=lambda x: -float(x.get("confidence") or 0))
+    return out[:max_n]
+
+
 def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
     """棚卸しスキャン: カメラ撮影 → AI 照合 → 棚卸日の確定更新のみ。"""
     st.markdown("##### 棚卸しスキャン（AI 照合）")
     st.caption(
-        "現物を撮影し、在庫中の台帳行と照合します。候補が表示されたら内容を確認し、"
-        "**棚卸を確定** でその行の「最後に確認した日付（棚卸日）」だけを **本日（JST）** に更新します（新規行は追加しません）。"
+        "現物を撮影し、在庫中の台帳行から **複数候補** を表示します（同型在庫が複数ある場合に備えページ切替）。"
+        "**この候補を選ぶ** で1件に絞り、**棚卸を確定** で「最後に確認した日付（棚卸日）」だけを **本日（JST）** に更新します（新規行は追加しません）。"
     )
     cam = st.camera_input("現物を撮影", key="stocktake_camera_input")
     if cam is not None:
@@ -4037,8 +4119,10 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         )
 
     if st.button("AIで台帳と照合", type="primary", key="stocktake_ai_match_btn"):
-        st.session_state.pop("_stocktake_scan_result", None)
+        st.session_state.pop("_stocktake_scan_candidates", None)
+        st.session_state.pop("_stocktake_selected_mid", None)
         st.session_state.pop("_stocktake_scan_warn", None)
+        st.session_state.pop("stocktake_cand_page", None)
         img_b = (
             cam.getvalue()
             if cam is not None
@@ -4073,82 +4157,128 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                         prompt_mode="stocktake_match",
                     )
                     res = _parse_json_from_model(raw or "")
-                    m = res.get("match") if isinstance(res, dict) else None
-                    mid = ""
-                    if isinstance(m, dict):
-                        mid = str(m.get("management_id") or "").strip()
-                    conf = float(m.get("confidence") or 0) if isinstance(m, dict) else 0.0
-                    if not mid or conf < 0.36:
+                    if not isinstance(res, dict):
+                        res = {}
+                    cand_list = _stocktake_candidates_from_gemini_response(
+                        res, df_ledger_hint
+                    )
+                    if not cand_list:
                         st.session_state["_stocktake_scan_warn"] = (
-                            "在庫中の行と確実に一致する候補が得られませんでした。明るさ・距離を変えて再撮影するか、在庫一覧で管理IDを確認してください。"
+                            "在庫中の行で、写真に合いそうな候補が得られませんでした。"
+                            "明るさ・距離を変えて再撮影するか、在庫一覧で管理IDを確認してください。"
                         )
                     else:
-                        tr = lookup_ledger_row_by_management_id(df_ledger_hint, mid)
-                        if tr is None:
-                            st.session_state["_stocktake_scan_warn"] = (
-                                f"管理ID **{mid}** が台帳に見つかりません。"
-                            )
-                        elif (
-                            _normalize_stock_status(str(tr.get(COL_STOCK_STATUS, "")))
-                            != STATUS_IN_STOCK
-                        ):
-                            st.session_state["_stocktake_scan_warn"] = (
-                                f"管理ID **{mid}** は在庫中ではありません。"
-                            )
-                        else:
-                            st.session_state["_stocktake_scan_result"] = {
-                                "management_id": mid,
-                                "product_name": str(tr.get(COL_NAME, "") or "").strip(),
-                                "supplier": str(tr.get(COL_SUPPLIER, "") or "").strip(),
-                                "last_stocktake": str(
-                                    tr.get(COL_LAST_STOCKTAKE, "") or ""
-                                ).strip(),
-                                "image_url": str(tr.get(COL_IMAGE_URL, "") or "").strip(),
-                                "confidence": conf,
-                            }
+                        st.session_state["_stocktake_scan_candidates"] = cand_list
+                        st.session_state["stocktake_cand_page"] = 0
+                        st.session_state.pop("_stocktake_selected_mid", None)
                 except Exception as e:
                     st.session_state["_stocktake_scan_warn"] = str(e)
 
     wn = st.session_state.pop("_stocktake_scan_warn", None)
     if wn:
         st.warning(wn)
-    hit = st.session_state.get("_stocktake_scan_result")
-    if isinstance(hit, dict) and hit.get("management_id"):
-        mid = str(hit["management_id"])
-        with st.container(border=True):
-            st.markdown(f"### 照合結果: **{mid}**")
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                iu = str(hit.get("image_url") or "").strip()
-                if iu.startswith("http://") or iu.startswith("https://"):
-                    st.image(iu, use_container_width=True)
-                else:
-                    st.caption("（台帳に画像URLがありません）")
-            with c2:
-                st.write(f"**商品名:** {hit.get('product_name') or '—'}")
-                st.write(f"**仕入先:** {hit.get('supplier') or '—'}")
-                st.write(
-                    f"**前回の棚卸日:** {hit.get('last_stocktake') or '—（未入力）'}"
-                )
-                st.caption(
-                    f"AI 確信度: {float(hit.get('confidence') or 0):.2f}（参考）"
-                )
-            if st.button(
-                "棚卸を確定（棚卸日を本日・JST に更新）",
-                type="primary",
-                key=f"stocktake_confirm_{mid}",
-            ):
-                try:
-                    with st.spinner("台帳を更新しています…"):
-                        apply_last_stocktake_jst_for_management_id(mid)
-                except Exception as e:
-                    st.error(str(e))
-                else:
-                    st.session_state.pop("_stocktake_scan_result", None)
-                    st.session_state.pop(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES, None)
-                    st.success(f"管理ID **{mid}** の棚卸日を更新しました。")
-                    st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+    cands = st.session_state.get("_stocktake_scan_candidates")
+    if isinstance(cands, list) and cands:
+        st.markdown("### 照合候補（在庫中）")
+        st.caption(
+            f"最大 **{len(cands)}** 件。**この候補を選ぶ** で選択し、下の **棚卸を確定** を押してください。"
+            f"（{STOCKTAKE_CAND_PAGE_SIZE} 件ずつ表示）"
+        )
+        sel_cur = str(st.session_state.get("_stocktake_selected_mid") or "").strip()
+        if sel_cur:
+            st.info(f"選択中の管理ID: **{sel_cur}**")
+
+        if "stocktake_cand_page" not in st.session_state:
+            st.session_state.stocktake_cand_page = 0
+        n_total = len(cands)
+        n_pages = max(1, (n_total + STOCKTAKE_CAND_PAGE_SIZE - 1) // STOCKTAKE_CAND_PAGE_SIZE)
+        page_idx = int(st.session_state.stocktake_cand_page)
+        if page_idx >= n_pages:
+            page_idx = n_pages - 1
+            st.session_state.stocktake_cand_page = page_idx
+        if page_idx < 0:
+            page_idx = 0
+            st.session_state.stocktake_cand_page = 0
+        start_i = page_idx * STOCKTAKE_CAND_PAGE_SIZE
+        end_i = min(n_total, start_i + STOCKTAKE_CAND_PAGE_SIZE)
+        page_slice = cands[start_i:end_i]
+
+        if n_pages > 1:
+            p1, p2, p3 = st.columns([1, 3, 1])
+            with p1:
+                if st.button(
+                    "◀ 前の候補",
+                    disabled=page_idx <= 0,
+                    key="stocktake_cand_prev",
+                ):
+                    st.session_state.stocktake_cand_page = max(0, page_idx - 1)
                     st.rerun()
+            with p2:
+                st.caption(
+                    f"**ページ {page_idx + 1} / {n_pages}**（{n_total} 件中 **{start_i + 1}〜{end_i}** 件）"
+                )
+            with p3:
+                if st.button(
+                    "次の候補 ▶",
+                    disabled=page_idx >= n_pages - 1,
+                    key="stocktake_cand_next",
+                ):
+                    st.session_state.stocktake_cand_page = min(
+                        n_pages - 1, page_idx + 1
+                    )
+                    st.rerun()
+
+        for j, hit in enumerate(page_slice):
+            mid = str(hit.get("management_id") or "").strip()
+            if not mid:
+                continue
+            gidx = start_i + j
+            with st.container(border=True):
+                h1, h2 = st.columns([1, 2])
+                with h1:
+                    _render_inventory_gallery_thumbnail(
+                        str(hit.get("image_url") or ""),
+                        width=200,
+                        sold=False,
+                    )
+                with h2:
+                    st.markdown(f"**管理ID:** `{mid}`")
+                    st.write(f"**商品名:** {hit.get('product_name') or '—'}")
+                    st.write(f"**仕入先:** {hit.get('supplier') or '—'}")
+                    st.write(
+                        f"**前回の棚卸日:** {hit.get('last_stocktake') or '—（未入力）'}"
+                    )
+                    st.caption(
+                        f"AI 確信度: {float(hit.get('confidence') or 0):.2f}（参考）"
+                    )
+                    if st.button(
+                        "この候補を選ぶ",
+                        key=f"stocktake_pick_{gidx}_{mid}",
+                        type="secondary",
+                    ):
+                        st.session_state["_stocktake_selected_mid"] = mid
+                        st.rerun()
+
+        if st.button(
+            "棚卸を確定（棚卸日を本日・JST に更新）",
+            type="primary",
+            key="stocktake_confirm_selected",
+            disabled=not str(st.session_state.get("_stocktake_selected_mid") or "").strip(),
+        ):
+            mid = str(st.session_state.get("_stocktake_selected_mid") or "").strip()
+            try:
+                with st.spinner("台帳を更新しています…"):
+                    apply_last_stocktake_jst_for_management_id(mid)
+            except Exception as e:
+                st.error(str(e))
+            else:
+                st.session_state.pop("_stocktake_scan_candidates", None)
+                st.session_state.pop("_stocktake_selected_mid", None)
+                st.session_state.pop("stocktake_cand_page", None)
+                st.session_state.pop(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES, None)
+                st.success(f"管理ID **{mid}** の棚卸日を更新しました。")
+                st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+                st.rerun()
 
 
 def _filter_inventory_df_for_view(
