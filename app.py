@@ -4764,21 +4764,33 @@ def render_inventory_list_page() -> None:
                 ("すべて", "在庫中", "販売済"),
                 key="inv_gallery_status_filter",
             )
-        st.selectbox(
-            "棚卸しで絞り込み（ギャラリー）",
-            (
-                "指定なし",
-                "台帳で棚卸日が未入力の在庫中のみ",
-                "今回の作業でまだ未確認（在庫中）",
-            ),
-            key="inv_gallery_stocktake_filter",
-        )
+        gal_f1, gal_f2 = st.columns(2)
+        with gal_f1:
+            st.selectbox(
+                "浮貸で絞り込み（ギャラリー）",
+                ("指定なし", "浮貸あり", "浮貸なし"),
+                key="inv_gallery_loan_filter",
+                help="**浮貸あり** … 浮貸日時が入っている行のみ。**浮貸なし** … 浮貸日時が空の行のみ（販売済も含みます）。",
+            )
+        with gal_f2:
+            st.selectbox(
+                "棚卸しで絞り込み（ギャラリー）",
+                (
+                    "指定なし",
+                    "台帳で棚卸日が未入力の在庫中のみ",
+                    "今回の作業でまだ未確認（在庫中）",
+                ),
+                key="inv_gallery_stocktake_filter",
+            )
 
         _fw = str(st.session_state.get("inv_gallery_search_text", "") or "")
         _sup_f = list(st.session_state.get("inv_gallery_suppliers_filter") or [])
         _st_f = str(st.session_state.get("inv_gallery_status_filter", "すべて") or "すべて")
         _stk_f = str(
             st.session_state.get("inv_gallery_stocktake_filter", "指定なし") or "指定なし"
+        )
+        _loan_f = str(
+            st.session_state.get("inv_gallery_loan_filter", "指定なし") or "指定なし"
         )
         _rem_gal = _inv_stocktake_work_remaining_get()
         if _stk_f == "今回の作業でまだ未確認（在庫中）" and _rem_gal is None:
@@ -4790,6 +4802,7 @@ def render_inventory_list_page() -> None:
             status_mode=_st_f,
             stocktake_filter=_stk_f,
             stocktake_session_remaining=_rem_gal,
+            loan_filter=_loan_f,
         )
         n_total = len(df_view)
         st.caption(
@@ -4799,7 +4812,7 @@ def render_inventory_list_page() -> None:
 
         if "inv_gallery_page" not in st.session_state:
             st.session_state.inv_gallery_page = 0
-        _fp_gal = f"{_fw!r}|{repr(_sup_f)}|{_st_f!r}|{_stk_f!r}"
+        _fp_gal = f"{_fw!r}|{repr(_sup_f)}|{_st_f!r}|{_stk_f!r}|{_loan_f!r}"
         if st.session_state.get("_inv_gallery_filter_fp") != _fp_gal:
             st.session_state._inv_gallery_filter_fp = _fp_gal
             st.session_state.inv_gallery_page = 0
@@ -5216,6 +5229,16 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                 st.rerun()
 
 
+def _mask_ledger_loan_datetime_nonblank(df: pd.DataFrame) -> pd.Series:
+    """浮貸日時が実質入力されている行（在庫一覧・ギャラリー用）。"""
+    if df.empty or COL_LOAN_DATETIME not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+    s = df[COL_LOAN_DATETIME].astype(str).str.strip()
+    low = s.str.lower()
+    blank = s.eq("") | low.isin(("nan", "none", "<na>", "nat"))
+    return ~(blank.fillna(True))
+
+
 def _filter_inventory_df_for_view(
     df: pd.DataFrame,
     *,
@@ -5224,6 +5247,7 @@ def _filter_inventory_df_for_view(
     status_mode: str,
     stocktake_filter: str = "指定なし",
     stocktake_session_remaining: set[str] | None = None,
+    loan_filter: str = "指定なし",
 ) -> pd.DataFrame:
     """在庫一覧の検索・フィルタ（ギャラリー／表の共通ビュー用）。"""
     out = df.copy()
@@ -5245,6 +5269,14 @@ def _filter_inventory_df_for_view(
         rem = stocktake_session_remaining
         m_rem = out[COL_MANAGEMENT_ID].astype(str).str.strip().isin(rem)
         out = out.loc[m_rem & _mask_ledger_in_stock(out)]
+    if loan_filter == "浮貸あり":
+        if COL_LOAN_DATETIME in out.columns:
+            out = out.loc[_mask_ledger_loan_datetime_nonblank(out)]
+        else:
+            out = out.iloc[0:0].copy()
+    elif loan_filter == "浮貸なし":
+        if COL_LOAN_DATETIME in out.columns:
+            out = out.loc[~_mask_ledger_loan_datetime_nonblank(out)]
     if suppliers and COL_SUPPLIER in out.columns:
         sup_m = out[COL_SUPPLIER].astype(str).str.strip().isin(set(suppliers))
         out = out.loc[sup_m]
