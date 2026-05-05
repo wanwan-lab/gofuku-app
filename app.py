@@ -69,7 +69,7 @@ import re
 import uuid
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import altair as alt
 import numpy as np
@@ -248,7 +248,10 @@ STOCKTAKE_CAND_PAGE_SIZE = 5
 # 棚卸しスキャン: AI が返す候補の最大件数（UI は STOCKTAKE_CAND_PAGE_SIZE 件ずつページング）
 STOCKTAKE_CAND_AI_MAX = 40
 # 棚卸しスキャン: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
-STOCKTAKE_CAND_MIN_CONFIDENCE = 0.18
+STOCKTAKE_CAND_MIN_CONFIDENCE = 0.14
+# 台帳の画像 URL から Gemini に渡す参照画像の上限（1リクエストのトークン・取得コスト対策）
+GEMINI_LEDGER_REF_IMAGE_MAX = 40
+GEMINI_LEDGER_REF_IMAGE_MAX_EDGE = 768
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
@@ -263,11 +266,19 @@ LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 # 写真→台帳照合（仕入 AI・棚卸し・販売の写真紐付け）向け。和装専門店以外・雑貨・アパレルでも迷いにくくする。
 _GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA = """
 照合の考え方（業種は限定しない）:
-- 在庫は **和服に限らず** 洋服・帽子・バッグ・アクセ・雑貨・アパレル全般・一点物があり得る。写真の品がリストのどれに相当するか、**色・シルエット・素材感・ブランド表記・タグ・価格帯**と台帳の商品名・カテゴリー・仕入金額の整合で推測する。
+- 在庫は **和服に限らず** 洋服・帽子・バッグ・アクセ・雑貨・アパレル全般・一点物があり得る。写真の品がリストのどれに相当するか、**色・シルエット・素材感・ブランド表記・タグ**と台帳の **商品名・カテゴリー・メモ・仕入先** で推測する。**どの行を選ぶかの判断に、台帳の金額や写真から読める価格が一致するかは使わない。**
+- **飲料・カップ麺などパッケージにロゴや商品名が大きく写る品**は文字・形状で照合しやすい。**無包装の衣料・帽子・布小物**は似た見た目が多く判別が難しい。首元・ウエスト・内側の **ケアタグ・サイズ・品番・紙タグ・下札** が写っていれば必ず読み取り、リストの商品名・メモと突き合わせる。
+- タグが読めない衣料では、**同じ仕入先で商品名やメモの語が写真の品とかぶる行**を候補に含めてよい。**無関係な別仕入先**の行は入れない。
 - 商品名が **略称・英字・カタカナ・型番のみ** で、写真の見え方と文字が違っても同一在庫と判断できるならその management_id を選ぶ。
 - 柄は **和柄だけでなく** 無地・ストライプ・チェック・ロゴ・プリント等も手がかりにする。
-- 確信が低い場合でも **迷う上位の数件** は confidence を下げつつ候補に含めてよい（明らかに無関係な行は入れない）。
+- 衣料・帽子で確信が低いときは **候補数を増やし** confidence を **0.12〜0.35** 程度まで下げてよい（明らかに無関係な行は入れない）。
+- **台帳の画像 URL から読み込んだ参考写真** が同じプロンプト内に載るときは、その **形状・色・柄・質感・シルエット** と質問の写真を必ず見比べ、テキストの商品名と矛盾しない範囲で **視覚的に最も同一在庫に近い management_id** を優先して選ぶ。参考写真が読めない行はテキストだけで判断する。
 """.strip()
+
+_GEMINI_LEDGER_REF_IMAGES_NOTICE_JA = (
+    "続く画像は **台帳に登録された画像 URL からサーバー側で取得した参考写真** です。"
+    "**直前に付いた管理 ID** の行が対応します。質問となる **最初の写真** と並べて、形・色・柄・質感で同一在庫か判断してください。\n\n"
+)
 
 # 証憑取込（Gemini への共通指示・JSON 仕様）
 VOUCHER_EXTRACTION_RULES = """注意点:
@@ -851,6 +862,23 @@ def _gemini_input_image_from_upload(uploaded) -> Image.Image:
     return Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
 
 
+def _pil_image_for_gemini(image_data: Any) -> Image.Image:
+    """Gemini へ渡す PIL（RGB・EXIF 補正済み）。"""
+    if isinstance(image_data, Image.Image):
+        im = ImageOps.exif_transpose(image_data)
+        return im.convert("RGB")
+    if isinstance(image_data, (bytes, bytearray, memoryview)):
+        im = Image.open(io.BytesIO(bytes(image_data)))
+        im = ImageOps.exif_transpose(im)
+        return im.convert("RGB")
+    gv = getattr(image_data, "getvalue", None)
+    if callable(gv):
+        return _pil_image_for_gemini(gv())
+    raise TypeError(
+        "image_data は PIL.Image / bytes / getvalue() を持つオブジェクトである必要があります。"
+    )
+
+
 def _consumption_tax_rate_from_choice_label(label: str) -> float:
     return CONSUMPTION_TAX_CHOICE_TO_RATE.get(label, CONSUMPTION_TAX_RATE)
 
@@ -975,6 +1003,7 @@ def analyze_image_with_gemini(
     *,
     inventory_context: str | None = None,
     prompt_mode: str = "full",
+    ledger_reference_images: list[tuple[str, bytes]] | None = None,
 ) -> str:
     api_key = _secret_str(SECRET_GEMINI_API_KEY)
     if not api_key:
@@ -983,36 +1012,56 @@ def analyze_image_with_gemini(
         )
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(_gemini_model_name())
-    inv_block = ""
-    if inventory_context and inventory_context.strip():
-        inv_block = f"""
+    subject = _pil_image_for_gemini(image_data)
+    refs = ledger_reference_images or []
+
+    def _ref_parts(seq: list[tuple[str, bytes]]) -> list[Any]:
+        ps: list[Any] = []
+        if not seq:
+            return ps
+        ps.append(_GEMINI_LEDGER_REF_IMAGES_NOTICE_JA)
+        for mid, jpeg_b in seq:
+            ps.append(f"参照・管理ID={json.dumps(mid)}\n")
+            ps.append(Image.open(io.BytesIO(jpeg_b)).convert("RGB"))
+        return ps
+
+    inv_stripped = (inventory_context or "").strip()
+    inv_tail_for_match = ""
+    if inv_stripped:
+        inv_tail_for_match = f"""
 次のリストは、すでに台帳にある行の抜粋です（**在庫中・販売済などステータス付き**。最大約400件。写真と同一・類似の商品がありそうなら必ず照合してください）。
+各行は **管理ID・商品名・仕入先** に加え **メモ**・**在庫カテゴリー** が付く場合があります（台帳に数値列があっても、**行の選び方に金額の一致は使わないこと**）。
 {_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
 
-{inventory_context.strip()}
+{inv_stripped}
 
 照合するときは必ず "match" オブジェクトを付け、少なくとも次を含めてください:
 - "management_id" (string): 上のリストにある行の **管理ID** と完全一致する値。リストには **在庫中・販売済などすべてのステータス** が含まれます。**写真と同一・類似の台帳上の1行** に対応するときは、その行の管理IDを選ぶこと（仕入れの入力補助・単価参照のため。ステータスで候補を除外しない）。該当がなければ ""
 - "product_name" (string): 台帳の商品名に合わせた確定案（推測でも可）
 - "supplier" (string): 台帳の仕入先に合わせた確定案（推測でも可）
-- "line_price_excl" (integer or null): 台帳の仕入金額（税抜）と一致する整数。不明なら null
+- "line_price_excl" (integer or null): 照合で選んだ台帳行の仕入金額（税抜）をそのまま入れる（**行の選定に写真と金額が一致するかは使わない**）。不明なら null
 - "inventory_category" (string): リストの照合先行に **{COL_CATEGORY}** が載っていればその行と同一の文字列。リストに無い・該当行が空なら ""
 - "confidence" (number): 0.0〜1.0 で、写真と台帳行が同一在庫である確信度
 
 同一行が見つからない場合は management_id を "" にし、confidence は 0.4 未満にしてください。
 """
     if prompt_mode == "stocktake_match":
-        if not inventory_context or not inventory_context.strip():
+        if not inv_stripped:
             raise ValueError(
                 "棚卸しの照合には台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
             )
-        prompt = f"""この写真は **店舗で棚卸しのために撮影した現物1点** です（衣料・アパレル・帽子・雑貨・一点物など **業種を限定しない**）。
-次のリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定した抜粋です（販売済は含みません。リスト外の管理IDは返さないこと）。
+        intro = f"""**直後の最初の画像** が、棚卸しのために撮影した **現物1点** です（衣料・アパレル・帽子・雑貨・一点物など **業種を限定しない** ）。
 {_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
-同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
-**リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
+続く画像は台帳の **{COL_IMAGE_URL}** 列の URL から取得した参考写真のときがあります（各画像の **直前の参照・管理ID** の行に対応）。**最初の画像** と形・色・柄・質感を見比べて照合してください。
 
-{inventory_context.strip()}
+次の **続きのテキスト** に示すリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定します（販売済は含みません。リスト外の管理IDは返さない）。
+同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
+**どの行が写真の品かは、金額の一致では判断しない**（商品名・メモ・カテゴリー・仕入先・タグ・色形・参考写真などで推測する）。
+**リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
+---
+"""
+        tail = f"""
+{inv_stripped}
 
 返却形式（キーは次のみ）:
 - "stocktake_candidates" (array): 必須。各要素は object で、次のフィールドを持つ:
@@ -1025,21 +1074,24 @@ def analyze_image_with_gemini(
   各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
 
 任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
-        response = model.generate_content([prompt, image_data])
+        response = model.generate_content([intro, subject, *_ref_parts(refs), tail])
         return response.text or ""
 
     if prompt_mode == "sale_link":
-        if not inventory_context or not inventory_context.strip():
+        if not inv_stripped:
             raise ValueError(
                 "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です（管理ID・商品名などが入っている行）。"
                 "在庫がすべて販売済のときや、台帳の読み込みに失敗しているときは使えません。"
             )
-        prompt = f"""この画像は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（衣料・アパレル・帽子・雑貨など **業種を限定しない** 在庫）。
+        intro = f"""**直後の最初の画像** は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（衣料・アパレル・帽子・雑貨など **業種を限定しない** 在庫）。
 {_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
-次のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。必ずこのリストの中からだけ management_id を選べ。
-写真と **同一の在庫1行** を選び、JSON だけを返してください（説明文・コードフェンス禁止）。
-
-{inventory_context.strip()}
+続く画像は台帳 **{COL_IMAGE_URL}** 由来の参考写真のときがあります。各画像の **直前の参照・管理ID** の行と対応し、**最初の画像** と見比べて同一在庫か判断してください。
+次の **続きのテキスト** のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。**行の選定に金額の一致は使わない。** 必ずこのリストの中からだけ management_id を選べ。
+JSON だけを返してください（説明文・コードフェンス禁止）。
+---
+"""
+        tail = f"""
+{inv_stripped}
 
 返却形式（キーは次のみ）:
 - "match" (object): 必須。フィールド:
@@ -1047,13 +1099,13 @@ def analyze_image_with_gemini(
   - "confidence" (number): 0.0〜1.0
   - "product_name" (string): その行の商品名（参考）
   - "supplier" (string): その行の仕入先（参考）
-  - "line_price_excl" (integer or null): その行の仕入金額（税抜）
+  - "line_price_excl" (integer or null): 選んだ行の仕入金額（税抜）を台帳どおり（**写真と金額が一致するかで行を決めない**）。不明なら null
 
 該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
-        response = model.generate_content([prompt, image_data])
+        response = model.generate_content([intro, subject, *_ref_parts(refs), tail])
         return response.text or ""
 
-    prompt = f"""この画像は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
+    schema_intro = f"""**直後の最初の画像** は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。この画像について次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
 説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
 
 必須キー（値の型を守ること）:
@@ -1067,12 +1119,20 @@ def analyze_image_with_gemini(
 - "material" (string): 素材の推定。不明なら ""
 - "condition" (string): 状態の推定。不明なら ""
 - "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
-{inv_block}
-任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
+"""
+    schema_refs_note = ""
+    if refs:
+        schema_refs_note = (
+            f"\n続く画像に台帳 **{COL_IMAGE_URL}** 由来の参考写真があるときがあります。"
+            "**直前テキストの参照・管理ID** の行に対応し、質問となる **最初の画像** と並べて照合してください。\n\n"
+        )
+    schema_footer = f"""{schema_refs_note}任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
   リストの行に **{COL_CATEGORY}** が載っているときは、照合して "match" に management_id を入れる場合 **必ず** 同じ行の値を "inventory_category" に含める。リストにカテゴリーが無いときのみ省略可。
   不要・該当なしのときは "match" キー自体を省略してもよい。"""
-    response = model.generate_content([prompt, image_data])
+    response = model.generate_content(
+        [schema_intro, subject, *_ref_parts(refs), inv_tail_for_match + schema_footer]
+    )
     return response.text or ""
 
 
@@ -2225,6 +2285,73 @@ def _ledger_in_stock_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[_mask_ledger_in_stock(df)].copy()
 
 
+def _iterate_gemini_inventory_rows(
+    df: pd.DataFrame,
+    *,
+    max_lines: int = 400,
+    only_in_stock: bool = True,
+    management_ids_filter: set[str] | None = None,
+) -> Iterator[pd.Series]:
+    """`_build_gemini_inventory_context` と同一の順序・終了条件でイテレート（参照画像収集用）。"""
+    if df.empty:
+        return
+    sub = _ledger_in_stock_rows(df) if only_in_stock else df
+    if sub.empty:
+        return
+    eff_max_lines = int(max_lines)
+    if management_ids_filter is not None:
+        filt = {str(x).strip() for x in management_ids_filter if str(x).strip()}
+        if not filt:
+            return
+        if COL_MANAGEMENT_ID not in sub.columns:
+            return
+        sub = sub.loc[
+            sub[COL_MANAGEMENT_ID].astype(str).str.strip().isin(filt)
+        ].copy()
+        if sub.empty:
+            return
+        eff_max_lines = max(eff_max_lines, 800)
+    n_lines = 0
+    for _, row in sub.iterrows():
+        if n_lines >= eff_max_lines:
+            break
+        mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
+        if not mid:
+            continue
+        n_lines += 1
+        yield row
+
+
+def _inventory_line_text_for_gemini_prompt(row: pd.Series) -> str:
+    mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
+    pn = str(row.get(COL_NAME, "") or "").strip().replace("\n", " ")
+    su = str(row.get(COL_SUPPLIER, "") or "").strip().replace("\n", " ")
+    st_lbl = ""
+    if COL_STOCK_STATUS in row.index:
+        st_lbl = _normalize_stock_status(str(row.get(COL_STOCK_STATUS, "") or ""))
+    st_seg = f" 状態={json.dumps(st_lbl, ensure_ascii=False)}" if st_lbl else ""
+    cat_seg = ""
+    if COL_CATEGORY in row.index:
+        cat = str(row.get(COL_CATEGORY, "") or "").strip().replace("\n", " ")
+        if cat:
+            cat_seg = (
+                f" {COL_CATEGORY}={json.dumps(cat, ensure_ascii=False)}"
+            )
+    memo_seg = ""
+    if COL_MEMO in row.index:
+        memo = str(row.get(COL_MEMO, "") or "").strip().replace("\n", " ")
+        if memo:
+            if len(memo) > 56:
+                memo = memo[:53] + "…"
+            memo_seg = f" メモ={json.dumps(memo, ensure_ascii=False)}"
+    return (
+        f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
+        f"商品名={json.dumps(pn, ensure_ascii=False)} "
+        f"仕入先={json.dumps(su, ensure_ascii=False)}"
+        f"{st_seg}{cat_seg}{memo_seg}"
+    )
+
+
 def _build_gemini_inventory_context(
     df: pd.DataFrame,
     *,
@@ -2239,59 +2366,95 @@ def _build_gemini_inventory_context(
     ``management_ids_filter`` … 指定時はその管理 ID に含まれる行だけ（棚卸し「今回の残リスト」向け）。
     **管理IDが空の行はスキップ** し、行数上限を無駄に使わない。
     """
-    if df.empty:
-        return ""
-    sub = _ledger_in_stock_rows(df) if only_in_stock else df
-    if sub.empty:
-        return ""
-    eff_max_lines = int(max_lines)
-    if management_ids_filter is not None:
-        filt = {str(x).strip() for x in management_ids_filter if str(x).strip()}
-        if not filt:
-            return ""
-        if COL_MANAGEMENT_ID not in sub.columns:
-            return ""
-        sub = sub.loc[
-            sub[COL_MANAGEMENT_ID].astype(str).str.strip().isin(filt)
-        ].copy()
-        if sub.empty:
-            return ""
-        eff_max_lines = max(eff_max_lines, 800)
     lines: list[str] = []
-    for _, row in sub.iterrows():
-        if len(lines) >= eff_max_lines:
+    for row in _iterate_gemini_inventory_rows(
+        df,
+        max_lines=max_lines,
+        only_in_stock=only_in_stock,
+        management_ids_filter=management_ids_filter,
+    ):
+        lines.append(_inventory_line_text_for_gemini_prompt(row))
+    return "\n".join(lines)
+
+
+def _ledger_image_bytes_for_gemini(image_url: str) -> bytes | None:
+    """ギャラリー表示と同等の URL 解決・取得で読み込み、長辺を抑えて JPEG バイトで返す（Gemini 参照用）。"""
+    iu = (image_url or "").strip()
+    if not (iu.startswith("http://") or iu.startswith("https://")):
+        return None
+    edge = max(320, min(2048, int(GEMINI_LEDGER_REF_IMAGE_MAX_EDGE)))
+    sz = min(edge * 2, 2400)
+    fid = _google_drive_file_id_from_url(iu)
+    candidates: list[str] = []
+    if fid:
+        candidates.append(f"https://drive.google.com/thumbnail?id={fid}&sz=w{sz}")
+        candidates.append(
+            f"https://drive.usercontent.google.com/download?id={fid}&export=view"
+        )
+    candidates.append(iu)
+    ua = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+    timeout = 20.0
+    for cand in candidates:
+        try:
+            r = requests.get(cand, timeout=timeout, headers=ua, allow_redirects=True)
+        except Exception:
+            continue
+        if r.status_code != 200 or not r.content or len(r.content) < 32:
+            continue
+        low512 = r.content[:512].lower()
+        if b"<html" in low512 or b"<!doctype" in low512:
+            continue
+        try:
+            im = Image.open(io.BytesIO(r.content))
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            continue
+    return None
+
+
+def _collect_ledger_reference_images(
+    df: pd.DataFrame,
+    *,
+    max_lines: int = 400,
+    only_in_stock: bool = True,
+    management_ids_filter: set[str] | None = None,
+    max_images: int = GEMINI_LEDGER_REF_IMAGE_MAX,
+) -> list[tuple[str, bytes]]:
+    """台帳の http(s) 画像 URL を、テキストリストと同じ並び・上限で取得し、(管理ID, JPEG) にする。"""
+    out: list[tuple[str, bytes]] = []
+    cap = max(0, int(max_images))
+    if cap == 0:
+        return out
+    for row in _iterate_gemini_inventory_rows(
+        df,
+        max_lines=max_lines,
+        only_in_stock=only_in_stock,
+        management_ids_filter=management_ids_filter,
+    ):
+        if len(out) >= cap:
             break
+        url = str(row.get(COL_IMAGE_URL, "") or "").strip()
+        if not (
+            url.startswith("http://")
+            or url.startswith("https://")
+        ):
+            continue
         mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
         if not mid:
             continue
-        pn = str(row.get(COL_NAME, "") or "").strip().replace("\n", " ")
-        su = str(row.get(COL_SUPPLIER, "") or "").strip().replace("\n", " ")
-        cogs = _int_from_cell(row.get(COL_PRICE_EXCL))
-        st_lbl = ""
-        if COL_STOCK_STATUS in row.index:
-            st_lbl = _normalize_stock_status(str(row.get(COL_STOCK_STATUS, "") or ""))
-        st_seg = f" 状態={json.dumps(st_lbl, ensure_ascii=False)}" if st_lbl else ""
-        cat_seg = ""
-        if COL_CATEGORY in row.index:
-            cat = str(row.get(COL_CATEGORY, "") or "").strip().replace("\n", " ")
-            if cat:
-                cat_seg = (
-                    f" {COL_CATEGORY}={json.dumps(cat, ensure_ascii=False)}"
-                )
-        memo_seg = ""
-        if COL_MEMO in row.index:
-            memo = str(row.get(COL_MEMO, "") or "").strip().replace("\n", " ")
-            if memo:
-                if len(memo) > 56:
-                    memo = memo[:53] + "…"
-                memo_seg = f" メモ={json.dumps(memo, ensure_ascii=False)}"
-        lines.append(
-            f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
-            f"商品名={json.dumps(pn, ensure_ascii=False)} "
-            f"仕入先={json.dumps(su, ensure_ascii=False)} "
-            f"仕入金額税抜={cogs}{st_seg}{cat_seg}{memo_seg}"
-        )
-    return "\n".join(lines)
+        blob = _ledger_image_bytes_for_gemini(url)
+        if blob:
+            out.append((mid, blob))
+    return out
 
 
 def _fuzzy_ledger_match_rows(
@@ -5373,7 +5536,10 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             st.session_state.pop(_k, None)
     st.caption(
         "現物を撮影し、**今回の棚卸対象リストにまだ残っている在庫中の行** だけを AI に渡し、複数候補を返します。"
-        "照合は **和装に限らず** 洋服・帽子・雑貨・アパレル・一点物も想定しています（台帳の **メモ**・カテゴリー・商品名の表記ゆれも手がかりになります）。"
+        "照合は **和装に限らず** 洋服・帽子・雑貨・アパレル・一点物も想定しています。"
+        "飲料・カップ麺のようにパッケージ文字が読める品より、**無包装の衣料**は難しいため、台帳の **メモ・カテゴリー・商品名・仕入先** を手がかりにします（**金額の一致は照合に使いません**）。"
+        "**タグが写る撮影**を推奨します。"
+        f"台帳の **{COL_IMAGE_URL}** に http(s) がある場合は、サービス側で最大 **{GEMINI_LEDGER_REF_IMAGE_MAX}** 枚まで取得し、質問写真と並べて形・色の照合に使います（取得できない URL は省略されます）。"
         f"候補は **{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、ページを切り替えて全件を確認できます（AI は最大 "
         f"**{STOCKTAKE_CAND_AI_MAX}** 件まで）。"
         "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
@@ -5390,6 +5556,10 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                 "続ける場合は **今回の棚卸を開始** でリストを作り直してください。"
             )
     cam = st.camera_input("現物を撮影", key="stocktake_camera_input")
+    st.caption(
+        "**衣料・帽子・布製品**は、飲料やカップ麺のようにパッケージ文字が読めないことが多く照合が難しくなりがちです。"
+        "**タグ・品番・サイズ・下札・内側のケア表記**が読める距離で写すと、台帳の商品名・メモと突き合わせやすくなります。"
+    )
     if cam is not None:
         st.session_state[SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES] = cam.getvalue()
     elif st.session_state.get(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES):
@@ -5450,10 +5620,16 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                                 return self._b
 
                         img_pil = _gemini_input_image_from_upload(_CamBytes(img_b))
+                        _ledger_refs = _collect_ledger_reference_images(
+                            df_ledger_hint,
+                            only_in_stock=True,
+                            management_ids_filter=st_rem_run,
+                        )
                         raw = analyze_image_with_gemini(
                             img_pil,
                             inventory_context=inv_ctx_st or None,
                             prompt_mode="stocktake_match",
+                            ledger_reference_images=_ledger_refs or None,
                         )
                         res = _parse_json_from_model(raw or "")
                         if not isinstance(res, dict):
@@ -5761,6 +5937,7 @@ def _render_sales_management_tab(
         "**出庫（販売）** … 在庫行を **販売済** にし、実売と販売日時（確定の JST）を記録します（新規行なし）。"
         "**出庫（浮貸）** … **在庫中** のままなら **浮貸日時** 列へ日時を記録し、**販売済** を選ぶ場合は **出庫（販売）と同様** に在庫行を販売済へ更新します（出庫種別はいずれも記録）。"
         "写真は任意（上の共通アップローダ）。"
+        f"**販売元を写真で照合** では台帳の **{COL_IMAGE_URL}** からも最大 **{GEMINI_LEDGER_REF_IMAGE_MAX}** 枚を取得して比較に使うことがあります。"
     )
     outbound_kind = st.radio(
         "出庫区分",
@@ -5817,10 +5994,15 @@ def _render_sales_management_tab(
             with st.spinner("画像を解析して販売元を照合しています…"):
                 try:
                     img = _gemini_input_image_from_upload(uploaded)
+                    _sale_ledger_refs = _collect_ledger_reference_images(
+                        df_ledger_hint,
+                        only_in_stock=True,
+                    )
                     raw_text = analyze_image_with_gemini(
                         img,
                         inventory_context=inv_ctx_sale or None,
                         prompt_mode="sale_link",
+                        ledger_reference_images=_sale_ledger_refs or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
                     _apply_gemini_sale_link_to_session(
@@ -6243,6 +6425,7 @@ def main():
         "写真は **1枚まで** です。**複数行を同時に登録する** ときは、その1枚をドライブに保存し、"
         "作成する **全行に同じ画像URL** を入れます。"
         "台帳の日時は写真の EXIF 撮影日時を優先し、写真がないときは日本時間（JST）の現在時刻です。"
+        "**衣料・帽子**で台帳照合する場合は、**タグや品番が読める**ように寄せると一致しやすいです（パッケージ商品より判別が難しいことがあります）。"
     )
 
     _inject_prominent_main_tabs_style()
@@ -6261,6 +6444,8 @@ def main():
         st.markdown("##### クイック検索（写真から検索）")
         st.caption(
             "**AIで画像を解析** で商品名・色・シルエットなどを推定しつつ在庫中と照合します（洋服・帽子・雑貨など **和装以外も** 想定）。"
+            "パッケージに大きな文字がある商品より、**無包装の衣料**は判別が難しいことがあります。**タグ・下札**が写っていると有利です。"
+            f"台帳の **{COL_IMAGE_URL}** に http(s) があるときは、その画像を最大 **{GEMINI_LEDGER_REF_IMAGE_MAX}** 枚まで取得して照合します。"
             "解析後は下の「近い候補」も併せて確認してください。"
         )
 
@@ -6311,13 +6496,19 @@ def main():
                 try:
                     img = _gemini_input_image_from_upload(uploaded)
                     inv_ctx = ""
+                    _purchase_ledger_refs: list[tuple[str, bytes]] = []
                     if df_ledger_hint is not None and not df_ledger_hint.empty:
                         inv_ctx = _build_gemini_inventory_context(
                             df_ledger_hint, only_in_stock=False
                         )
+                        _purchase_ledger_refs = _collect_ledger_reference_images(
+                            df_ledger_hint,
+                            only_in_stock=False,
+                        )
                     raw_text = analyze_image_with_gemini(
                         img,
                         inventory_context=inv_ctx or None,
+                        ledger_reference_images=_purchase_ledger_refs or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
                     result = _apply_purchase_ledger_match_supplement(
@@ -6359,7 +6550,7 @@ def main():
             st.markdown("##### 台帳から入力補助（任意）")
             st.caption(
                 "絞り込み欄に文字を入れると候補が絞られます。プルダウンで選ぶと下の **必須入力欄** に反映されます（あとから手修正も可能です）。"
-                "在庫中の行に一致したときは **販売予定金額（税抜・任意）** にも、台帳の1点あたりの値を入れます（仕入先まで一致する行を優先）。"
+                "在庫中の行に一致したときは **販売予定金額（税抜・任意）** にも、台帳の1点あたりの値を入れます（選んだ行の値をそのまま反映）。"
                 f"**{COL_CATEGORY}** も同様に、台帳の既存値から選べます。"
             )
             hc1, hc2, hc3 = st.columns(3)
