@@ -6226,31 +6226,6 @@ def render_stocktake_scan_tab(
             ).strip():
                 _tsm = str(st.session_state["_stocktake_selected_mid"]).strip()
                 st.caption(f"選択中の管理ID（補助）: **{_tsm}**")
-            if st.button("入力をクリア", key="stocktake_assist_clear_btn"):
-                st.session_state.stocktake_hint_filter_product_name = ""
-                st.session_state.stocktake_hint_filter_supplier = ""
-                st.session_state.stocktake_hint_filter_inventory_category = ""
-                st.session_state.stocktake_hint_filter_management_id = ""
-                st.session_state.stocktake_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
-                st.session_state.stocktake_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
-                st.session_state.stocktake_ledger_pick_inventory_category = (
-                    LEDGER_PICK_PLACEHOLDER
-                )
-                st.session_state.stocktake_ledger_pick_management_id = (
-                    LEDGER_PICK_PLACEHOLDER
-                )
-                st.session_state.stocktake_assist_buf_product_name = ""
-                st.session_state.stocktake_assist_buf_supplier = ""
-                st.session_state.stocktake_assist_buf_inventory_category = ""
-                st.session_state.stocktake_assist_buf_management_id = ""
-                st.session_state.pop("stocktake_assist_quick_candidates", None)
-                st.session_state.pop("stocktake_assist_last_n_matching_mids", None)
-                st.session_state.pop("_stocktake_selected_mid", None)
-                st.session_state.pop("_stocktake_scan_candidates", None)
-                st.session_state.pop("stocktake_multi_done_mids", None)
-                st.session_state.pop("stocktake_cand_page", None)
-                st.session_state.pop("_stocktake_scan_warn", None)
-                st.rerun()
             _refresh_stocktake_assist_quick_candidates(df_ledger_hint, st_rem_scan)
             _stk_c = st.session_state.get("stocktake_assist_quick_candidates")
             if (
@@ -6283,6 +6258,34 @@ def render_stocktake_scan_tab(
         st.caption(
             "**今回の棚卸を開始** して対象リストがあるときだけ、ここに仕入タブと同様の台帳入力補助が表示されます。"
         )
+    if (
+        st.session_state.stocktake_assist_visible
+        and st.button("入力をクリア", key="stocktake_assist_clear_btn")
+    ):
+        st.session_state.stocktake_hint_filter_product_name = ""
+        st.session_state.stocktake_hint_filter_supplier = ""
+        st.session_state.stocktake_hint_filter_inventory_category = ""
+        st.session_state.stocktake_hint_filter_management_id = ""
+        st.session_state.stocktake_ledger_pick_product_name = LEDGER_PICK_PLACEHOLDER
+        st.session_state.stocktake_ledger_pick_supplier = LEDGER_PICK_PLACEHOLDER
+        st.session_state.stocktake_ledger_pick_inventory_category = (
+            LEDGER_PICK_PLACEHOLDER
+        )
+        st.session_state.stocktake_ledger_pick_management_id = (
+            LEDGER_PICK_PLACEHOLDER
+        )
+        st.session_state.stocktake_assist_buf_product_name = ""
+        st.session_state.stocktake_assist_buf_supplier = ""
+        st.session_state.stocktake_assist_buf_inventory_category = ""
+        st.session_state.stocktake_assist_buf_management_id = ""
+        st.session_state.pop("stocktake_assist_quick_candidates", None)
+        st.session_state.pop("stocktake_assist_last_n_matching_mids", None)
+        st.session_state.pop("_stocktake_selected_mid", None)
+        st.session_state.pop("_stocktake_scan_candidates", None)
+        st.session_state.pop("stocktake_multi_done_mids", None)
+        st.session_state.pop("stocktake_cand_page", None)
+        st.session_state.pop("_stocktake_scan_warn", None)
+        st.rerun()
 
     wn = st.session_state.pop("_stocktake_scan_warn", None)
     if wn:
