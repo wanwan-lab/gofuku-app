@@ -6623,7 +6623,7 @@ def _render_sales_management_tab(
     c1, c2 = st.columns(2)
     with c1:
         do_match = st.button(
-            "販売元を写真で照合",
+            "AIで写真と照合",
             disabled=uploaded is None,
             key="sales_tab_photo_match_btn",
         )
@@ -6647,7 +6647,6 @@ def _render_sales_management_tab(
             st.session_state.sales_assist_buf_inventory_category = ""
             st.session_state.sales_assist_buf_management_id = ""
             st.session_state.sales_pick_mode = "1件選択"
-            st.session_state["sales_multi_selected_ids"] = []
             st.session_state.pop("sales_assist_quick_candidates", None)
             st.session_state.pop("sales_assist_last_n_matching_mids", None)
             st.session_state.pop("_sale_link_management_id", None)
@@ -6718,26 +6717,7 @@ def _render_sales_management_tab(
         horizontal=True,
         key="sales_pick_mode",
     )
-    if _sale_pick_mode.startswith("複数"):
-        s1, s2 = st.columns(2)
-        with s1:
-            if st.button("在庫中をすべて選択", key="sales_pick_all_ids", disabled=not _sale_id_opts):
-                st.session_state["sales_multi_selected_ids"] = list(_sale_id_opts)
-                st.session_state.field_sale_source_mgmt_id = ", ".join(_sale_id_opts)
-                st.rerun()
-        with s2:
-            if st.button("選択をクリア", key="sales_pick_clear_ids"):
-                st.session_state["sales_multi_selected_ids"] = []
-                st.session_state.field_sale_source_mgmt_id = ""
-                st.rerun()
-        st.multiselect(
-            "一括反映する管理ID",
-            options=_sale_id_opts,
-            key="sales_multi_selected_ids",
-        )
-        _picked_ids = [str(x).strip() for x in st.session_state.get("sales_multi_selected_ids", []) if str(x).strip()]
-        st.session_state.field_sale_source_mgmt_id = ", ".join(_picked_ids)
-    else:
+    if not _sale_pick_mode.startswith("複数"):
         if _sale_id_opts:
             st.selectbox(
                 "在庫中の管理ID（すぐ選ぶ）",
@@ -6786,7 +6766,6 @@ def _render_sales_management_tab(
                     key="sales_cand_pick_all",
                     disabled=not _spm_mids,
                 ):
-                    st.session_state["sales_multi_selected_ids"] = list(_spm_mids)
                     st.session_state.field_sale_source_mgmt_id = ", ".join(_spm_mids)
                     st.rerun()
             with c2:
@@ -6795,15 +6774,17 @@ def _render_sales_management_tab(
                     key="sales_cand_pick_page_all",
                     disabled=not _spm_page_mids,
                 ):
-                    _cur = set(st.session_state.get("sales_multi_selected_ids") or [])
+                    _cur = set(
+                        _split_management_ids_from_field(
+                            str(st.session_state.get("field_sale_source_mgmt_id", "") or "")
+                        )
+                    )
                     _cur.update(_spm_page_mids)
                     _new = sorted(x for x in _cur if str(x).strip())
-                    st.session_state["sales_multi_selected_ids"] = _new
                     st.session_state.field_sale_source_mgmt_id = ", ".join(_new)
                     st.rerun()
             with c3:
                 if st.button("候補選択をクリア", key="sales_cand_pick_clear"):
-                    st.session_state["sales_multi_selected_ids"] = []
                     st.session_state.field_sale_source_mgmt_id = ""
                     st.rerun()
             st.multiselect(
@@ -6816,7 +6797,11 @@ def _render_sales_management_tab(
                 key="sales_cand_pick_page_partial_add",
                 disabled=not bool(st.session_state.get("sales_page_partial_pick")),
             ):
-                _cur = set(st.session_state.get("sales_multi_selected_ids") or [])
+                _cur = set(
+                    _split_management_ids_from_field(
+                        str(st.session_state.get("field_sale_source_mgmt_id", "") or "")
+                    )
+                )
                 _cur.update(
                     [
                         str(x).strip()
@@ -6825,7 +6810,6 @@ def _render_sales_management_tab(
                     ]
                 )
                 _new = sorted(x for x in _cur if str(x).strip())
-                st.session_state["sales_multi_selected_ids"] = _new
                 st.session_state.field_sale_source_mgmt_id = ", ".join(_new)
                 st.rerun()
         _render_mid_pick_candidate_cards(
