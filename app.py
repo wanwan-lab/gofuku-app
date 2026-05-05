@@ -982,7 +982,8 @@ def analyze_image_with_gemini(
     if prompt_mode == "sale_link":
         if not inventory_context or not inventory_context.strip():
             raise ValueError(
-                "販売元の写真照合には、台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
+                "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です（管理ID・商品名などが入っている行）。"
+                "在庫がすべて販売済のときや、台帳の読み込みに失敗しているときは使えません。"
             )
         prompt = f"""この画像は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（呉服店の在庫）。
 次のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。必ずこのリストの中からだけ management_id を選べ。
@@ -1648,13 +1649,21 @@ def _bump_inventory_sheet_cache_bust() -> None:
 @st.cache_data(show_spinner=False)
 def _inventory_sheet_get_all_values_cached(
     sheet_id: str, worksheet_title: str, bust: int
-) -> list[list[str]] | None:
-    """同一 bust の間は get_all_values の結果を再利用する（bust は書き込み・再読込で進める）。"""
+) -> list[list[Any]]:
+    """同一 bust の間は get_all_values の結果を再利用する（bust は書き込み・再読込で進める）。
+
+    失敗時は **例外を送出**する。``return None`` だと Streamlit の ``@st.cache_data`` に
+    失敗結果がキャッシュされ、一時的な通信エラー後も台帳が読めなくなるため。
+    """
     _ = bust
     try:
         sh = _gspread_client().open_by_key(str(sheet_id))
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError(
+            "スプレッドシートを開けません。"
+            f"{SECRET_GOOGLE_SPREADSHEET_ID}・共有権限・[{SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION}] を確認してください。"
+            f" 詳細: {e}"
+        ) from e
     try:
         try:
             ws = sh.worksheet(str(worksheet_title))
@@ -1664,12 +1673,16 @@ def _inventory_sheet_get_all_values_cached(
                 rows=2000,
                 cols=max(20, len(EXPECTED_HEADERS) + 2),
             )
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError(
+            f"ワークシート「{worksheet_title}」を開けず、新規作成にも失敗しました: {e}"
+        ) from e
     try:
         return ws.get_all_values()
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError(
+            f"ワークシート「{worksheet_title}」の get_all_values に失敗しました: {e}"
+        ) from e
 
 
 def ensure_worksheet_header():
@@ -2616,8 +2629,10 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
         return None
     wname = _secret_str(SECRET_GOOGLE_WORKSHEET_NAME, DEFAULT_WORKSHEET_NAME)
     bust = int(st.session_state.get(SESSION_KEY_INV_SHEET_CACHE_BUST, 0))
-    raw = _inventory_sheet_get_all_values_cached(str(sid), str(wname), bust)
-    if raw is None:
+    try:
+        raw = _inventory_sheet_get_all_values_cached(str(sid), str(wname), bust)
+    except Exception as e:
+        st.session_state["_inventory_sheet_load_error"] = str(e)
         return None
     if not raw:
         return pd.DataFrame(columns=EXPECTED_HEADERS)
@@ -2632,9 +2647,9 @@ def _ledger_hint_dataframe() -> pd.DataFrame | None:
     if not _uses_local_inventory_csv() and not _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
         return None
     try:
-        df = load_inventory_dataframe()
-        return df
-    except Exception:
+        return load_inventory_dataframe()
+    except Exception as e:
+        st.session_state["_ledger_hint_load_error"] = str(e)
         return None
 
 
@@ -5116,44 +5131,48 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         elif df_ledger_hint is None or df_ledger_hint.empty:
             st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
         else:
-            with st.spinner("画像を解析して台帳と照合しています…"):
-                try:
-                    inv_ctx = _build_gemini_inventory_context(
-                        df_ledger_hint, only_in_stock=True
-                    )
+            inv_ctx_st = _build_gemini_inventory_context(
+                df_ledger_hint, only_in_stock=True
+            )
+            if not (inv_ctx_st or "").strip():
+                st.session_state["_stocktake_scan_warn"] = (
+                    "台帳に **在庫中** の行がありません。棚卸しの照合には在庫中の行が必要です。"
+                )
+            else:
+                with st.spinner("画像を解析して台帳と照合しています…"):
+                    try:
+                        class _CamBytes:
+                            __slots__ = ("_b",)
 
-                    class _CamBytes:
-                        __slots__ = ("_b",)
+                            def __init__(self, b: bytes) -> None:
+                                self._b = b
 
-                        def __init__(self, b: bytes) -> None:
-                            self._b = b
+                            def getvalue(self) -> bytes:
+                                return self._b
 
-                        def getvalue(self) -> bytes:
-                            return self._b
-
-                    img_pil = _gemini_input_image_from_upload(_CamBytes(img_b))
-                    raw = analyze_image_with_gemini(
-                        img_pil,
-                        inventory_context=inv_ctx or None,
-                        prompt_mode="stocktake_match",
-                    )
-                    res = _parse_json_from_model(raw or "")
-                    if not isinstance(res, dict):
-                        res = {}
-                    cand_list = _stocktake_candidates_from_gemini_response(
-                        res, df_ledger_hint
-                    )
-                    if not cand_list:
-                        st.session_state["_stocktake_scan_warn"] = (
-                            "在庫中の行で、写真に合いそうな候補が得られませんでした。"
-                            "明るさ・距離を変えて再撮影するか、在庫一覧で管理IDを確認してください。"
+                        img_pil = _gemini_input_image_from_upload(_CamBytes(img_b))
+                        raw = analyze_image_with_gemini(
+                            img_pil,
+                            inventory_context=inv_ctx_st or None,
+                            prompt_mode="stocktake_match",
                         )
-                    else:
-                        st.session_state["_stocktake_scan_candidates"] = cand_list
-                        st.session_state["stocktake_cand_page"] = 0
-                        st.session_state.pop("_stocktake_selected_mid", None)
-                except Exception as e:
-                    st.session_state["_stocktake_scan_warn"] = str(e)
+                        res = _parse_json_from_model(raw or "")
+                        if not isinstance(res, dict):
+                            res = {}
+                        cand_list = _stocktake_candidates_from_gemini_response(
+                            res, df_ledger_hint
+                        )
+                        if not cand_list:
+                            st.session_state["_stocktake_scan_warn"] = (
+                                "在庫中の行で、写真に合いそうな候補が得られませんでした。"
+                                "明るさ・距離を変えて再撮影するか、在庫一覧で管理IDを確認してください。"
+                            )
+                        else:
+                            st.session_state["_stocktake_scan_candidates"] = cand_list
+                            st.session_state["stocktake_cand_page"] = 0
+                            st.session_state.pop("_stocktake_selected_mid", None)
+                    except Exception as e:
+                        st.session_state["_stocktake_scan_warn"] = str(e)
 
     wn = st.session_state.pop("_stocktake_scan_warn", None)
     if wn:
@@ -5392,32 +5411,39 @@ def _render_sales_management_tab(
             st.rerun()
 
     if do_match and uploaded is not None:
-        with st.spinner("画像を解析して販売元を照合しています…"):
-            try:
-                img = _gemini_input_image_from_upload(uploaded)
-                inv_ctx = ""
-                if df_ledger_hint is not None and not df_ledger_hint.empty:
-                    inv_ctx = _build_gemini_inventory_context(
-                        df_ledger_hint, only_in_stock=True
+        inv_ctx_sale = ""
+        if df_ledger_hint is not None and not df_ledger_hint.empty:
+            inv_ctx_sale = _build_gemini_inventory_context(
+                df_ledger_hint, only_in_stock=True
+            )
+        if not (inv_ctx_sale or "").strip():
+            st.warning(
+                "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です。"
+                "在庫がすべて販売済の場合や、**管理ID** が空の行しかない場合はリストを作れません。"
+                "ページ先頭の台帳読み込みエラーが出ていないかも確認してください。"
+            )
+        else:
+            with st.spinner("画像を解析して販売元を照合しています…"):
+                try:
+                    img = _gemini_input_image_from_upload(uploaded)
+                    raw_text = analyze_image_with_gemini(
+                        img,
+                        inventory_context=inv_ctx_sale or None,
+                        prompt_mode="sale_link",
                     )
-                raw_text = analyze_image_with_gemini(
-                    img,
-                    inventory_context=inv_ctx or None,
-                    prompt_mode="sale_link",
-                )
-                result = _parse_json_from_model(raw_text or "")
-                _apply_gemini_sale_link_to_session(
-                    result,
-                    df_ledger_hint,
-                    fill_product_preview_fields=False,
-                )
-                st.success("照合が完了しました。管理IDを確認してください。")
-            except Exception as e:
-                st.warning(
-                    "現在混み合っているか、無料枠の上限に達している可能性があります。"
-                    "1分ほど待ってから再試行してください。"
-                )
-                st.caption(f"詳細: {e}")
+                    result = _parse_json_from_model(raw_text or "")
+                    _apply_gemini_sale_link_to_session(
+                        result,
+                        df_ledger_hint,
+                        fill_product_preview_fields=False,
+                    )
+                    st.success("照合が完了しました。管理IDを確認してください。")
+                except Exception as e:
+                    st.warning(
+                        "現在混み合っているか、無料枠の上限に達している可能性があります。"
+                        "1分ほど待ってから再試行してください。"
+                    )
+                    st.caption(f"詳細: {e}")
 
     _swarn = st.session_state.pop("_sale_link_warn", None)
     if _swarn:
@@ -5789,6 +5815,13 @@ def main():
     _init_registration_form_session_state()
     _init_voucher_sidebar_state()
     df_ledger_hint = _ledger_hint_dataframe()
+    _ledger_err = st.session_state.pop("_ledger_hint_load_error", None)
+    _sheet_err = st.session_state.pop("_inventory_sheet_load_error", None)
+    if _ledger_err or _sheet_err:
+        st.warning(
+            "台帳の参照用データの読み込みに失敗しました（**仕入のAI解析・販売の写真照合・候補一覧**に影響します）。"
+            f"\n\n{_ledger_err or _sheet_err}"
+        )
 
     st.markdown("## 台帳登録")
     st.caption(
