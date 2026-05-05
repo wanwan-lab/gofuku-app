@@ -2704,9 +2704,9 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     """入出庫判定・行金額・年月などの派生列を付与したコピーを返す。
 
     1点1行ライフサイクル前提: **在庫中** かつ **入庫** だけを仕入（入庫）側に計上し、
-    **販売済** かつ実売がある行は **実売行計（税抜・税込）** を売上（出庫）側に計上する
-    （「入庫種別」が空の在庫中は入庫扱い。販売済＋実売で売上を計上し、仕入金額を二重に出庫しない）。
-    **在庫中** のまま **出庫**（浮貸など別レコード）の行は、従来どおり仕入列ベースで出庫に含める。
+    **販売済** かつ実売がある行は **出庫側の金額を実売ではなく当行の仕入金額（税抜・税込）** で計上する
+    （「入庫種別」が空の在庫中は入庫扱い。数量の出庫計上は販売済＋実売で行い、金額の入出庫は仕入列で統一）。
+    **在庫中** のまま **出庫**（浮貸など）の行は仕入列ベースで出庫に含める。
     """
     d = df.copy()
     if d.empty:
@@ -2750,9 +2750,6 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     ac_u = _series_to_numeric_loose(
         d[COL_ACTUAL_SALE] if COL_ACTUAL_SALE in d.columns else 0
     ).fillna(0)
-    ac_incl_line = _series_to_numeric_loose(
-        d[COL_ACTUAL_SALE_INCL] if COL_ACTUAL_SALE_INCL in d.columns else 0
-    ).fillna(0)
     rev_ex = (ac_u * qty).clip(lower=0)
     m_stock_in = is_in_mv & (st_col == STATUS_IN_STOCK)
     # 販売済は実売ベースで売上計上（区分がまだ入庫の旧行も、実売があればここに含める）
@@ -2764,12 +2761,13 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     d["_amt_in_in"] = line_in.where(m_stock_in, 0.0).fillna(0).astype(float)
 
     d["_qty_out"] = qty.where(m_sold_rev | m_float_out, 0.0).fillna(0).astype(float)
+    # 金額の入出庫はいずれも当行の仕入金額（税抜・税込）で統一（販売済の実売は金額集計に使わない）
     d["_amt_ex_out"] = (
-        rev_ex.where(m_sold_rev, 0.0).fillna(0)
+        line_ex.where(m_sold_rev, 0.0).fillna(0)
         + line_ex.where(m_float_out, 0.0).fillna(0)
     ).astype(float)
     d["_amt_in_out"] = (
-        ac_incl_line.where(m_sold_rev, 0.0).fillna(0)
+        line_in.where(m_sold_rev, 0.0).fillna(0)
         + line_in.where(m_float_out, 0.0).fillna(0)
     ).astype(float)
 
@@ -2804,9 +2802,9 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     st.subheader("集計")
     st.caption(
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
-        f"金額はシートの「{COL_PRICE_EXCL}」「{COL_PRICE_INCL}」列を行合計として集計します。"
+        f"入出庫の **金額** は「{COL_PRICE_EXCL}」「{COL_PRICE_INCL}」（仕入・税抜・税込）を行合計として集計します（販売済行の出庫側も実売ではなく当行の仕入金額で計上）。"
         f"仕入先・取引先別の粗利は「{COL_GROSS_PROFIT}」列を合算しています（税抜・台帳保存時の値）。"
-        "出庫（販売）は **在庫行の更新** のみのため、入庫／出庫の数量・金額は **在庫中＝仕入**、**販売済＝実売** を二重計上しないよう派生列で計上しています。"
+        "入出庫の **数量** は在庫中の入庫行と、販売済で実売がある行の出庫数量として計上します。"
         "期間フィルタと月次の軸は **販売済は販売日時**（未入力の旧行は日時にフォールバック）、在庫中は **日時** です。"
         "（税抜の仕入金額が空で税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
         "カンマ区切り・円記号付きの数値も読み取ります。）"
@@ -2870,13 +2868,16 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     if supplier_filter:
         flt = flt[flt[COL_SUPPLIER].astype(str).isin(supplier_filter)]
 
-    ad_sup = ad_f
-    if supplier_filter:
-        ad_sup = ad_sup[ad_sup[COL_SUPPLIER].astype(str).isin(supplier_filter)]
-    stock_cogs_total = 0
-    if COL_PRICE_EXCL in ad_sup.columns:
-        stock_cogs_total = _finite_int(
-            _series_to_numeric_loose(ad_sup[COL_PRICE_EXCL]).fillna(0).sum(),
+    period_cogs_ex = 0
+    if COL_PRICE_EXCL in flt.columns:
+        period_cogs_ex = _finite_int(
+            _series_to_numeric_loose(flt[COL_PRICE_EXCL]).fillna(0).sum(),
+            0,
+        )
+    period_cogs_in = 0
+    if COL_PRICE_INCL in flt.columns:
+        period_cogs_in = _finite_int(
+            _series_to_numeric_loose(flt[COL_PRICE_INCL]).fillna(0).sum(),
             0,
         )
     gp_sold_period = 0
@@ -2893,14 +2894,16 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         )
     st.markdown("##### ライフサイクル指標")
     st.caption(
-        "税抜原価の総額は **日付は問わず**（仕入先フィルタのみ適用）で、在庫中・販売済を問わず "
-        f"**{COL_PRICE_EXCL}** 列を合算します。"
-        "確定粗利は **From〜To と仕入先フィルタ内** の販売済行の粗利列の合計です。"
+        "次の3つは **From〜To・仕入先フィルタ** に合致する行のみを対象にします（数量は含みません）。"
+        f"原価は台帳の **{COL_PRICE_EXCL}** / **{COL_PRICE_INCL}** を合算した税抜・税込の総額です。"
+        "確定粗利は **販売済** 行の粗利列（税抜）の合計です。"
     )
-    _lc1, _lc2 = st.columns(2)
+    _lc1, _lc2, _lc3 = st.columns(3)
     with _lc1:
-        st.metric("税抜原価総額（ステータス不問）", f"¥{stock_cogs_total:,}")
+        st.metric("税抜原価総額（期間内）", f"¥{period_cogs_ex:,}")
     with _lc2:
+        st.metric("税込原価総額（期間内）", f"¥{period_cogs_in:,}")
+    with _lc3:
         st.metric("確定粗利（期間内・販売済・税抜）", f"¥{gp_sold_period:,}")
 
     if flt.empty:
@@ -2912,23 +2915,22 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
 
     q_in = _finite_int(flt["_qty_in"].sum(), 0)
     q_out = _finite_int(flt["_qty_out"].sum(), 0)
-    q_net = q_in - q_out
+    q_sum = q_in + q_out
     ex_in = _finite_int(flt["_amt_ex_in"].sum(), 0)
     ex_out = _finite_int(flt["_amt_ex_out"].sum(), 0)
-    ex_net = ex_in - ex_out
     in_in = _finite_int(flt["_amt_in_in"].sum(), 0)
     in_out = _finite_int(flt["_amt_in_out"].sum(), 0)
-    in_net = in_in - in_out
 
+    st.markdown("##### 期間内の数量")
     m1, m2, m3 = st.columns(3)
     m1.metric("入庫 合計数量", f"{q_in:,}")
     m2.metric("出庫 合計数量", f"{q_out:,}")
-    m3.metric("差し引き 数量（入−出）", f"{q_net:,}")
-    m5, m6, m7, m8, m9 = st.columns(5)
+    m3.metric("合計数量（入+出）", f"{q_sum:,}")
+
+    st.markdown("##### 期間内の金額（仕入ベース）")
+    m5, m6, m9 = st.columns(3)
     m5.metric("入庫 合計金額（税抜）", f"¥{ex_in:,}")
     m6.metric("出庫 合計金額（税抜）", f"¥{ex_out:,}")
-    m7.metric("差し引き 税抜（入−出）", f"¥{ex_net:,}")
-    m8.metric("差し引き 税込（入−出）", f"¥{in_net:,}")
     with m9:
         if COL_GROSS_PROFIT in flt.columns:
             gp_tot = _finite_int(
@@ -2937,6 +2939,9 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
             st.metric("粗利合計（税抜）", f"¥{gp_tot:,}")
         else:
             st.metric("粗利合計（税抜）", "—")
+    m7, m8 = st.columns(2)
+    m7.metric("入庫 合計金額（税込）", f"¥{in_in:,}")
+    m8.metric("出庫 合計金額（税込）", f"¥{in_out:,}")
 
     st.markdown("##### 仕入先・取引先別サマリー（税抜金額・数量・粗利）")
     sup_col = "仕入先・取引先"
@@ -3074,7 +3079,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
 
     st.markdown("##### 月次推移（金額・税抜）")
     st.caption(
-        "数量グラフと同じ月次集計で、入庫・出庫の税抜金額を並べた棒グラフです（積み上げではありません）。"
+        "数量グラフと同じ月次集計で、入庫・出庫の税抜金額（いずれも **仕入金額ベース**）を並べた棒グラフです（積み上げではありません）。"
     )
     if not monthly.empty:
         month_order = monthly["_ym"].astype(str).tolist()
@@ -3122,7 +3127,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
 
     st.markdown("##### 金額推移（税抜）")
     st.caption(
-        "その月までの入庫・出庫それぞれの税抜金額の**累計**（いわゆる累積）を、"
+        "その月までの入庫・出庫それぞれの税抜金額（**仕入金額ベース**）の**累計**（いわゆる累積）を、"
         "各月で入庫・出庫の2本の棒として並べたグラフです。"
         "上の From〜To・仕入先・取引先の絞り込みに従います。"
     )
@@ -3172,7 +3177,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         st.caption("累積金額グラフを表示できる月次データがありません。")
 
     st.markdown("##### 仕入先・取引先別 税抜金額（変動幅の大きい順・上位15件）")
-    st.caption("各仕入先・取引先で入庫・出庫の税抜金額を並べた棒グラフです。")
+    st.caption("各仕入先・取引先で入庫・出庫の税抜金額（**仕入金額ベース**）を並べた棒グラフです。")
     chart_src = (
         grp.set_index(sup_col)[["入庫金額税抜", "出庫金額税抜"]]
         .assign(_abs=lambda x: (x["入庫金額税抜"] - x["出庫金額税抜"]).abs())
