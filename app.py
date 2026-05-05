@@ -68,7 +68,7 @@ import re
 import uuid
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import altair as alt
 import numpy as np
@@ -1860,15 +1860,12 @@ def _mask_ledger_stocktake_unverified(df: pd.DataFrame) -> pd.Series:
 
 def _mask_ledger_stocktake_today_jst(df: pd.DataFrame) -> pd.Series:
     """在庫中かつ棚卸日が今日（JST）の行。"""
+    if df.empty or COL_LAST_STOCKTAKE not in df.columns:
+        return pd.Series(False, index=df.index)
     m_in = _mask_ledger_in_stock(df)
-    dt = _ledger_stocktake_dates_parsed(df)
-    today = _today_jst_date()
-    parts = (
-        dt.dt.year.eq(today.year)
-        & dt.dt.month.eq(today.month)
-        & dt.dt.day.eq(today.day)
-    )
-    return m_in & dt.notna() & parts
+    today_s = _today_jst_date().isoformat()
+    tok = df[COL_LAST_STOCKTAKE].map(_stocktake_date_token_for_compare)
+    return m_in & (tok == today_s) & (tok != "")
 
 
 def _count_stocktake_today_jst_in_management_ids(
@@ -1884,11 +1881,29 @@ def _count_stocktake_today_jst_in_management_ids(
 
 
 def _stocktake_date_token_for_compare(val: Any) -> str:
-    """棚卸日セルの値を暦日（ISO）に正規化。空・解釈不能は空文字。"""
+    """棚卸日セルの値を **JST の暦日**（ISO）に正規化。空・解釈不能は空文字。
+
+    サーバーが UTC のときでも、スプレッドシートの日付列と「今日（JST）」の一致判定がずれないようにする。
+    """
+    if val is None:
+        return ""
+    if isinstance(val, (float, np.floating)) and (pd.isna(val) or not math.isfinite(float(val))):
+        return ""
     dt = pd.to_datetime(val, errors="coerce")
     if pd.isna(dt):
         return ""
-    return pd.Timestamp(dt).normalize().date().isoformat()
+    ts = pd.Timestamp(dt)
+    try:
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(TZ_JP, ambiguous="infer", nonexistent="shift_forward")
+        else:
+            ts = ts.tz_convert(TZ_JP)
+    except (TypeError, ValueError):
+        try:
+            ts = pd.Timestamp(dt).tz_localize("UTC", ambiguous="infer").tz_convert(TZ_JP)
+        except Exception:
+            return ""
+    return ts.date().isoformat()
 
 
 def _ledger_stocktake_date_token_for_mid(df: pd.DataFrame, mid: str) -> str:
@@ -1993,7 +2008,16 @@ def _inv_stocktake_work_read_disk() -> tuple[bool, set[str], int | None, set[str
             ks = str(k).strip()
             if not ks:
                 continue
-            snap[ks] = str(v).strip() if v is not None else ""
+            snap[ks] = (
+                _stocktake_date_token_for_compare(v)
+                if str(v).strip()
+                else ""
+            )
+    if not orig:
+        if snap:
+            orig = set(snap.keys())
+        elif s:
+            orig = set(s)
     return (True, s, bi, orig, snap)
 
 
@@ -3102,36 +3126,57 @@ def apply_outbound_loan_in_stock_datetime_by_management_id(
     overwrite_inventory_worksheet_from_dataframe(df_src)
 
 
-def apply_last_stocktake_jst_for_management_id(management_id: str) -> None:
-    """在庫中の1行について「最後に確認した日付（棚卸日）」を本日（JST）にし、日時を更新して保存する。"""
-    sid = (management_id or "").strip()
-    if not sid:
-        raise ValueError("管理IDが空です。")
+def apply_last_stocktake_jst_for_management_ids(
+    management_ids: Iterable[str],
+) -> tuple[int, list[str]]:
+    """複数の在庫中の行について棚卸日を本日（JST）にし、1回の読込・保存で反映する。
+
+    戻り値: (更新に成功した件数, スキップ理由の短文リスト。重複・不在・在庫外などはスキップ)
+    """
+    ids = {str(x).strip() for x in management_ids if str(x).strip()}
+    if not ids:
+        raise ValueError("管理IDが1件以上必要です。")
     df_src = load_inventory_dataframe()
     if df_src is None or df_src.empty:
         raise RuntimeError("台帳を読み込めませんでした。")
     df_src = df_src.reindex(columns=EXPECTED_HEADERS, fill_value="").copy()
     _ledger_df_loosen_numeric_columns_for_assignment(df_src)
-    msk = df_src[COL_MANAGEMENT_ID].astype(str).str.strip() == sid
-    if not msk.any():
-        raise RuntimeError(f"管理ID {sid} の行が台帳に見つかりません。")
-    if int(msk.sum()) != 1:
-        raise RuntimeError(f"管理ID {sid} が複数行に重複しています。")
-    cur_st = _normalize_stock_status(
-        str(df_src.loc[msk, COL_STOCK_STATUS].iloc[0])
-    )
-    if cur_st != STATUS_IN_STOCK:
-        raise RuntimeError(
-            f"管理ID {sid} は在庫中ではないため棚卸確定できません（現在: {cur_st}）。"
-        )
     today_s = _today_jst_date().isoformat()
     now_exec = jst_now_str()
-    if COL_LAST_STOCKTAKE in df_src.columns:
-        df_src.loc[msk, COL_LAST_STOCKTAKE] = today_s
-    df_src.loc[msk, COL_DATETIME] = now_exec
+    updated: set[str] = set()
+    skips: list[str] = []
+    for sid in sorted(ids):
+        msk = df_src[COL_MANAGEMENT_ID].astype(str).str.strip() == sid
+        if not msk.any():
+            skips.append(f"{sid}: 台帳に見つかりません")
+            continue
+        if int(msk.sum()) != 1:
+            skips.append(f"{sid}: 管理IDが重複しています")
+            continue
+        cur_st = _normalize_stock_status(
+            str(df_src.loc[msk, COL_STOCK_STATUS].iloc[0])
+        )
+        if cur_st != STATUS_IN_STOCK:
+            skips.append(f"{sid}: 在庫中ではない（{cur_st}）")
+            continue
+        if COL_LAST_STOCKTAKE in df_src.columns:
+            df_src.loc[msk, COL_LAST_STOCKTAKE] = today_s
+        df_src.loc[msk, COL_DATETIME] = now_exec
+        updated.add(sid)
+    if not updated:
+        raise RuntimeError(
+            "更新できる在庫中の行がありませんでした。"
+            + (f" 詳細: {'; '.join(skips[:6])}" if skips else "")
+        )
     df_src = _recalc_gross_profit_dataframe(df_src)
     overwrite_inventory_worksheet_from_dataframe(df_src)
-    _inv_stocktake_work_remaining_note_done(sid)
+    _inv_stocktake_work_remaining_note_done(updated)
+    return len(updated), skips
+
+
+def apply_last_stocktake_jst_for_management_id(management_id: str) -> None:
+    """在庫中の1行について「最後に確認した日付（棚卸日）」を本日（JST）にし、日時を更新して保存する。"""
+    apply_last_stocktake_jst_for_management_ids([management_id])
 
 
 def _apply_ledger_sort(
@@ -5209,7 +5254,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
     st.markdown("##### 棚卸しスキャン（AI 照合）")
     st.caption(
         "現物を撮影し、在庫中の台帳行から **複数候補** を表示します（同型在庫が複数ある場合に備えページ切替）。"
-        "**この候補を選ぶ** で1件に絞り、**棚卸を確定** で「最後に確認した日付（棚卸日）」だけを **本日（JST）** に更新します（新規行は追加しません）。"
+        "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
     )
     cam = st.camera_input("現物を撮影", key="stocktake_camera_input")
     if cam is not None:
@@ -5224,6 +5269,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
     if st.button("AIで台帳と照合", type="primary", key="stocktake_ai_match_btn"):
         st.session_state.pop("_stocktake_scan_candidates", None)
         st.session_state.pop("_stocktake_selected_mid", None)
+        st.session_state.pop("stocktake_multi_done_mids", None)
         st.session_state.pop("_stocktake_scan_warn", None)
         st.session_state.pop("stocktake_cand_page", None)
         img_b = (
@@ -5288,12 +5334,19 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
     if isinstance(cands, list) and cands:
         st.markdown("### 照合候補（在庫中）")
         st.caption(
-            f"最大 **{len(cands)}** 件（**管理IDの昇順**）。**この候補を選ぶ** で選択し、下の **棚卸を確定** を押してください。"
+            f"最大 **{len(cands)}** 件（**管理IDの昇順**）。"
             f"（{STOCKTAKE_CAND_PAGE_SIZE} 件ずつ表示）"
         )
-        sel_cur = str(st.session_state.get("_stocktake_selected_mid") or "").strip()
-        if sel_cur:
-            st.info(f"選択中の管理ID: **{sel_cur}**")
+        _st_mode = st.radio(
+            "棚卸の確定の仕方",
+            (
+                "1件ずつ選んで確定（従来）",
+                "複数を選んで一括確定（同じ商品の複数行向け）",
+            ),
+            horizontal=True,
+            key="stocktake_scan_confirm_mode",
+        )
+        _st_batch = _st_mode.startswith("複数")
 
         if "stocktake_cand_page" not in st.session_state:
             st.session_state.stocktake_cand_page = 0
@@ -5309,6 +5362,58 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         start_i = page_idx * STOCKTAKE_CAND_PAGE_SIZE
         end_i = min(n_total, start_i + STOCKTAKE_CAND_PAGE_SIZE)
         page_slice = cands[start_i:end_i]
+        _mid_opts = [str(h.get("management_id") or "").strip() for h in cands]
+        _mid_opts = [m for m in _mid_opts if m]
+        _mid_label: dict[str, str] = {}
+        for h in cands:
+            _m = str(h.get("management_id") or "").strip()
+            if not _m:
+                continue
+            _pn = str(h.get("product_name") or "—").strip()
+            if len(_pn) > 36:
+                _pn = _pn[:33] + "…"
+            _mid_label[_m] = f"{_m} ／ {_pn}"
+
+        if _st_batch:
+            st.caption(
+                "下の一覧で **任意の管理IDを複数選択** するか、**すべて選択**／**このページだけ選択**／**クリア** を使ってから一括確定してください。"
+            )
+            ba1, ba2, ba3, ba4 = st.columns(4)
+            with ba1:
+                if st.button("すべての候補を選択", key="stocktake_sel_all_cands"):
+                    st.session_state["stocktake_multi_done_mids"] = list(_mid_opts)
+                    st.rerun()
+            with ba2:
+                _page_mids = [
+                    str(h.get("management_id") or "").strip()
+                    for h in page_slice
+                    if str(h.get("management_id") or "").strip()
+                ]
+                if st.button(
+                    "このページの候補をすべて選択",
+                    key="stocktake_sel_page_cands",
+                    disabled=not _page_mids,
+                ):
+                    _cur = set(st.session_state.get("stocktake_multi_done_mids") or [])
+                    _cur.update(_page_mids)
+                    st.session_state["stocktake_multi_done_mids"] = sorted(_cur)
+                    st.rerun()
+            with ba3:
+                if st.button("選択をクリア", key="stocktake_clr_multi_sel"):
+                    st.session_state["stocktake_multi_done_mids"] = []
+                    st.rerun()
+            with ba4:
+                st.caption(f"候補 **{n_total}** 件中、選択中 **{len(st.session_state.get('stocktake_multi_done_mids') or [])}** 件")
+            st.multiselect(
+                "一括で棚卸確定する管理ID（任意に追加・解除）",
+                options=_mid_opts,
+                format_func=lambda m: _mid_label.get(m, m),
+                key="stocktake_multi_done_mids",
+            )
+        else:
+            sel_cur = str(st.session_state.get("_stocktake_selected_mid") or "").strip()
+            if sel_cur:
+                st.info(f"選択中の管理ID: **{sel_cur}**")
 
         if n_pages > 1:
             p1, p2, p3 = st.columns([1, 3, 1])
@@ -5358,7 +5463,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                     st.caption(
                         f"AI 確信度: {float(hit.get('confidence') or 0):.2f}（参考）"
                     )
-                    if st.button(
+                    if not _st_batch and st.button(
                         "この候補を選ぶ",
                         key=f"stocktake_pick_{gidx}_{mid}",
                         type="secondary",
@@ -5366,7 +5471,37 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                         st.session_state["_stocktake_selected_mid"] = mid
                         st.rerun()
 
-        if st.button(
+        if _st_batch:
+            _picked = list(st.session_state.get("stocktake_multi_done_mids") or [])
+            _picked = [str(x).strip() for x in _picked if str(x).strip()]
+            if st.button(
+                "選択した候補をまとめて棚卸確定（棚卸日を本日・JST）",
+                type="primary",
+                key="stocktake_confirm_multi",
+                disabled=len(_picked) < 1,
+            ):
+                try:
+                    with st.spinner("台帳を更新しています…"):
+                        n_ok, skips = apply_last_stocktake_jst_for_management_ids(_picked)
+                except Exception as e:
+                    st.error(str(e))
+                else:
+                    st.session_state.pop("_stocktake_scan_candidates", None)
+                    st.session_state.pop("_stocktake_selected_mid", None)
+                    st.session_state.pop("stocktake_multi_done_mids", None)
+                    st.session_state.pop("stocktake_cand_page", None)
+                    st.session_state.pop(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES, None)
+                    st.success(
+                        f"**{n_ok}** 件の棚卸日を本日（JST）に更新しました。"
+                    )
+                    if skips:
+                        st.caption(
+                            "スキップ: " + "；".join(skips[:8])
+                            + (" …" if len(skips) > 8 else "")
+                        )
+                    st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+                    st.rerun()
+        elif st.button(
             "棚卸を確定（棚卸日を本日・JST に更新）",
             type="primary",
             key="stocktake_confirm_selected",
@@ -5381,6 +5516,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             else:
                 st.session_state.pop("_stocktake_scan_candidates", None)
                 st.session_state.pop("_stocktake_selected_mid", None)
+                st.session_state.pop("stocktake_multi_done_mids", None)
                 st.session_state.pop("stocktake_cand_page", None)
                 st.session_state.pop(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES, None)
                 st.success(f"管理ID **{mid}** の棚卸日を更新しました。")
