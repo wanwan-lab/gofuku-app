@@ -1798,6 +1798,18 @@ def _mask_ledger_stocktake_today_jst(df: pd.DataFrame) -> pd.Series:
     return m_in & dt.notna() & parts
 
 
+def _count_stocktake_today_jst_in_management_ids(
+    df: pd.DataFrame, mids: set[str]
+) -> int:
+    """指定した管理 ID のうち、在庫中かつ棚卸日が今日（JST）の行数。"""
+    if df.empty or not mids or COL_MANAGEMENT_ID not in df.columns:
+        return 0
+    m = _mask_ledger_stocktake_today_jst(df) & df[COL_MANAGEMENT_ID].astype(str).str.strip().isin(
+        mids
+    )
+    return int(m.sum())
+
+
 def _all_in_stock_management_ids(df: pd.DataFrame) -> set[str]:
     """在庫中の行の管理ID（空でないもの）の集合。"""
     if df.empty or COL_MANAGEMENT_ID not in df.columns:
@@ -1811,34 +1823,38 @@ def _stocktake_work_session_path() -> Path:
     return Path(__file__).resolve().parent / STOCKTAKE_WORK_SESSION_FILENAME
 
 
-def _inv_stocktake_work_read_disk() -> tuple[bool, set[str], int | None]:
-    """ディスク上のセッション（migrate なし）。(有効, 残りID, session_baseline_n または未設定時 None)。"""
+def _inv_stocktake_work_read_disk() -> tuple[bool, set[str], int | None, set[str]]:
+    """ディスク上のセッション（migrate なし）。(有効, 残りID, baseline, 開始時対象の管理ID)。"""
     p = _stocktake_work_session_path()
     if not p.is_file():
-        return (False, set(), None)
+        return (False, set(), None, set())
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
-        return (False, set(), None)
+        return (False, set(), None, set())
     if not isinstance(raw, dict) or not raw.get("active"):
-        return (False, set(), None)
+        return (False, set(), None, set())
     rem = raw.get("remaining") or []
     if not isinstance(rem, list):
         rem = []
     s = {str(x).strip() for x in rem if str(x).strip()}
     base = raw.get("session_baseline_n")
     bi = int(base) if isinstance(base, int) and base >= 1 else None
-    return (True, s, bi)
+    org_raw = raw.get("session_origin_ids") or []
+    if not isinstance(org_raw, list):
+        org_raw = []
+    orig = {str(x).strip() for x in org_raw if str(x).strip()}
+    return (True, s, bi, orig)
 
 
-def _inv_stocktake_work_remaining_read_state() -> tuple[bool, set[str], int]:
-    """表示用のセッション状態。無効時 (False, set(), 0)。有効時 baseline は最低 1（旧ファイル互換）。"""
+def _inv_stocktake_work_remaining_read_state() -> tuple[bool, set[str], int, set[str]]:
+    """表示用のセッション状態。無効時 (False, set(), 0, set())。有効時 baseline は最低 1（旧ファイル互換）。"""
     _inv_stocktake_work_remaining_migrate_legacy_from_session_state()
-    a, s, b = _inv_stocktake_work_read_disk()
+    a, s, b, o = _inv_stocktake_work_read_disk()
     if not a:
-        return False, set(), 0
+        return False, set(), 0, set()
     eff_b = b if b is not None and b >= 1 else max(len(s), 1)
-    return True, s, eff_b
+    return True, s, eff_b, o
 
 
 def _inv_stocktake_work_remaining_save(
@@ -1846,8 +1862,9 @@ def _inv_stocktake_work_remaining_save(
     remaining: set[str],
     *,
     baseline_override: int | None = None,
+    session_origin: set[str] | None = None,
 ) -> None:
-    """有効時は JSON に保存（session_baseline_n を維持または上書き）。無効時はファイル削除。"""
+    """有効時は JSON に保存（baseline・開始時対象 ID を維持または上書き）。無効時はファイル削除。"""
     st.session_state.pop(_SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY, None)
     p = _stocktake_work_session_path()
     if not active:
@@ -1857,14 +1874,21 @@ def _inv_stocktake_work_remaining_save(
         except OSError:
             pass
         return
-    _a, _old_rem, old_base = _inv_stocktake_work_read_disk()
+    _a, _old_rem, old_base, old_orig = _inv_stocktake_work_read_disk()
     eff_base = baseline_override if baseline_override is not None and baseline_override >= 1 else old_base
     if eff_base is None or eff_base < 1:
         eff_base = max(len(remaining), 1)
+    if session_origin is not None:
+        eff_origin = {str(x).strip() for x in session_origin if str(x).strip()}
+    elif old_orig:
+        eff_origin = set(old_orig)
+    else:
+        eff_origin = {str(x).strip() for x in remaining if str(x).strip()}
     data = {
         "active": True,
         "remaining": sorted(remaining),
         "session_baseline_n": int(eff_base),
+        "session_origin_ids": sorted(eff_origin),
     }
     tmp = p.with_name(p.name + ".tmp")
     try:
@@ -1908,7 +1932,7 @@ def _inv_stocktake_work_remaining_migrate_legacy_from_session_state() -> None:
 def _inv_stocktake_work_remaining_get() -> set[str] | None:
     """棚卸し作業セッションの残り管理 ID。未開始・全件確認済みで終了したあとは None。"""
     _inv_stocktake_work_remaining_migrate_legacy_from_session_state()
-    active, rem, _b = _inv_stocktake_work_read_disk()
+    active, rem, _b, _o = _inv_stocktake_work_read_disk()
     if not active:
         return None
     return rem
@@ -1921,7 +1945,9 @@ def _inv_stocktake_work_remaining_start(df: pd.DataFrame) -> None:
         _inv_stocktake_work_remaining_save(False, set())
         return
     n0 = len(ids)
-    _inv_stocktake_work_remaining_save(True, ids, baseline_override=n0)
+    _inv_stocktake_work_remaining_save(
+        True, ids, baseline_override=n0, session_origin=ids
+    )
 
 
 def _inv_stocktake_work_remaining_clear() -> None:
@@ -1935,7 +1961,12 @@ def _inv_stocktake_work_remaining_prune(df: pd.DataFrame) -> None:
         return
     valid = _all_in_stock_management_ids(df)
     newrem = {m for m in cur if m in valid}
-    _inv_stocktake_work_remaining_finish_if_empty(newrem)
+    _, _, _, old_orig = _inv_stocktake_work_read_disk()
+    new_orig = (old_orig & valid) if old_orig else newrem
+    if not newrem:
+        _inv_stocktake_work_remaining_save(False, set())
+    else:
+        _inv_stocktake_work_remaining_save(True, newrem, session_origin=new_orig)
 
 
 def _inv_stocktake_work_remaining_note_done(mids: set[str] | str) -> None:
@@ -3941,9 +3972,14 @@ def render_inventory_list_page() -> None:
         return
 
     _inv_stocktake_work_remaining_prune(df_sheet)
-    st_active, st_rem, st_base = _inv_stocktake_work_remaining_read_state()
+    st_active, st_rem, st_base, st_origin = _inv_stocktake_work_remaining_read_state()
     n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
-    n_today_done = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
+    n_today_global = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
+    n_session_today_done = (
+        _count_stocktake_today_jst_in_management_ids(df_sheet, st_origin)
+        if st_active and st_origin
+        else 0
+    )
     if st_active and COL_MANAGEMENT_ID in df_sheet.columns:
         _m_sess_ct = (
             df_sheet[COL_MANAGEMENT_ID]
@@ -3958,7 +3994,10 @@ def render_inventory_list_page() -> None:
     sk1, sk2, sk3, sk4 = st.columns(4)
     sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
     sk2.metric("今回の作業でまだ未確認（在庫中）", f"{n_session_in_stock_pending:,}")
-    sk3.metric("今日確認済（在庫中・JST）", f"{n_today_done:,}")
+    sk3.metric(
+        "今回リストで今日確認済（在庫中・JST）",
+        f"{n_session_today_done:,}",
+    )
     with sk4:
         if st_active and st_base > 0:
             n_rem_ids = len(st_rem)
@@ -3993,7 +4032,7 @@ def render_inventory_list_page() -> None:
         if st.button(
             "今回の対象リストを終了",
             key="inv_stocktake_work_end",
-            disabled=rem is None,
+            disabled=not st_active,
         ):
             _inv_stocktake_work_remaining_clear()
             st.session_state.inv_gallery_page = 0
@@ -4032,14 +4071,14 @@ def render_inventory_list_page() -> None:
             st.caption(
                 "上で **今回の棚卸を開始** を押したあとのみ有効です。台帳に棚卸日が入っていても、まだ今回のリストに残っている **在庫中** の行です。"
             )
-            if rem is None:
+            if not st_active:
                 st.info("作業セッションが未開始です。「今回の棚卸を開始」を押してください。")
-            elif not rem:
+            elif not st_rem:
                 st.success(
                     "今回の作業で追っていた在庫中の行は、すべてリストから外れました（または開始時点で在庫中がゼロでした）。"
                 )
             else:
-                m_sess = df_sheet[COL_MANAGEMENT_ID].astype(str).str.strip().isin(rem)
+                m_sess = df_sheet[COL_MANAGEMENT_ID].astype(str).str.strip().isin(st_rem)
                 sess_df = df_sheet.loc[m_sess & _mask_ledger_in_stock(df_sheet)].copy()
                 if COL_MANAGEMENT_ID in sess_df.columns and not sess_df.empty:
                     sess_df = sess_df.copy()
@@ -4050,14 +4089,28 @@ def render_inventory_list_page() -> None:
                 st.metric("この一覧の件数（今回の残り・在庫中）", f"{len(sess_df):,}")
                 st.dataframe(sess_df[_ucols], use_container_width=True, hide_index=True)
 
-    if n_today_done > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
+    if st_active and st_origin and COL_MANAGEMENT_ID in df_sheet.columns:
+        if n_session_today_done > 0:
+            m_td_sess = _mask_ledger_stocktake_today_jst(df_sheet) & df_sheet[
+                COL_MANAGEMENT_ID
+            ].astype(str).str.strip().isin(st_origin)
+            _td_rows = df_sheet.loc[m_td_sess]
+            _ids_show = (
+                _td_rows[COL_MANAGEMENT_ID].astype(str).str.strip().head(18).tolist()
+            )
+            tail = " …" if len(_td_rows) > len(_ids_show) else ""
+            st.caption(
+                f"今回の作業対象リストのうち、今日（JST {_today_jst_date().isoformat()}）の棚卸日が入っている在庫中: **{n_session_today_done}** 件。"
+                f"管理IDの例: {', '.join(_ids_show)}{tail}"
+            )
+    elif n_today_global > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
         _td_rows = df_sheet.loc[_mask_ledger_stocktake_today_jst(df_sheet)]
         _ids_show = (
             _td_rows[COL_MANAGEMENT_ID].astype(str).str.strip().head(18).tolist()
         )
         tail = " …" if len(_td_rows) > len(_ids_show) else ""
         st.caption(
-            f"今日（JST {_today_jst_date().isoformat()}）の棚卸日が入っている在庫中: **{n_today_done}** 件。"
+            f"今日（JST {_today_jst_date().isoformat()}）の棚卸日が入っている在庫中（台帳全体）: **{n_today_global}** 件。"
             f"管理IDの例: {', '.join(_ids_show)}{tail}"
         )
 
