@@ -1167,7 +1167,7 @@ JSON だけを返してください（説明文・コードフェンス禁止）
 - "normalized_supplier" (string): 照合用に正規化した仕入先
 - "normalized_feature_profile" (object): feature_profile と同じキーで、照合用の正規化値
 - "normalization_suggestions" (array): 任意。辞書追加候補を返す。
-  各要素は {"source": "...", "normalized": "...", "type": "color|shape|material|feature|supplier|other", "confidence": 0.0-1.0}
+  各要素は {{"source": "...", "normalized": "...", "type": "color|shape|material|feature|supplier|other", "confidence": 0.0-1.0}}
 """
     schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
@@ -8156,10 +8156,6 @@ def main():
                             _link_urls = list(dict.fromkeys(u for u in urls if u))
                             for _uurl in _link_urls[:8]:
                                 st.markdown(f"[保存した画像を開く]({_uurl})")
-                            if _feat_list:
-                                st.caption("記録した個体特徴（デジタル指紋）:")
-                                for _f in _feat_list:
-                                    st.write(f"- {_f}")
                             _qr_codes_for_ui = [b for b in _qr_codes_for_ui if b]
                             if _qr_codes_for_ui:
                                 st.caption("生成したQRコード（管理ID）")
