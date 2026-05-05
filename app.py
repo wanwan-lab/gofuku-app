@@ -22,6 +22,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED … GAS 未設定時に台帳の画像URL列へ入れるプレースホルダ URL
   APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
   INVENTORY_SOURCE           … ``csv`` | ``sheet`` 。未指定時は **GOOGLE_SPREADSHEET_ID があるとき sheet**、無いとき **csv**（リポジトリ直下 ``inventory.csv`` または環境変数 ``GOFUKU_INVENTORY_CSV``）。
+  GEMINI_LEDGER_REF_IMAGE_MAX … 1回の Gemini 呼び出しに添付する台帳参照画像の最大枚数（バッチサイズ。未設定時は下記定数。10〜250 にクランプ）。参照枚数がこれを超えるときは **複数回 API を呼び** 結果を統合する
 
 ※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（既定は flash 系プレビュー）。
 ※ **登録（インプット）** ページの証憑取込で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
@@ -222,6 +223,7 @@ SECRET_GOOGLE_SERVICE_ACCOUNT_SECTION = "google_service_account"
 SECRET_APP_PASSWORD = "APP_PASSWORD"
 SECRET_INVENTORY_SOURCE = "INVENTORY_SOURCE"
 SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED = "FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED"
+SECRET_GEMINI_LEDGER_REF_IMAGE_MAX = "GEMINI_LEDGER_REF_IMAGE_MAX"
 
 # --- secrets に無いときの既定（非機密のデフォルトのみ） ---
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
@@ -249,8 +251,10 @@ STOCKTAKE_CAND_PAGE_SIZE = 5
 STOCKTAKE_CAND_AI_MAX = 40
 # 棚卸しスキャン: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
 STOCKTAKE_CAND_MIN_CONFIDENCE = 0.14
-# 台帳の画像 URL から Gemini に渡す参照画像の上限（1リクエストのトークン・取得コスト対策）
-GEMINI_LEDGER_REF_IMAGE_MAX = 40
+# 1回の Gemini 呼び出しに添付する台帳参照画像の最大枚数（バッチサイズ。secrets の GEMINI_LEDGER_REF_IMAGE_MAX で上書き可）
+GEMINI_LEDGER_REF_IMAGE_MAX = 100
+# 1回の照合で **取得を試みる** 台帳参照画像の安全上限（メモリ・所要時間対策。超える行は打ち切り）
+GEMINI_LEDGER_REF_MAX_COLLECT = 5000
 GEMINI_LEDGER_REF_IMAGE_MAX_EDGE = 768
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
@@ -518,6 +522,18 @@ def _secret_int(
         return default
 
 
+def _gemini_ledger_ref_image_max() -> int:
+    """1回の **Gemini API 呼び出し** に添付する台帳参照画像の上限＝バッチサイズ（secrets または定数）。
+    参照枚数がこれを超えるときは複数バッチ送信し、結果をマージする。
+    """
+    return _secret_int(
+        SECRET_GEMINI_LEDGER_REF_IMAGE_MAX,
+        GEMINI_LEDGER_REF_IMAGE_MAX,
+        min_value=10,
+        max_value=250,
+    )
+
+
 def _gas_upload_timeout_seconds() -> int:
     return _secret_int(
         SECRET_GAS_UPLOAD_TIMEOUT_SECONDS,
@@ -594,6 +610,161 @@ def _parse_json_from_model(text: str) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise ValueError("JSON がオブジェクト形式ではありません。")
     return obj
+
+
+def _safe_parse_json_object_from_model_text(text: str) -> dict[str, Any]:
+    if not (text or "").strip():
+        return {}
+    try:
+        return _parse_json_from_model(text)
+    except Exception:
+        return {}
+
+
+def _merge_gemini_stocktake_batches(batch_dicts: list[dict[str, Any]]) -> dict[str, Any]:
+    """複数バッチの棚卸し照合 JSON を統合（管理 ID 単位で最高 confidence を採用）。"""
+    by_mid: dict[str, dict[str, Any]] = {}
+    for d in batch_dicts:
+        sc = d.get("stocktake_candidates")
+        if isinstance(sc, list):
+            for item in sc:
+                if isinstance(item, dict):
+                    mid = str(item.get("management_id") or "").strip()
+                    if not mid:
+                        continue
+                    cf = float(item.get("confidence") or 0)
+                    prev = by_mid.get(mid)
+                    prev_cf = float(prev.get("confidence") or 0) if prev else -1.0
+                    if prev is None or cf > prev_cf:
+                        by_mid[mid] = dict(item)
+        m0 = d.get("match")
+        if isinstance(m0, dict):
+            mid = str(m0.get("management_id") or "").strip()
+            if mid:
+                cf = float(m0.get("confidence") or 0)
+                prev = by_mid.get(mid)
+                prev_cf = float(prev.get("confidence") or 0) if prev else -1.0
+                if prev is None or cf > prev_cf:
+                    by_mid[mid] = dict(m0)
+    merged = sorted(
+        by_mid.values(), key=lambda x: -float(x.get("confidence") or 0)
+    )
+    out: dict[str, Any] = {"stocktake_candidates": merged}
+    if merged:
+        top = merged[0]
+        out["match"] = {
+            "management_id": str(top.get("management_id") or ""),
+            "confidence": float(top.get("confidence") or 0),
+            "product_name": str(top.get("product_name") or ""),
+            "supplier": str(top.get("supplier") or ""),
+        }
+    return out
+
+
+def _merge_gemini_sale_link_batches(batch_dicts: list[dict[str, Any]]) -> dict[str, Any]:
+    best: dict[str, Any] | None = None
+    best_cf = -1.0
+    empty_fallback: dict[str, Any] | None = None
+    for d in batch_dicts:
+        m = d.get("match")
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("management_id") or "").strip()
+        cf = float(m.get("confidence") or 0)
+        if mid:
+            if cf > best_cf:
+                best_cf = cf
+                best = dict(m)
+        elif empty_fallback is None:
+            empty_fallback = dict(m)
+    pick = best or empty_fallback or {
+        "management_id": "",
+        "confidence": 0.0,
+        "product_name": "",
+        "supplier": "",
+        "line_price_excl": None,
+    }
+    return {"match": pick}
+
+
+def _merge_gemini_full_batches(batch_dicts: list[dict[str, Any]]) -> dict[str, Any]:
+    """仕入写真解析モードで、複数バッチの JSON を 1 つに統合（商品項目は優先順で埋め、match は confidence 最大）。"""
+    if not batch_dicts:
+        return {}
+    out = dict(batch_dicts[0])
+    scalar_keys = (
+        "product_name",
+        "supplier",
+        "inventory_category",
+        "product_kind",
+        "color",
+        "pattern",
+        "material",
+        "condition",
+    )
+    for k in scalar_keys:
+        cur = out.get(k)
+        if cur is None or (isinstance(cur, str) and not str(cur).strip()):
+            for d in batch_dicts[1:]:
+                if k not in d:
+                    continue
+                v = d.get(k)
+                if v is not None and (
+                    not isinstance(v, str) or str(v).strip()
+                ):
+                    out[k] = v
+                    break
+    qty_ok = False
+    for d in batch_dicts:
+        q = d.get("quantity")
+        if q is None:
+            continue
+        try:
+            qi = int(float(str(q)))
+            if qi >= 1:
+                out["quantity"] = qi
+                qty_ok = True
+                break
+        except Exception:
+            continue
+    if not qty_ok and "quantity" not in out:
+        out["quantity"] = 1
+
+    def _unit_price_usable(v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str):
+            s = v.strip().lower()
+            return bool(s) and s not in ("null", "none", "-", "不明")
+        try:
+            return math.isfinite(float(v))
+        except (TypeError, ValueError):
+            return False
+
+    upx: Any = batch_dicts[0].get("unit_price_excl")
+    if not _unit_price_usable(upx):
+        for d in batch_dicts[1:]:
+            u = d.get("unit_price_excl")
+            if _unit_price_usable(u):
+                upx = u
+                break
+    out["unit_price_excl"] = upx if _unit_price_usable(upx) else None
+    best_m: dict[str, Any] | None = None
+    best_cf = -1.0
+    for d in batch_dicts:
+        m = d.get("match")
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("management_id") or "").strip()
+        cf = float(m.get("confidence") or 0)
+        if mid and cf > best_cf:
+            best_cf = cf
+            best_m = dict(m)
+    if best_m:
+        out["match"] = best_m
+    else:
+        out.pop("match", None)
+    return out
 
 
 def _coerce_positive_int(val: Any, default: int = 1) -> int:
@@ -1014,6 +1185,12 @@ def analyze_image_with_gemini(
     model = genai.GenerativeModel(_gemini_model_name())
     subject = _pil_image_for_gemini(image_data)
     refs = ledger_reference_images or []
+    batch_sz = max(1, _gemini_ledger_ref_image_max())
+
+    def _ref_batches(seq: list[tuple[str, bytes]]) -> list[list[tuple[str, bytes]]]:
+        if not seq:
+            return [[]]
+        return [seq[i : i + batch_sz] for i in range(0, len(seq), batch_sz)]
 
     def _ref_parts(seq: list[tuple[str, bytes]]) -> list[Any]:
         ps: list[Any] = []
@@ -1024,6 +1201,18 @@ def analyze_image_with_gemini(
             ps.append(f"参照・管理ID={json.dumps(mid)}\n")
             ps.append(Image.open(io.BytesIO(jpeg_b)).convert("RGB"))
         return ps
+
+    batches = _ref_batches(refs)
+    n_batches = len(batches)
+
+    def _batch_split_notice(batch_index_zero_based: int) -> str:
+        if n_batches <= 1:
+            return ""
+        return (
+            f"※参照画像が多いため **{n_batches}** 回に分けて Gemini に送信しています。"
+            f"これは **第 {batch_index_zero_based + 1} / {n_batches} 回** です。**最初の写真は常に同一の質問画像**であり、続く参照画像だけがこのバッチ分です。"
+            "台帳のテキストリストは共通です。このバッチで考えられる候補を JSON に出力してください（アプリが全バッチを統合します）。\n\n"
+        )
 
     inv_stripped = (inventory_context or "").strip()
     inv_tail_for_match = ""
@@ -1074,8 +1263,19 @@ def analyze_image_with_gemini(
   各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
 
 任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
-        response = model.generate_content([intro, subject, *_ref_parts(refs), tail])
-        return response.text or ""
+        texts: list[str] = []
+        for bi, chunk in enumerate(batches):
+            preamble = _batch_split_notice(bi)
+            response = model.generate_content(
+                [preamble + intro, subject, *_ref_parts(chunk), tail]
+            )
+            texts.append(response.text or "")
+        if n_batches == 1:
+            return texts[0]
+        merged = _merge_gemini_stocktake_batches(
+            [_safe_parse_json_object_from_model_text(t) for t in texts]
+        )
+        return json.dumps(merged, ensure_ascii=False)
 
     if prompt_mode == "sale_link":
         if not inv_stripped:
@@ -1102,8 +1302,19 @@ JSON だけを返してください（説明文・コードフェンス禁止）
   - "line_price_excl" (integer or null): 選んだ行の仕入金額（税抜）を台帳どおり（**写真と金額が一致するかで行を決めない**）。不明なら null
 
 該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
-        response = model.generate_content([intro, subject, *_ref_parts(refs), tail])
-        return response.text or ""
+        texts_s: list[str] = []
+        for bi, chunk in enumerate(batches):
+            preamble = _batch_split_notice(bi)
+            response = model.generate_content(
+                [preamble + intro, subject, *_ref_parts(chunk), tail]
+            )
+            texts_s.append(response.text or "")
+        if n_batches == 1:
+            return texts_s[0]
+        merged_s = _merge_gemini_sale_link_batches(
+            [_safe_parse_json_object_from_model_text(t) for t in texts_s]
+        )
+        return json.dumps(merged_s, ensure_ascii=False)
 
     schema_intro = f"""**直後の最初の画像** は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。この画像について次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
 説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
@@ -1120,20 +1331,34 @@ JSON だけを返してください（説明文・コードフェンス禁止）
 - "condition" (string): 状態の推定。不明なら ""
 - "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
 """
-    schema_refs_note = ""
-    if refs:
-        schema_refs_note = (
-            f"\n続く画像に台帳 **{COL_IMAGE_URL}** 由来の参考写真があるときがあります。"
-            "**直前テキストの参照・管理ID** の行に対応し、質問となる **最初の画像** と並べて照合してください。\n\n"
-        )
-    schema_footer = f"""{schema_refs_note}任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
+    texts_f: list[str] = []
+    for bi, chunk in enumerate(batches):
+        preamble = _batch_split_notice(bi)
+        schema_refs_note = ""
+        if chunk:
+            schema_refs_note = (
+                f"\n続く画像に台帳 **{COL_IMAGE_URL}** 由来の参考写真があるときがあります。"
+                "**直前テキストの参照・管理ID** の行に対応し、質問となる **最初の画像** と並べて照合してください。\n\n"
+            )
+        schema_footer = f"""{schema_refs_note}任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
   例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
   リストの行に **{COL_CATEGORY}** が載っているときは、照合して "match" に management_id を入れる場合 **必ず** 同じ行の値を "inventory_category" に含める。リストにカテゴリーが無いときのみ省略可。
   不要・該当なしのときは "match" キー自体を省略してもよい。"""
-    response = model.generate_content(
-        [schema_intro, subject, *_ref_parts(refs), inv_tail_for_match + schema_footer]
+        resp = model.generate_content(
+            [
+                preamble + schema_intro,
+                subject,
+                *_ref_parts(chunk),
+                inv_tail_for_match + schema_footer,
+            ]
+        )
+        texts_f.append(resp.text or "")
+    if n_batches == 1:
+        return texts_f[0]
+    merged_f = _merge_gemini_full_batches(
+        [_safe_parse_json_object_from_model_text(t) for t in texts_f]
     )
-    return response.text or ""
+    return json.dumps(merged_f, ensure_ascii=False)
 
 
 def _voucher_configure_model():
@@ -2427,12 +2652,17 @@ def _collect_ledger_reference_images(
     max_lines: int = 400,
     only_in_stock: bool = True,
     management_ids_filter: set[str] | None = None,
-    max_images: int = GEMINI_LEDGER_REF_IMAGE_MAX,
+    max_collect: int | None = None,
 ) -> list[tuple[str, bytes]]:
-    """台帳の http(s) 画像 URL を、テキストリストと同じ並び・上限で取得し、(管理ID, JPEG) にする。"""
+    """台帳の並び順で http(s) 画像 URL を走査し、(管理ID, JPEG) を順にすべて収集する。
+
+    Gemini へはバッチ送信する（:func:`_gemini_ledger_ref_image_max` 枚ずつ）。
+    ``max_collect`` が None のときは :data:`GEMINI_LEDGER_REF_MAX_COLLECT` 件まで
+    （超える場合は未取得の参照が省略される）。
+    """
+    collect_cap = GEMINI_LEDGER_REF_MAX_COLLECT if max_collect is None else max(0, int(max_collect))
     out: list[tuple[str, bytes]] = []
-    cap = max(0, int(max_images))
-    if cap == 0:
+    if collect_cap <= 0:
         return out
     for row in _iterate_gemini_inventory_rows(
         df,
@@ -2440,13 +2670,10 @@ def _collect_ledger_reference_images(
         only_in_stock=only_in_stock,
         management_ids_filter=management_ids_filter,
     ):
-        if len(out) >= cap:
+        if len(out) >= collect_cap:
             break
         url = str(row.get(COL_IMAGE_URL, "") or "").strip()
-        if not (
-            url.startswith("http://")
-            or url.startswith("https://")
-        ):
+        if not (url.startswith("http://") or url.startswith("https://")):
             continue
         mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
         if not mid:
@@ -5539,7 +5766,9 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         "照合は **和装に限らず** 洋服・帽子・雑貨・アパレル・一点物も想定しています。"
         "飲料・カップ麺のようにパッケージ文字が読める品より、**無包装の衣料**は難しいため、台帳の **メモ・カテゴリー・商品名・仕入先** を手がかりにします（**金額の一致は照合に使いません**）。"
         "**タグが写る撮影**を推奨します。"
-        f"台帳の **{COL_IMAGE_URL}** に http(s) がある場合は、サービス側で最大 **{GEMINI_LEDGER_REF_IMAGE_MAX}** 枚まで取得し、質問写真と並べて形・色の照合に使います（取得できない URL は省略されます）。"
+        f"台帳の **{COL_IMAGE_URL}** に http(s) がある行は、並び順ですべてダウンロードを試み（合計 **{GEMINI_LEDGER_REF_MAX_COLLECT}** 枚を超える分は省略）、"
+        f"**1回の API につき最大 {_gemini_ledger_ref_image_max()} 枚**ずつ複数回 Gemini に送り、応答を統合して照合します。"
+        "取得できない URL はその行だけスキップします。"
         f"候補は **{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、ページを切り替えて全件を確認できます（AI は最大 "
         f"**{STOCKTAKE_CAND_AI_MAX}** 件まで）。"
         "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
@@ -5937,7 +6166,8 @@ def _render_sales_management_tab(
         "**出庫（販売）** … 在庫行を **販売済** にし、実売と販売日時（確定の JST）を記録します（新規行なし）。"
         "**出庫（浮貸）** … **在庫中** のままなら **浮貸日時** 列へ日時を記録し、**販売済** を選ぶ場合は **出庫（販売）と同様** に在庫行を販売済へ更新します（出庫種別はいずれも記録）。"
         "写真は任意（上の共通アップローダ）。"
-        f"**販売元を写真で照合** では台帳の **{COL_IMAGE_URL}** からも最大 **{GEMINI_LEDGER_REF_IMAGE_MAX}** 枚を取得して比較に使うことがあります。"
+        f"**販売元を写真で照合** でも **{COL_IMAGE_URL}** から参照画像を並び順で最大 **{GEMINI_LEDGER_REF_MAX_COLLECT}** 枚まで取得し、"
+        f"**{_gemini_ledger_ref_image_max()}** 枚ずつ複数回 API を呼んで結果をまとめます。"
     )
     outbound_kind = st.radio(
         "出庫区分",
@@ -6445,7 +6675,8 @@ def main():
         st.caption(
             "**AIで画像を解析** で商品名・色・シルエットなどを推定しつつ在庫中と照合します（洋服・帽子・雑貨など **和装以外も** 想定）。"
             "パッケージに大きな文字がある商品より、**無包装の衣料**は判別が難しいことがあります。**タグ・下札**が写っていると有利です。"
-            f"台帳の **{COL_IMAGE_URL}** に http(s) があるときは、その画像を最大 **{GEMINI_LEDGER_REF_IMAGE_MAX}** 枚まで取得して照合します。"
+            f"台帳の **{COL_IMAGE_URL}** に http(s) があるときは、参照画像を最大 **{GEMINI_LEDGER_REF_MAX_COLLECT}** 枚まで取得し、"
+            f"**{_gemini_ledger_ref_image_max()}** 枚ずつ複数回 API を呼んで照合します。"
             "解析後は下の「近い候補」も併せて確認してください。"
         )
 
