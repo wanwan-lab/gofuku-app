@@ -6293,8 +6293,8 @@ def render_stocktake_scan_tab(
         _st_mode = st.radio(
             "棚卸の確定の仕方",
             (
-                "1件ずつ選んで確定（従来）",
-                "複数を選んで一括確定（同じ商品の複数行向け）",
+                "1件選択",
+                "複数選択（一括反映）",
             ),
             horizontal=True,
             key="stocktake_scan_confirm_mode",
@@ -6357,6 +6357,32 @@ def render_stocktake_scan_tab(
                     st.rerun()
             with ba4:
                 st.caption(f"候補 **{n_total}** 件中、選択中 **{len(st.session_state.get('stocktake_multi_done_mids') or [])}** 件")
+            _page_pick_opts = [
+                str(h.get("management_id") or "").strip()
+                for h in page_slice
+                if str(h.get("management_id") or "").strip()
+            ]
+            st.multiselect(
+                "このページ内の候補を任意選択（追加用）",
+                options=_page_pick_opts,
+                format_func=lambda m: _mid_label.get(m, m),
+                key="stocktake_multi_page_pick",
+            )
+            if st.button(
+                "このページの任意選択を追加",
+                key="stocktake_sel_page_partial_add",
+                disabled=not bool(st.session_state.get("stocktake_multi_page_pick")),
+            ):
+                _cur = set(st.session_state.get("stocktake_multi_done_mids") or [])
+                _cur.update(
+                    [
+                        str(x).strip()
+                        for x in st.session_state.get("stocktake_multi_page_pick", [])
+                        if str(x).strip()
+                    ]
+                )
+                st.session_state["stocktake_multi_done_mids"] = sorted(_cur)
+                st.rerun()
             st.multiselect(
                 "一括で棚卸確定する管理ID（任意に追加・解除）",
                 options=_mid_opts,
@@ -6679,20 +6705,42 @@ def _render_sales_management_tab(
             "内容を確認してから確定してください。"
         )
 
-    _spm_hits = st.session_state.get("_sales_photo_match_card_hits")
-    if isinstance(_spm_hits, list) and _spm_hits:
-        st.markdown("##### 写真照合の近い候補（カード）")
-        st.caption(
-            "AI の商品名・仕入先・管理IDと表記が近い **在庫中** の行です。"
-            "**この候補を販売元にする** でその管理IDへ切り替えられます。"
+    _sale_id_opts: list[str] = []
+    if df_ledger_hint is not None and not df_ledger_hint.empty:
+        _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
+    _sale_pick_mode = st.radio(
+        "販売対象の選択",
+        ("1件選択", "複数選択（一括反映）"),
+        horizontal=True,
+        key="sales_pick_mode",
+    )
+    if _sale_pick_mode.startswith("複数"):
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("在庫中をすべて選択", key="sales_pick_all_ids", disabled=not _sale_id_opts):
+                st.session_state["sales_multi_selected_ids"] = list(_sale_id_opts)
+                st.session_state.field_sale_source_mgmt_id = ", ".join(_sale_id_opts)
+                st.rerun()
+        with s2:
+            if st.button("選択をクリア", key="sales_pick_clear_ids"):
+                st.session_state["sales_multi_selected_ids"] = []
+                st.session_state.field_sale_source_mgmt_id = ""
+                st.rerun()
+        st.multiselect(
+            "一括反映する管理ID",
+            options=_sale_id_opts,
+            key="sales_multi_selected_ids",
         )
-        _render_mid_pick_candidate_cards(
-            _spm_hits,
-            widget_key_namespace="sales_photo_match_cards",
-            sold=False,
-            pick_mode="sale",
-        )
-
+        _picked_ids = [str(x).strip() for x in st.session_state.get("sales_multi_selected_ids", []) if str(x).strip()]
+        st.session_state.field_sale_source_mgmt_id = ", ".join(_picked_ids)
+    else:
+        if _sale_id_opts:
+            st.selectbox(
+                "在庫中の管理ID（すぐ選ぶ）",
+                options=[LEDGER_PICK_PLACEHOLDER] + _sale_id_opts,
+                key="sale_pick_source_id",
+                on_change=_on_sale_pick_source_id,
+            )
     if "sales_assist_visible" not in st.session_state:
         st.session_state.sales_assist_visible = False
     if st.button(
@@ -6703,6 +6751,85 @@ def _render_sales_management_tab(
     ):
         st.session_state.sales_assist_visible = not st.session_state.sales_assist_visible
         st.rerun()
+
+    _spm_hits = st.session_state.get("_sales_photo_match_card_hits")
+    if isinstance(_spm_hits, list) and _spm_hits:
+        st.markdown("##### 写真照合の近い候補（カード）")
+        st.caption(
+            "AI の商品名・仕入先・管理IDと表記が近い **在庫中** の行です。"
+            "**この候補を販売元にする** でその管理IDへ切り替えられます。"
+        )
+        _spm_mids = [str(h.get("management_id") or "").strip() for h in _spm_hits]
+        _spm_mids = [m for m in _spm_mids if m]
+        _spm_page_key = "_sales_photo_match_cards_page"
+        _spm_page_size = 5
+        _spm_total = len(_spm_hits)
+        _spm_pages = max(1, (_spm_total + _spm_page_size - 1) // _spm_page_size)
+        _spm_cur = int(st.session_state.get(_spm_page_key, 0) or 0)
+        _spm_cur = max(0, min(_spm_pages - 1, _spm_cur))
+        _spm_start = _spm_cur * _spm_page_size
+        _spm_end = min(_spm_total, _spm_start + _spm_page_size)
+        _spm_page_mids = [
+            str(h.get("management_id") or "").strip()
+            for h in _spm_hits[_spm_start:_spm_end]
+            if str(h.get("management_id") or "").strip()
+        ]
+        if _sale_pick_mode.startswith("複数"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button(
+                    "候補全部を選択",
+                    key="sales_cand_pick_all",
+                    disabled=not _spm_mids,
+                ):
+                    st.session_state["sales_multi_selected_ids"] = list(_spm_mids)
+                    st.session_state.field_sale_source_mgmt_id = ", ".join(_spm_mids)
+                    st.rerun()
+            with c2:
+                if st.button(
+                    "表示ページの候補をすべて選択",
+                    key="sales_cand_pick_page_all",
+                    disabled=not _spm_page_mids,
+                ):
+                    _cur = set(st.session_state.get("sales_multi_selected_ids") or [])
+                    _cur.update(_spm_page_mids)
+                    _new = sorted(x for x in _cur if str(x).strip())
+                    st.session_state["sales_multi_selected_ids"] = _new
+                    st.session_state.field_sale_source_mgmt_id = ", ".join(_new)
+                    st.rerun()
+            with c3:
+                if st.button("候補選択をクリア", key="sales_cand_pick_clear"):
+                    st.session_state["sales_multi_selected_ids"] = []
+                    st.session_state.field_sale_source_mgmt_id = ""
+                    st.rerun()
+            st.multiselect(
+                "表示ページ内の候補を任意選択（追加用）",
+                options=_spm_page_mids,
+                key="sales_page_partial_pick",
+            )
+            if st.button(
+                "表示ページの任意選択を追加",
+                key="sales_cand_pick_page_partial_add",
+                disabled=not bool(st.session_state.get("sales_page_partial_pick")),
+            ):
+                _cur = set(st.session_state.get("sales_multi_selected_ids") or [])
+                _cur.update(
+                    [
+                        str(x).strip()
+                        for x in st.session_state.get("sales_page_partial_pick", [])
+                        if str(x).strip()
+                    ]
+                )
+                _new = sorted(x for x in _cur if str(x).strip())
+                st.session_state["sales_multi_selected_ids"] = _new
+                st.session_state.field_sale_source_mgmt_id = ", ".join(_new)
+                st.rerun()
+        _render_mid_pick_candidate_cards(
+            _spm_hits,
+            widget_key_namespace="sales_photo_match_cards",
+            sold=False,
+            pick_mode="sale",
+        )
 
     if (
         st.session_state.sales_assist_visible
@@ -6750,43 +6877,6 @@ def _render_sales_management_tab(
                     sold=False,
                     pick_mode="sale",
                 )
-
-    _sale_id_opts: list[str] = []
-    if df_ledger_hint is not None and not df_ledger_hint.empty:
-        _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
-    _sale_pick_mode = st.radio(
-        "販売対象の選択",
-        ("1件選択", "複数選択（一括反映）"),
-        horizontal=True,
-        key="sales_pick_mode",
-    )
-    if _sale_pick_mode.startswith("複数"):
-        s1, s2 = st.columns(2)
-        with s1:
-            if st.button("在庫中をすべて選択", key="sales_pick_all_ids", disabled=not _sale_id_opts):
-                st.session_state["sales_multi_selected_ids"] = list(_sale_id_opts)
-                st.session_state.field_sale_source_mgmt_id = ", ".join(_sale_id_opts)
-                st.rerun()
-        with s2:
-            if st.button("選択をクリア", key="sales_pick_clear_ids"):
-                st.session_state["sales_multi_selected_ids"] = []
-                st.session_state.field_sale_source_mgmt_id = ""
-                st.rerun()
-        st.multiselect(
-            "一括反映する管理ID",
-            options=_sale_id_opts,
-            key="sales_multi_selected_ids",
-        )
-        _picked_ids = [str(x).strip() for x in st.session_state.get("sales_multi_selected_ids", []) if str(x).strip()]
-        st.session_state.field_sale_source_mgmt_id = ", ".join(_picked_ids)
-    else:
-        if _sale_id_opts:
-            st.selectbox(
-                "在庫中の管理ID（すぐ選ぶ）",
-                options=[LEDGER_PICK_PLACEHOLDER] + _sale_id_opts,
-                key="sale_pick_source_id",
-                on_change=_on_sale_pick_source_id,
-            )
 
     st.text_input(
         "販売する管理ID（手入力可）",
