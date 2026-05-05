@@ -244,6 +244,8 @@ TZ_JP = pytz.timezone("Asia/Tokyo")
 LEDGER_DATA_EDITOR_KEY = "inventory_ledger_data_editor"
 INV_GALLERY_PAGE_SIZE = 30
 STOCKTAKE_CAND_PAGE_SIZE = 5
+# 棚卸しスキャン: AI が返す候補の最大件数（UI は STOCKTAKE_CAND_PAGE_SIZE 件ずつページング）
+STOCKTAKE_CAND_AI_MAX = 40
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
@@ -991,8 +993,8 @@ def analyze_image_with_gemini(
                 "棚卸しの照合には台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
             )
         prompt = f"""この写真は **店舗で棚卸しのために撮影した現物1点** です（呉服・和装の在庫）。
-次のリストは台帳の **在庫中** の行だけです（販売済は含みません）。
-同じ柄・同型で **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大5件）。
+次のリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定した抜粋です（販売済は含みません。リスト外の管理IDは返さないこと）。
+同じ柄・同型で **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
 **リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
 
 {inventory_context.strip()}
@@ -2235,12 +2237,17 @@ def _ledger_in_stock_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_gemini_inventory_context(
-    df: pd.DataFrame, *, max_lines: int = 400, only_in_stock: bool = True
+    df: pd.DataFrame,
+    *,
+    max_lines: int = 400,
+    only_in_stock: bool = True,
+    management_ids_filter: set[str] | None = None,
 ) -> str:
     """台帳行を短い箇条書きにし、画像照合用プロンプトへ埋め込む。
 
     ``only_in_stock=True`` … 販売照合・棚卸し用（在庫中のみ）。
     ``only_in_stock=False`` … 登録画面の AI 解析用（在庫中・販売済など全行を最大 max_lines 件）。
+    ``management_ids_filter`` … 指定時はその管理 ID に含まれる行だけ（棚卸し「今回の残リスト」向け）。
     **管理IDが空の行はスキップ** し、行数上限を無駄に使わない。
     """
     if df.empty:
@@ -2248,9 +2255,22 @@ def _build_gemini_inventory_context(
     sub = _ledger_in_stock_rows(df) if only_in_stock else df
     if sub.empty:
         return ""
+    eff_max_lines = int(max_lines)
+    if management_ids_filter is not None:
+        filt = {str(x).strip() for x in management_ids_filter if str(x).strip()}
+        if not filt:
+            return ""
+        if COL_MANAGEMENT_ID not in sub.columns:
+            return ""
+        sub = sub.loc[
+            sub[COL_MANAGEMENT_ID].astype(str).str.strip().isin(filt)
+        ].copy()
+        if sub.empty:
+            return ""
+        eff_max_lines = max(eff_max_lines, 800)
     lines: list[str] = []
     for _, row in sub.iterrows():
-        if len(lines) >= max_lines:
+        if len(lines) >= eff_max_lines:
             break
         mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
         if not mid:
@@ -4198,6 +4218,43 @@ def _render_inventory_category_pie(
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _analytics_table_multisort(
+    df: pd.DataFrame, specs: list[tuple[str, bool]]
+) -> pd.DataFrame:
+    """分析の対象行一覧用。複数列を mergesort で安定ソート（日時・金額列は型変換して比較）。"""
+    out = df.copy()
+    keys: list[str] = []
+    ascending: list[bool] = []
+    drops: list[str] = []
+    for i, (col, asc) in enumerate(specs):
+        if not col or col not in out.columns:
+            continue
+        if col == COL_DATETIME:
+            k = f"___an_sort_dt_{i}"
+            out[k] = pd.to_datetime(out[col], errors="coerce")
+            drops.append(k)
+            keys.append(k)
+            ascending.append(asc)
+        elif col in (COL_PRICE_EXCL, COL_GROSS_PROFIT, COL_QTY):
+            k = f"___an_sort_num_{i}"
+            out[k] = pd.to_numeric(out[col], errors="coerce")
+            drops.append(k)
+            keys.append(k)
+            ascending.append(asc)
+        else:
+            keys.append(col)
+            ascending.append(asc)
+    if not keys:
+        return out
+    out = out.sort_values(
+        by=keys,
+        ascending=ascending,
+        na_position="last",
+        kind="mergesort",
+    )
+    return out.drop(columns=drops, errors="ignore")
+
+
 def render_analytics_dashboard_page() -> None:
     """集計・分析: メトリクス・Plotly・既存の月次ダッシュボード。"""
     st.subheader("分析")
@@ -4301,60 +4358,88 @@ def render_analytics_dashboard_page() -> None:
     _pie_chart_title = f"原価シェア（在庫カテゴリー）— {_status_lbl}"
     _render_inventory_category_pie(pie_df, chart_title=_pie_chart_title)
 
-    st.markdown("##### 対象行一覧（ソート）")
-    if sub.empty:
-        st.caption("選んだステータスに該当する行がありません。")
-    else:
-        _tbl_opts = [
-            COL_DATETIME,
-            COL_NAME,
-            COL_SUPPLIER,
-            COL_MANAGEMENT_ID,
-            COL_STOCK_STATUS,
-            COL_QTY,
-            COL_PRICE_EXCL,
-            COL_GROSS_PROFIT,
-            COL_CATEGORY,
-        ]
-        _tbl_sort_choices = [c for c in _tbl_opts if c in sub.columns]
-        if not _tbl_sort_choices:
-            _tbl_sort_choices = list(sub.columns)[: min(8, len(sub.columns))]
-        _ts1, _ts2 = st.columns([2, 1])
-        with _ts1:
-            _tbl_sort_col = st.selectbox(
-                "並び替えの基準列",
-                options=_tbl_sort_choices,
-                key="analytics_table_sort_by",
-            )
-        with _ts2:
-            _tbl_asc = st.checkbox("昇順", value=False, key="analytics_table_asc")
-        _cols_show = [c for c in _tbl_opts if c in sub.columns]
-        if _cols_show:
-            _view = sub[_cols_show].copy()
-            if _tbl_sort_col in _view.columns:
-                if _tbl_sort_col == COL_DATETIME:
-                    _view = _view.assign(
-                        __dt_sort=pd.to_datetime(_view[_tbl_sort_col], errors="coerce")
-                    ).sort_values(
-                        "__dt_sort", ascending=_tbl_asc, na_position="last"
-                    ).drop(columns=["__dt_sort"])
-                elif _tbl_sort_col in (COL_PRICE_EXCL, COL_GROSS_PROFIT, COL_QTY):
-                    _view["__num_sort"] = pd.to_numeric(
-                        _view[_tbl_sort_col], errors="coerce"
-                    )
-                    _view = _view.sort_values(
-                        "__num_sort", ascending=_tbl_asc, na_position="last"
-                    ).drop(columns=["__num_sort"])
-                else:
-                    _view = _view.sort_values(
-                        by=_tbl_sort_col,
-                        ascending=_tbl_asc,
-                        na_position="last",
-                        kind="mergesort",
-                    )
-            st.dataframe(_view, use_container_width=True, hide_index=True)
+    with st.expander("分析: 対象行一覧（ソート）", expanded=False):
+        st.caption(
+            "クリックで開閉します。**第1ソート** にステータス、**第2ソート** に仕入先を指定すると、"
+            "ステータス別にまとめたうえで仕入先順に並べ替えられます（第2は「なし」で1段だけにもできます）。"
+        )
+        if sub.empty:
+            st.caption("選んだステータスに該当する行がありません。")
         else:
-            st.caption("表示できる列がありません。")
+            _tbl_opts = [
+                COL_DATETIME,
+                COL_NAME,
+                COL_SUPPLIER,
+                COL_MANAGEMENT_ID,
+                COL_STOCK_STATUS,
+                COL_QTY,
+                COL_PRICE_EXCL,
+                COL_GROSS_PROFIT,
+                COL_CATEGORY,
+            ]
+            _tbl_sort_choices = [c for c in _tbl_opts if c in sub.columns]
+            if not _tbl_sort_choices:
+                _tbl_sort_choices = list(sub.columns)[: min(8, len(sub.columns))]
+            _sec_opts = ["なし"] + _tbl_sort_choices
+            _def_p = (
+                COL_STOCK_STATUS
+                if COL_STOCK_STATUS in _tbl_sort_choices
+                else _tbl_sort_choices[0]
+            )
+            _def_s = (
+                COL_SUPPLIER
+                if COL_SUPPLIER in _tbl_sort_choices
+                else "なし"
+            )
+            _ix_p = (
+                _tbl_sort_choices.index(_def_p)
+                if _def_p in _tbl_sort_choices
+                else 0
+            )
+            _ix_s = _sec_opts.index(_def_s) if _def_s in _sec_opts else 0
+            _a1, _a2, _a3, _a4 = st.columns([2, 1, 2, 1])
+            with _a1:
+                _p_col = st.selectbox(
+                    "第1ソート",
+                    options=_tbl_sort_choices,
+                    index=_ix_p,
+                    key="analytics_tbl_sort_p",
+                )
+            with _a2:
+                _p_ord = st.radio(
+                    "第1の順序",
+                    ["昇順", "降順"],
+                    horizontal=True,
+                    key="analytics_tbl_sort_p_ord",
+                )
+            with _a3:
+                _s_col = st.selectbox(
+                    "第2ソート",
+                    options=_sec_opts,
+                    index=_ix_s,
+                    key="analytics_tbl_sort_s",
+                )
+            with _a4:
+                _s_ord = st.radio(
+                    "第2の順序",
+                    ["昇順", "降順"],
+                    horizontal=True,
+                    key="analytics_tbl_sort_s_ord",
+                    disabled=(_s_col == "なし"),
+                )
+            _cols_show = [c for c in _tbl_opts if c in sub.columns]
+            if _cols_show:
+                _view = sub[_cols_show].copy()
+                _specs: list[tuple[str, bool]] = [
+                    (_p_col, _p_ord == "昇順"),
+                ]
+                if _s_col != "なし" and _s_col in _view.columns:
+                    if _s_col != _p_col:
+                        _specs.append((_s_col, _s_ord == "昇順"))
+                _view = _analytics_table_multisort(_view, _specs)
+                st.dataframe(_view, use_container_width=True, hide_index=True)
+            else:
+                st.caption("表示できる列がありません。")
 
     st.divider()
     render_ledger_dashboard(calc)
@@ -5195,9 +5280,13 @@ def _stocktake_candidates_from_gemini_response(
     df_ledger: pd.DataFrame,
     *,
     min_conf: float = 0.22,
-    max_n: int = STOCKTAKE_CAND_PAGE_SIZE,
+    max_n: int = STOCKTAKE_CAND_AI_MAX,
+    allowed_management_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Gemini の JSON から棚卸し候補を正規化（在庫中・台帳に存在する行のみ、重複除去）。"""
+    """Gemini の JSON から棚卸し候補を正規化（在庫中・台帳に存在する行のみ、重複除去）。
+
+    ``allowed_management_ids`` … 指定時はその集合に含まれる管理 ID のみ採用（今回の対象リスト）。
+    """
     raw_list: list[dict[str, Any]] = []
     if isinstance(res, dict):
         sc = res.get("stocktake_candidates")
@@ -5219,6 +5308,8 @@ def _stocktake_candidates_from_gemini_response(
         except (TypeError, ValueError):
             conf = 0.0
         if conf < min_conf:
+            continue
+        if allowed_management_ids is not None and mid not in allowed_management_ids:
             continue
         tr = lookup_ledger_row_by_management_id(df_ledger, mid)
         if tr is None:
@@ -5252,10 +5343,33 @@ def _stocktake_candidates_from_gemini_response(
 def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
     """棚卸しスキャン: カメラ撮影 → AI 照合 → 棚卸日の確定更新のみ。"""
     st.markdown("##### 棚卸しスキャン（AI 照合）")
+    st_rem_scan = _inv_stocktake_work_remaining_get()
+    _scan_targets_ok = st_rem_scan is not None and len(st_rem_scan) > 0
+    if not _scan_targets_ok:
+        for _k in (
+            "_stocktake_scan_candidates",
+            "_stocktake_selected_mid",
+            "stocktake_multi_done_mids",
+            "stocktake_cand_page",
+        ):
+            st.session_state.pop(_k, None)
     st.caption(
-        "現物を撮影し、在庫中の台帳行から **複数候補** を表示します（同型在庫が複数ある場合に備えページ切替）。"
+        "現物を撮影し、**今回の棚卸対象リストにまだ残っている在庫中の行** だけを AI に渡し、複数候補を返します。"
+        f"候補は **{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、ページを切り替えて全件を確認できます（AI は最大 "
+        f"**{STOCKTAKE_CAND_AI_MAX}** 件まで）。"
         "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
     )
+    if not _scan_targets_ok:
+        if st_rem_scan is None:
+            st.info(
+                "先に在庫一覧で **今回の棚卸を開始（在庫中をすべて今回の対象に）** を押してください。"
+                "スキャンは **今回のリストに残っている行だけ** を照合対象にします。"
+            )
+        else:
+            st.info(
+                "今回の対象リストに **残っている行がありません**（すべて棚卸済みか、台帳更新でリストから外れました）。"
+                "続ける場合は **今回の棚卸を開始** でリストを作り直してください。"
+            )
     cam = st.camera_input("現物を撮影", key="stocktake_camera_input")
     if cam is not None:
         st.session_state[SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES] = cam.getvalue()
@@ -5266,7 +5380,12 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             width=320,
         )
 
-    if st.button("AIで台帳と照合", type="primary", key="stocktake_ai_match_btn"):
+    if st.button(
+        "AIで台帳と照合",
+        type="primary",
+        key="stocktake_ai_match_btn",
+        disabled=not _scan_targets_ok,
+    ):
         st.session_state.pop("_stocktake_scan_candidates", None)
         st.session_state.pop("_stocktake_selected_mid", None)
         st.session_state.pop("stocktake_multi_done_mids", None)
@@ -5277,7 +5396,12 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             if cam is not None
             else st.session_state.get(SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES)
         )
-        if not img_b:
+        st_rem_run = _inv_stocktake_work_remaining_get()
+        if st_rem_run is None or not st_rem_run:
+            st.session_state["_stocktake_scan_warn"] = (
+                "今回の棚卸対象リストがありません。**今回の棚卸を開始** からやり直してください。"
+            )
+        elif not img_b:
             st.session_state["_stocktake_scan_warn"] = (
                 "先にカメラで撮影するか、直前に保存した撮影データがありません。"
             )
@@ -5285,11 +5409,14 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
         else:
             inv_ctx_st = _build_gemini_inventory_context(
-                df_ledger_hint, only_in_stock=True
+                df_ledger_hint,
+                only_in_stock=True,
+                management_ids_filter=st_rem_run,
             )
             if not (inv_ctx_st or "").strip():
                 st.session_state["_stocktake_scan_warn"] = (
-                    "台帳に **在庫中** の行がありません。棚卸しの照合には在庫中の行が必要です。"
+                    "今回の対象リストに **在庫中として残っている行** がありません。"
+                    "在庫一覧で対象を開始し直すか、残リストを確認してください。"
                 )
             else:
                 with st.spinner("画像を解析して台帳と照合しています…"):
@@ -5313,11 +5440,13 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
                         if not isinstance(res, dict):
                             res = {}
                         cand_list = _stocktake_candidates_from_gemini_response(
-                            res, df_ledger_hint
+                            res,
+                            df_ledger_hint,
+                            allowed_management_ids=st_rem_run,
                         )
                         if not cand_list:
                             st.session_state["_stocktake_scan_warn"] = (
-                                "在庫中の行で、写真に合いそうな候補が得られませんでした。"
+                                "今回の対象リストの在庫中の行で、写真に合いそうな候補が得られませんでした。"
                                 "明るさ・距離を変えて再撮影するか、在庫一覧で管理IDを確認してください。"
                             )
                         else:
@@ -5332,10 +5461,10 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
         st.warning(wn)
     cands = st.session_state.get("_stocktake_scan_candidates")
     if isinstance(cands, list) and cands:
-        st.markdown("### 照合候補（在庫中）")
+        st.markdown("### 照合候補（今回の対象リスト・在庫中）")
         st.caption(
-            f"最大 **{len(cands)}** 件（**管理IDの昇順**）。"
-            f"（{STOCKTAKE_CAND_PAGE_SIZE} 件ずつ表示）"
+            f"**{len(cands)}** 件（**管理IDの昇順**）。"
+            f"**{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、下のボタンで全候補をページ送りできます。"
         )
         _st_mode = st.radio(
             "棚卸の確定の仕方",
