@@ -58,6 +58,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 
 from __future__ import annotations
 
+import contextlib
 import base64
 import difflib
 import io
@@ -4941,7 +4942,7 @@ def render_inventory_list_page(*, view_mode: str = "table") -> None:
         st.markdown("## ギャラリー（カタログ）")
         st.caption(
             "共有の **inventory.csv** または **スプレッドシート**から読み込んだ在庫を、接客向けに **カード型** で表示します。"
-            "上の **再読込**・メトリクス・棚卸し作業セッションは **在庫一覧** ページと共通です。"
+            "**再読込**の直下にある **棚卸し: メトリクス・作業セッション・参照** を開くと、在庫一覧と同じメトリクス・棚卸作業・参照用一覧をまとめて表示できます。"
             f"1ページ **{INV_GALLERY_PAGE_SIZE}** 件ずつ切り替えられます。下の **表示の並び順** はこのページのタイル順にも反映されます。"
         )
     else:
@@ -4956,7 +4957,7 @@ def render_inventory_list_page(*, view_mode: str = "table") -> None:
             "棚卸し用の「最後に確認した日付（棚卸日）」は **YYYY-MM-DD** 推奨です（例: 今日なら "
             f"{_today_jst_date().isoformat()}）。"
             "カタログ表示はサイドバーの **ギャラリー（カタログ）** から開けます。"
-            "棚卸の参照一覧・作業セッションは下の展開パネルから使えます。"
+            "棚卸のメトリクス・作業セッション・参照用一覧は下に続きます（参照用一覧のみ展開パネルです）。"
         )
 
     if msg := st.session_state.pop("_ledger_saved_flash", None):
@@ -5003,154 +5004,164 @@ def render_inventory_list_page(*, view_mode: str = "table") -> None:
     st_active, st_rem, st_base, st_origin, _st_snap = (
         _inv_stocktake_work_remaining_read_state(df_sheet)
     )
-    n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
-    n_today_global = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
-    if st_active and COL_MANAGEMENT_ID in df_sheet.columns:
-        _m_sess_ct = (
-            df_sheet[COL_MANAGEMENT_ID]
-            .astype(str)
-            .str.strip()
-            .isin(st_rem)
-            & _mask_ledger_in_stock(df_sheet)
-        )
-        n_session_in_stock_pending = int(_m_sess_ct.sum())
-    else:
-        n_session_in_stock_pending = 0
-    n_session_confirmed_display: int | None = None
-    if st_active:
-        n_session_confirmed_display = max(0, n_in_stock - n_session_in_stock_pending)
-    sk1, sk2, sk3, sk4 = st.columns(4)
-    sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
-    sk2.metric("今回の作業でまだ未確認（在庫中）", f"{n_session_in_stock_pending:,}")
-    sk3.metric(
-        "今回の作業で確認済（在庫中）",
-        f"{n_session_confirmed_display:,}" if n_session_confirmed_display is not None else "—",
-        help=(
-            "「在庫中（件数）」−「今回の作業でまだ未確認（在庫中）」として表示しています。"
-            "作業セッション未開始のときは「—」です。セッション開始後に在庫が増えると、この差は今回リスト外の在庫分だけ大きくなることがあります。"
-        ),
+    _stk_outer = (
+        st.expander("棚卸し: メトリクス・作業セッション・参照", expanded=False)
+        if _vm == "gallery"
+        else contextlib.nullcontext()
     )
-    with sk4:
-        if st_active and st_base > 0:
-            n_rem_ids = len(st_rem)
-            pct_done = 100.0 * (st_base - n_rem_ids) / st_base
-            pct_done = max(0.0, min(100.0, pct_done))
-            st.metric("今回リスト（残り／対象）", f"{n_rem_ids:,} / {st_base:,}")
-            st.metric("今回リストの進捗", f"{pct_done:.1f}%")
-        else:
-            st.caption("今回の作業リストは未開始です。")
-            st.metric("今回リスト（残り／対象）", "—")
-            st.metric("今回リストの進捗", "—")
-
-    st.markdown("##### 棚卸し作業セッション（任意）")
-    st.caption(
-        "同じ月・年に何度も棚卸しするとき、台帳に前回の棚卸日が入っていても **今回の対象リスト** で追えます。"
-        "対象リストは **`"
-        + STOCKTAKE_WORK_SESSION_FILENAME
-        + "`** に保存されるため、ブラウザやアプリを閉じてもリセットされません。"
-        "「今回の棚卸を開始」で在庫中の全管理IDを対象にし、棚卸しスキャンの確定・一括棚卸日・台帳保存で棚卸日を付けた行は自動でリストから外れます。"
-        "残りがゼロになった時点でもセッションは終了します（全数確認済み）。手動で閉じる場合は「今回の対象リストを終了」を押してください（台帳の日付は変わりません）。"
-    )
-    ss1, ss2 = st.columns(2)
-    with ss1:
-        if st.button(
-            "今回の棚卸を開始（在庫中をすべて今回の対象に）",
-            key="inv_stocktake_work_start",
-        ):
-            _inv_stocktake_work_remaining_start(df_sheet)
-            st.session_state.inv_gallery_page = 0
-            st.rerun()
-    with ss2:
-        if st.button(
-            "今回の対象リストを終了",
-            key="inv_stocktake_work_end",
-            disabled=not st_active,
-        ):
-            _inv_stocktake_work_remaining_clear()
-            st.session_state.inv_gallery_page = 0
-            st.rerun()
-
-    with st.expander("棚卸し: 参照用一覧（台帳未入力 / 今回の作業）", expanded=False):
-        list_kind = st.radio(
-            "表示する一覧",
-            ("台帳で棚卸日が未入力の在庫中", "今回の作業でまだ未確認の在庫中"),
-            horizontal=True,
-            key="inv_stocktake_list_kind_radio",
-        )
-        _ucols = [
-            c
-            for c in (
-                COL_MANAGEMENT_ID,
-                COL_NAME,
-                COL_SUPPLIER,
-                COL_DATETIME,
-                COL_LAST_STOCKTAKE,
-            )
-            if c in df_sheet.columns
-        ]
-        if list_kind.startswith("台帳"):
+    with _stk_outer:
+        if _vm == "gallery":
             st.caption(
-                "「最後に確認した日付（棚卸日）」が空、または日付として解釈できない **在庫中** のみです。"
-                "日付の入力・保存は下の表・スキャン・一括ボタンで行ってください。"
+                "クリックで開閉します。**在庫一覧** ページではこのブロックは折りたたまず常に表示されます。"
             )
-            unv = df_sheet.loc[_mask_ledger_stocktake_unverified(df_sheet)].copy()
-            if unv.empty:
-                st.success("在庫中で、かつ棚卸日が未入力の行はありません。")
-            else:
-                st.metric("この一覧の件数", f"{len(unv):,}")
-                st.dataframe(unv[_ucols], use_container_width=True, hide_index=True)
+        n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
+        n_today_global = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
+        if st_active and COL_MANAGEMENT_ID in df_sheet.columns:
+            _m_sess_ct = (
+                df_sheet[COL_MANAGEMENT_ID]
+                .astype(str)
+                .str.strip()
+                .isin(st_rem)
+                & _mask_ledger_in_stock(df_sheet)
+            )
+            n_session_in_stock_pending = int(_m_sess_ct.sum())
         else:
-            st.caption(
-                "上で **今回の棚卸を開始** を押したあとのみ有効です。台帳に棚卸日が入っていても、まだ今回のリストに残っている **在庫中** の行です。"
-            )
-            if not st_active:
-                st.info("作業セッションが未開始です。「今回の棚卸を開始」を押してください。")
-            elif not st_rem:
-                st.success(
-                    "今回の作業で追っていた在庫中の行は、すべてリストから外れました（または開始時点で在庫中がゼロでした）。"
-                )
+            n_session_in_stock_pending = 0
+        n_session_confirmed_display: int | None = None
+        if st_active:
+            n_session_confirmed_display = max(0, n_in_stock - n_session_in_stock_pending)
+        sk1, sk2, sk3, sk4 = st.columns(4)
+        sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
+        sk2.metric("今回の作業でまだ未確認（在庫中）", f"{n_session_in_stock_pending:,}")
+        sk3.metric(
+            "今回の作業で確認済（在庫中）",
+            f"{n_session_confirmed_display:,}" if n_session_confirmed_display is not None else "—",
+            help=(
+                "「在庫中（件数）」−「今回の作業でまだ未確認（在庫中）」として表示しています。"
+                "作業セッション未開始のときは「—」です。セッション開始後に在庫が増えると、この差は今回リスト外の在庫分だけ大きくなることがあります。"
+            ),
+        )
+        with sk4:
+            if st_active and st_base > 0:
+                n_rem_ids = len(st_rem)
+                pct_done = 100.0 * (st_base - n_rem_ids) / st_base
+                pct_done = max(0.0, min(100.0, pct_done))
+                st.metric("今回リスト（残り／対象）", f"{n_rem_ids:,} / {st_base:,}")
+                st.metric("今回リストの進捗", f"{pct_done:.1f}%")
             else:
-                m_sess = df_sheet[COL_MANAGEMENT_ID].astype(str).str.strip().isin(st_rem)
-                sess_df = df_sheet.loc[m_sess & _mask_ledger_in_stock(df_sheet)].copy()
-                if COL_MANAGEMENT_ID in sess_df.columns and not sess_df.empty:
-                    sess_df = sess_df.copy()
-                    sess_df["_sk"] = sess_df[COL_MANAGEMENT_ID].astype(str).str.strip().map(
-                        _management_id_sort_key
-                    )
-                    sess_df = sess_df.sort_values("_sk").drop(columns=["_sk"])
-                st.metric("この一覧の件数（今回の残り・在庫中）", f"{len(sess_df):,}")
-                st.dataframe(sess_df[_ucols], use_container_width=True, hide_index=True)
+                st.caption("今回の作業リストは未開始です。")
+                st.metric("今回リスト（残り／対象）", "—")
+                st.metric("今回リストの進捗", "—")
 
-    if (
-        st_active
-        and st_origin
-        and COL_MANAGEMENT_ID in df_sheet.columns
-        and n_session_confirmed_display is not None
-        and n_session_confirmed_display > 0
-    ):
-        _ids_show = _management_ids_origin_cleared_session_in_stock(
-            df_sheet, st_origin, st_rem, limit=18
-        )
-        _cap = (
-            f"上記「確認済」＝在庫中（件数）−今回の作業でまだ未確認（在庫中）＝**{n_session_confirmed_display}** 件です。"
-        )
-        if _ids_show:
-            tail = " …" if n_session_confirmed_display > len(_ids_show) else ""
-            _cap += (
-                f" 今回の開始対象からリストが外れた在庫中の管理IDの例: "
-                f"{', '.join(_ids_show)}{tail}"
-            )
-        st.caption(_cap)
-    elif n_today_global > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
-        _td_rows = df_sheet.loc[_mask_ledger_stocktake_today_jst(df_sheet)]
-        _ids_show = (
-            _td_rows[COL_MANAGEMENT_ID].astype(str).str.strip().head(18).tolist()
-        )
-        tail = " …" if len(_td_rows) > len(_ids_show) else ""
+        st.markdown("##### 棚卸し作業セッション（任意）")
         st.caption(
-            f"今日（JST {_today_jst_date().isoformat()}）の棚卸日が入っている在庫中（台帳全体）: **{n_today_global}** 件。"
-            f"管理IDの例: {', '.join(_ids_show)}{tail}"
+            "同じ月・年に何度も棚卸しするとき、台帳に前回の棚卸日が入っていても **今回の対象リスト** で追えます。"
+            "対象リストは **`"
+            + STOCKTAKE_WORK_SESSION_FILENAME
+            + "`** に保存されるため、ブラウザやアプリを閉じてもリセットされません。"
+            "「今回の棚卸を開始」で在庫中の全管理IDを対象にし、棚卸しスキャンの確定・一括棚卸日・台帳保存で棚卸日を付けた行は自動でリストから外れます。"
+            "残りがゼロになった時点でもセッションは終了します（全数確認済み）。手動で閉じる場合は「今回の対象リストを終了」を押してください（台帳の日付は変わりません）。"
         )
+        ss1, ss2 = st.columns(2)
+        with ss1:
+            if st.button(
+                "今回の棚卸を開始（在庫中をすべて今回の対象に）",
+                key="inv_stocktake_work_start",
+            ):
+                _inv_stocktake_work_remaining_start(df_sheet)
+                st.session_state.inv_gallery_page = 0
+                st.rerun()
+        with ss2:
+            if st.button(
+                "今回の対象リストを終了",
+                key="inv_stocktake_work_end",
+                disabled=not st_active,
+            ):
+                _inv_stocktake_work_remaining_clear()
+                st.session_state.inv_gallery_page = 0
+                st.rerun()
+
+        with st.expander("棚卸し: 参照用一覧（台帳未入力 / 今回の作業）", expanded=False):
+            list_kind = st.radio(
+                "表示する一覧",
+                ("台帳で棚卸日が未入力の在庫中", "今回の作業でまだ未確認の在庫中"),
+                horizontal=True,
+                key="inv_stocktake_list_kind_radio",
+            )
+            _ucols = [
+                c
+                for c in (
+                    COL_MANAGEMENT_ID,
+                    COL_NAME,
+                    COL_SUPPLIER,
+                    COL_DATETIME,
+                    COL_LAST_STOCKTAKE,
+                )
+                if c in df_sheet.columns
+            ]
+            if list_kind.startswith("台帳"):
+                st.caption(
+                    "「最後に確認した日付（棚卸日）」が空、または日付として解釈できない **在庫中** のみです。"
+                    "日付の入力・保存は下の表・スキャン・一括ボタンで行ってください。"
+                )
+                unv = df_sheet.loc[_mask_ledger_stocktake_unverified(df_sheet)].copy()
+                if unv.empty:
+                    st.success("在庫中で、かつ棚卸日が未入力の行はありません。")
+                else:
+                    st.metric("この一覧の件数", f"{len(unv):,}")
+                    st.dataframe(unv[_ucols], use_container_width=True, hide_index=True)
+            else:
+                st.caption(
+                    "上で **今回の棚卸を開始** を押したあとのみ有効です。台帳に棚卸日が入っていても、まだ今回のリストに残っている **在庫中** の行です。"
+                )
+                if not st_active:
+                    st.info("作業セッションが未開始です。「今回の棚卸を開始」を押してください。")
+                elif not st_rem:
+                    st.success(
+                        "今回の作業で追っていた在庫中の行は、すべてリストから外れました（または開始時点で在庫中がゼロでした）。"
+                    )
+                else:
+                    m_sess = df_sheet[COL_MANAGEMENT_ID].astype(str).str.strip().isin(st_rem)
+                    sess_df = df_sheet.loc[m_sess & _mask_ledger_in_stock(df_sheet)].copy()
+                    if COL_MANAGEMENT_ID in sess_df.columns and not sess_df.empty:
+                        sess_df = sess_df.copy()
+                        sess_df["_sk"] = sess_df[COL_MANAGEMENT_ID].astype(str).str.strip().map(
+                            _management_id_sort_key
+                        )
+                        sess_df = sess_df.sort_values("_sk").drop(columns=["_sk"])
+                    st.metric("この一覧の件数（今回の残り・在庫中）", f"{len(sess_df):,}")
+                    st.dataframe(sess_df[_ucols], use_container_width=True, hide_index=True)
+
+        if (
+            st_active
+            and st_origin
+            and COL_MANAGEMENT_ID in df_sheet.columns
+            and n_session_confirmed_display is not None
+            and n_session_confirmed_display > 0
+        ):
+            _ids_show = _management_ids_origin_cleared_session_in_stock(
+                df_sheet, st_origin, st_rem, limit=18
+            )
+            _cap = (
+                f"上記「確認済」＝在庫中（件数）−今回の作業でまだ未確認（在庫中）＝**{n_session_confirmed_display}** 件です。"
+            )
+            if _ids_show:
+                tail = " …" if n_session_confirmed_display > len(_ids_show) else ""
+                _cap += (
+                    f" 今回の開始対象からリストが外れた在庫中の管理IDの例: "
+                    f"{', '.join(_ids_show)}{tail}"
+                )
+            st.caption(_cap)
+        elif n_today_global > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
+            _td_rows = df_sheet.loc[_mask_ledger_stocktake_today_jst(df_sheet)]
+            _ids_show = (
+                _td_rows[COL_MANAGEMENT_ID].astype(str).str.strip().head(18).tolist()
+            )
+            tail = " …" if len(_td_rows) > len(_ids_show) else ""
+            st.caption(
+                f"今日（JST {_today_jst_date().isoformat()}）の棚卸日が入っている在庫中（台帳全体）: **{n_today_global}** 件。"
+                f"管理IDの例: {', '.join(_ids_show)}{tail}"
+            )
 
     st.markdown("##### 表示の並び順（台帳表に反映・保存時もこの順で書き込みます）")
     s1, s2, s3, s4, s5, s6 = st.columns([2, 1, 2, 1, 2, 1])
