@@ -250,8 +250,10 @@ INV_GALLERY_PAGE_SIZE = 30
 STOCKTAKE_CAND_PAGE_SIZE = 5
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
-# 在庫一覧: 棚卸しを「今回の作業」単位で追う（台帳に棚卸日が入っていてもセッション内では未確認として扱える）
-SESSION_KEY_STOCKTAKE_WORK_REMAINING = "_inv_stocktake_work_remaining_mids"
+# 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
+STOCKTAKE_WORK_SESSION_FILENAME = "stocktake_work_session.json"
+# 移行前の session_state キー（読み込み時にファイルへ移す）
+_SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY = "_inv_stocktake_work_remaining_mids"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 
@@ -1805,39 +1807,109 @@ def _all_in_stock_management_ids(df: pd.DataFrame) -> set[str]:
     return {x for x in ids.tolist() if x}
 
 
-def _inv_stocktake_work_remaining_get() -> set[str] | None:
-    """棚卸し作業セッションの残り管理ID。未開始は None。"""
-    v = st.session_state.get(SESSION_KEY_STOCKTAKE_WORK_REMAINING)
+def _stocktake_work_session_path() -> Path:
+    return Path(__file__).resolve().parent / STOCKTAKE_WORK_SESSION_FILENAME
+
+
+def _inv_stocktake_work_remaining_read_file() -> tuple[bool, set[str]]:
+    """(セッション有効, 残り管理ID)。ファイルなし・無効形式は (False, set())。"""
+    p = _stocktake_work_session_path()
+    if not p.is_file():
+        return (False, set())
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return (False, set())
+    if not isinstance(raw, dict) or not raw.get("active"):
+        return (False, set())
+    rem = raw.get("remaining") or []
+    if not isinstance(rem, list):
+        rem = []
+    s = {str(x).strip() for x in rem if str(x).strip()}
+    return (True, s)
+
+
+def _inv_stocktake_work_remaining_save(active: bool, remaining: set[str]) -> None:
+    """有効時は JSON に保存。無効時はファイル削除。ブラウザ session の旧キーは掃除する。"""
+    st.session_state.pop(_SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY, None)
+    p = _stocktake_work_session_path()
+    if not active:
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+        return
+    data = {"active": True, "remaining": sorted(remaining)}
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(p)
+    except OSError:
+        try:
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _inv_stocktake_work_remaining_finish_if_empty(remaining: set[str]) -> None:
+    """残りが空ならセッション終了（全数確認済み）。それ以外は保存。"""
+    if not remaining:
+        _inv_stocktake_work_remaining_save(False, set())
+    else:
+        _inv_stocktake_work_remaining_save(True, remaining)
+
+
+def _inv_stocktake_work_remaining_migrate_legacy_from_session_state() -> None:
+    """旧実装の session_state だけに残っているリストを初回ファイルへ移す。"""
+    v = st.session_state.get(_SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY)
     if v is None:
-        return None
+        return
     if isinstance(v, set):
-        return set(v)
-    if isinstance(v, (list, tuple)):
-        return {str(x).strip() for x in v if str(x).strip()}
-    return None
+        s = set(v)
+    elif isinstance(v, (list, tuple)):
+        s = {str(x).strip() for x in v if str(x).strip()}
+    else:
+        s = set()
+    st.session_state.pop(_SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY, None)
+    if _stocktake_work_session_path().is_file():
+        return
+    if not s:
+        return
+    _inv_stocktake_work_remaining_finish_if_empty(s)
+
+
+def _inv_stocktake_work_remaining_get() -> set[str] | None:
+    """棚卸し作業セッションの残り管理 ID。未開始・全件確認済みで終了したあとは None。"""
+    _inv_stocktake_work_remaining_migrate_legacy_from_session_state()
+    active, rem = _inv_stocktake_work_remaining_read_file()
+    if not active:
+        return None
+    return rem
 
 
 def _inv_stocktake_work_remaining_start(df: pd.DataFrame) -> None:
     """在庫中の全管理IDを「今回の作業」の対象にする。"""
-    st.session_state[SESSION_KEY_STOCKTAKE_WORK_REMAINING] = _all_in_stock_management_ids(
-        df
-    )
+    ids = _all_in_stock_management_ids(df)
+    if not ids:
+        _inv_stocktake_work_remaining_save(False, set())
+        return
+    _inv_stocktake_work_remaining_save(True, ids)
 
 
 def _inv_stocktake_work_remaining_clear() -> None:
-    st.session_state.pop(SESSION_KEY_STOCKTAKE_WORK_REMAINING, None)
+    _inv_stocktake_work_remaining_save(False, set())
 
 
 def _inv_stocktake_work_remaining_prune(df: pd.DataFrame) -> None:
-    """販売済・削除などで在庫中でなくなった ID を残リストから外す。"""
-    key = SESSION_KEY_STOCKTAKE_WORK_REMAINING
-    if key not in st.session_state:
-        return
+    """販売済・削除などで在庫中でなくなった ID を残リストから外す。空になればセッション終了。"""
     cur = _inv_stocktake_work_remaining_get()
     if cur is None:
         return
     valid = _all_in_stock_management_ids(df)
-    st.session_state[key] = {m for m in cur if m in valid}
+    newrem = {m for m in cur if m in valid}
+    _inv_stocktake_work_remaining_finish_if_empty(newrem)
 
 
 def _inv_stocktake_work_remaining_note_done(mids: set[str] | str) -> None:
@@ -1851,7 +1923,7 @@ def _inv_stocktake_work_remaining_note_done(mids: set[str] | str) -> None:
     cur = _inv_stocktake_work_remaining_get()
     if cur is None:
         return
-    st.session_state[SESSION_KEY_STOCKTAKE_WORK_REMAINING] = cur - s
+    _inv_stocktake_work_remaining_finish_if_empty(cur - s)
 
 
 def _management_ids_last_stocktake_changed(
@@ -3867,8 +3939,11 @@ def render_inventory_list_page() -> None:
     st.markdown("##### 棚卸し作業セッション（任意）")
     st.caption(
         "同じ月・年に何度も棚卸しするとき、台帳に前回の棚卸日が入っていても **今回の対象リスト** で追えます。"
+        "対象リストは **`"
+        + STOCKTAKE_WORK_SESSION_FILENAME
+        + "`** に保存されるため、ブラウザやアプリを閉じてもリセットされません。"
         "「今回の棚卸を開始」で在庫中の全管理IDを対象にし、棚卸しスキャンの確定・一括棚卸日・台帳保存で棚卸日を付けた行は自動でリストから外れます。"
-        "「今回の対象リストを終了」でセッションを閉じます（台帳の日付は変わりません）。"
+        "残りがゼロになった時点でもセッションは終了します（全数確認済み）。手動で閉じる場合は「今回の対象リストを終了」を押してください（台帳の日付は変わりません）。"
     )
     ss1, ss2 = st.columns(2)
     with ss1:
