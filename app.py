@@ -741,13 +741,6 @@ def _apply_gemini_json_to_session(
     st.session_state.ai_parse_ran = True
     feat_list = _extract_distinctive_features_from_result(r)
     st.session_state["_ai_distinctive_features"] = feat_list
-    if feat_list:
-        existing_memo = str(st.session_state.get("field_memo", "") or "").strip()
-        blk = _memo_features_block(feat_list)
-        if blk and blk not in existing_memo:
-            st.session_state.field_memo = (
-                existing_memo + ("\n" if existing_memo else "") + blk
-            )
 
     ic = str(
         r.get("inventory_category")
@@ -805,8 +798,9 @@ def _apply_gemini_sale_link_to_session(
             or r.get("仕入先")
             or ""
         ).strip()
+        ft0 = _extract_distinctive_features_from_result(r)
         fr = _single_row_fuzzy_ledger_match(
-            df_ledger, pn0, su0, only_in_stock=True, limit=14
+            df_ledger, pn0, su0, ft0, only_in_stock=True, limit=14
         )
         if fr is not None:
             mid = str(fr.get(COL_MANAGEMENT_ID, "") or "").strip()
@@ -2382,39 +2376,49 @@ def _fuzzy_ledger_match_rows(
     df: pd.DataFrame,
     product_name: str,
     supplier: str,
+    features: list[str] | None = None,
     *,
     limit: int | None = 8,
 ) -> pd.DataFrame:
-    """台帳候補を返す（優先順: 名前+仕入先部分一致 → 名前部分一致 → 仕入先部分一致）。"""
+    """台帳候補を返す（優先順: 名前+特徴 → 名前+仕入先 → 名前 → 仕入先）。"""
     if df is None or df.empty:
         return pd.DataFrame()
     pn = (product_name or "").strip().casefold()
     su = (supplier or "").strip().casefold()
-    if not pn and not su:
+    ft_list = [str(x or "").strip().casefold() for x in (features or []) if str(x or "").strip()]
+    if not pn and not su and not ft_list:
         return df.iloc[:0]
 
     scored: list[tuple[int, float, Any]] = []
     for i, row in df.iterrows():
         rpn = str(row.get(COL_NAME, "") or "").strip()
         rsu = str(row.get(COL_SUPPLIER, "") or "").strip()
+        rft = str(row.get(COL_FEATURES, "") or "").strip()
         rpn_l = rpn.casefold()
         rsu_l = rsu.casefold()
+        rft_l = rft.casefold()
+        feat_hits = sum(1 for f in ft_list if f and f in rft_l)
+        feat_ok = feat_hits > 0
         both_ok = bool(pn and su and (pn in rpn_l) and (su in rsu_l))
         name_ok = bool(pn and (pn in rpn_l))
         sup_ok = bool(su and (su in rsu_l))
-        if not (both_ok or name_ok or sup_ok):
+        if not (feat_ok or both_ok or name_ok or sup_ok):
             continue
-        if both_ok:
+        if name_ok and feat_ok:
             prio = 0
-        elif name_ok:
+        elif both_ok:
             prio = 1
-        else:
+        elif name_ok:
             prio = 2
+        else:
+            prio = 3
         sim = 0.0
         if pn:
             sim += 0.6 * difflib.SequenceMatcher(None, rpn_l, pn).ratio()
         if su:
             sim += 0.4 * difflib.SequenceMatcher(None, rsu_l, su).ratio()
+        if ft_list:
+            sim += 0.25 * (feat_hits / max(1, len(ft_list)))
         scored.append((prio, -sim, i))
 
     scored.sort(key=lambda x: (x[0], x[1], _management_id_sort_key(str(df.loc[x[2]].get(COL_MANAGEMENT_ID, "") or "").strip())))
@@ -2431,6 +2435,7 @@ def _single_row_fuzzy_ledger_match(
     df: pd.DataFrame | None,
     product_name: str,
     supplier: str,
+    features: list[str] | None = None,
     *,
     only_in_stock: bool,
     limit: int = 12,
@@ -2445,7 +2450,7 @@ def _single_row_fuzzy_ledger_match(
     su = (supplier or "").strip()
     if not pn and not su:
         return None
-    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=limit)
+    cand = _fuzzy_ledger_match_rows(base, pn, su, features, limit=limit)
     if cand.shape[0] != 1:
         return None
     row = cand.iloc[0]
@@ -2457,7 +2462,7 @@ def _apply_purchase_ledger_match_supplement(
     result: dict[str, Any],
     df_ledger: pd.DataFrame | None,
 ) -> dict[str, Any]:
-    """Gemini が match.management_id を返さないとき、台帳を曖昧照合して一意なら match を補う。"""
+    """Gemini が match.management_id を返さないとき、商品名+特徴を優先して一意照合し match を補う。"""
     if not isinstance(result, dict) or df_ledger is None or df_ledger.empty:
         return result
     m0 = result.get("match")
@@ -2478,8 +2483,9 @@ def _apply_purchase_ledger_match_supplement(
         or m.get("supplier")
         or ""
     ).strip()
+    ft = _extract_distinctive_features_from_result(result)
     row = _single_row_fuzzy_ledger_match(
-        df_ledger, pn, su, only_in_stock=False, limit=12
+        df_ledger, pn, su, ft, only_in_stock=False, limit=12
     )
     if row is None:
         return result
@@ -2904,7 +2910,10 @@ def _refresh_ledger_quick_search_candidates(df_ledger: pd.DataFrame | None) -> N
         return
     pn = str(st.session_state.get("field_product_name", "") or "").strip()
     su = str(st.session_state.get("field_supplier", "") or "").strip()
-    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, limit=None)
+    ft = _extract_distinctive_features_from_result(
+        {"distinctive_features": st.session_state.get("_ai_distinctive_features", [])}
+    )
+    cand = _fuzzy_ledger_match_rows(df_ledger, pn, su, ft, limit=None)
     if cand.empty:
         st.session_state.pop("ledger_quick_candidates", None)
     else:
@@ -3183,7 +3192,7 @@ def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None
     if sub.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
         return
-    cand = _fuzzy_ledger_match_rows(sub, pn, su, limit=None)
+    cand = _fuzzy_ledger_match_rows(sub, pn, su, None, limit=None)
     if cand.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
     else:
@@ -3271,7 +3280,7 @@ def _refresh_stocktake_assist_quick_candidates(
         return
     pn = str(st.session_state.get("stocktake_assist_buf_product_name", "") or "").strip()
     su = str(st.session_state.get("stocktake_assist_buf_supplier", "") or "").strip()
-    cand = _fuzzy_ledger_match_rows(base, pn, su, limit=None)
+    cand = _fuzzy_ledger_match_rows(base, pn, su, None, limit=None)
     if cand.empty:
         st.session_state.pop("stocktake_assist_quick_candidates", None)
     else:
@@ -3678,10 +3687,10 @@ def apply_last_stocktake_jst_for_management_ids(
             obs = str(feature_updates_by_management_id.get(sid, "") or "").strip()
             if obs:
                 tag = f"[{today_s} 棚卸し時] {obs}"
-                old_memo = str(df_src.loc[msk, COL_MEMO].iloc[0] or "").strip()
-                if tag not in old_memo:
-                    df_src.loc[msk, COL_MEMO] = (
-                        old_memo + ("\n" if old_memo else "") + tag
+                old_feat = str(df_src.loc[msk, COL_FEATURES].iloc[0] or "").strip()
+                if tag not in old_feat:
+                    df_src.loc[msk, COL_FEATURES] = (
+                        old_feat + ("\n" if old_feat else "") + tag
                     )
         df_src.loc[msk, COL_DATETIME] = now_exec
         updated.add(sid)
@@ -5057,15 +5066,6 @@ def _extract_distinctive_features_from_result(result: dict[str, Any]) -> list[st
     return out
 
 
-def _memo_features_block(features: list[str]) -> str:
-    if not features:
-        return ""
-    lines = ["[個体特徴/仕入時]"]
-    for f in features[:6]:
-        lines.append(f"- {f}")
-    return "\n".join(lines)
-
-
 def _render_inventory_gallery_thumbnail(image_url: str, *, width: int, sold: bool) -> None:
     """ギャラリー用。Drive 直リンクは ``st.image(URL)`` が効かないことが多いため、取得して JPEG 化して表示する。"""
     iu = (image_url or "").strip()
@@ -5285,9 +5285,10 @@ def _sales_photo_match_card_hits_from_result(
         or result.get("仕入先")
         or ""
     ).strip()
+    ft0 = _extract_distinctive_features_from_result(result)
     conf = float(m.get("confidence") or result.get("confidence") or 0)
     mid_primary = str(m.get("management_id") or "").strip()
-    cand = _fuzzy_ledger_match_rows(sub, pn0, su0, limit=None)
+    cand = _fuzzy_ledger_match_rows(sub, pn0, su0, ft0, limit=None)
     if cand.empty:
         return []
     hits: list[dict[str, Any]] = []
@@ -6865,7 +6866,7 @@ def _render_sales_management_tab(
     if isinstance(_spm_hits, list) and _spm_hits:
         st.markdown("##### 写真照合の近い候補（カード）")
         st.caption(
-            "AI の商品名・仕入先・管理IDと表記が近い **在庫中** の行です。"
+            "AI の商品名・個体特徴・管理IDと表記が近い **在庫中** の行です。"
             "**この候補を販売元にする** でその管理IDへ切り替えられます。"
         )
         _render_mid_pick_candidate_cards(
@@ -7475,7 +7476,7 @@ def main():
         ):
             with st.expander("近い候補（写真解析・入力文字から照合・カード）", expanded=False):
                 st.caption(
-                    "Gemini で管理IDが一致しないときは、**名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
+                    "Gemini で管理IDが一致しないときは、**名前＋個体特徴** → **名前＋仕入先** → **名前** → **仕入先** の部分一致で候補を出します。"
                     "カードから選ぶと、仕入入力の必須項目へ反映されます（在庫中・販売済どちらも候補対象）。"
                 )
                 _p_hits = [_sale_card_hit_from_series(row) for _, row in _cand.iterrows()]
@@ -7663,9 +7664,6 @@ def main():
                     }
                 )
                 _feat_text = "\n".join(f"- {x}" for x in _feat_list) if _feat_list else ""
-                _memo_feat_blk = _memo_features_block(_feat_list)
-                if _memo_feat_blk and _memo_feat_blk not in memo_s:
-                    memo_s = memo_s + ("\n" if memo_s else "") + _memo_feat_blk
     
                 _rq2 = max(1, min(2000, int(st.session_state.get("field_row_quantity", 1))))
                 _icat2 = str(
