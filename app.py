@@ -101,11 +101,8 @@ COL_GROSS_PROFIT = "粗利"
 COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
 COL_IMAGE_URL = "画像URL"
 COL_MEMO = "メモ"
-# 廃止済み機能との互換用（台帳定義には含めない）
-COL_FEATURES = "個体特徴（デジタル指紋）"
 COL_CATEGORY = "在庫カテゴリー"
 COL_MANAGEMENT_ID = "管理ID"
-COL_QR_CODE = "QRコード"
 COL_LAST_STOCKTAKE = "最後に確認した日付（棚卸日）"
 COL_LOAN_DATETIME = "浮貸日時"
 # 証憑取込（recorded_at / evidence_url に相当）
@@ -2656,8 +2653,6 @@ def _inventory_row_values_for_append(
     loan_datetime: str = "",
     voucher_recorded_at: str = "",
     voucher_evidence_url: str = "",
-    features: str = "",
-    qr_code: str = "",
 ) -> list[Any]:
     """台帳 EXPECTED_HEADERS 順の1行分セル値を組み立てる（追記用）。"""
     cogs = _finite_int(line_price_excl_yen, 0)
@@ -2707,11 +2702,9 @@ def _inventory_row_values_for_append(
         gross_cell,
         stt,
         memo,
-        (features or "").strip(),
         (inventory_category or "").strip(),
         image_url,
         management_id,
-        (qr_code or "").strip(),
         "",
         (voucher_recorded_at or "").strip(),
         (voucher_evidence_url or "").strip(),
@@ -5009,8 +5002,6 @@ def _sale_card_hit_from_series(
     *,
     confidence: float | None = None,
     extra_caption: str | None = None,
-    matched_features: list[str] | None = None,
-    missing_features: list[str] | None = None,
 ) -> dict[str, Any]:
     """販売候補カード1件分の表示用 dict。"""
     return {
@@ -5021,15 +5012,12 @@ def _sale_card_hit_from_series(
         "line_price_excl": _finite_int(row.get(COL_PRICE_EXCL), 0),
         "planned_sale_excl": _finite_int(row.get(COL_PLANNED_SALE), 0),
         "memo": str(row.get(COL_MEMO, "") or "").strip(),
-        "features": str(row.get(COL_FEATURES, "") or "").strip(),
         "image_url": str(row.get(COL_IMAGE_URL, "") or "").strip(),
         "confidence": confidence,
         "last_stocktake": str(row.get(COL_LAST_STOCKTAKE, "") or "").strip()
         if COL_LAST_STOCKTAKE in row.index
         else "",
         "extra_caption": extra_caption or "",
-        "matched_features": list(matched_features or []),
-        "missing_features": list(missing_features or []),
     }
 
 
@@ -5100,25 +5088,15 @@ def _render_mid_pick_candidate_cards(
                 lst = str(hit.get("last_stocktake") or "").strip()
                 if lst:
                     st.write(f"**前回の棚卸日:** {lst}")
-                feat_text = str(
-                    hit.get("features")
-                    or hit.get("memo")
-                    or ""
-                ).strip()
-                if feat_text:
-                    st.markdown("**登録時の特徴点:**")
-                    for ln in [x.strip(" ・-\t") for x in feat_text.splitlines()]:
+                memo_text = str(hit.get("memo") or "").strip()
+                if memo_text:
+                    st.markdown("**メモ:**")
+                    for ln in [x.strip(" ・-\t") for x in memo_text.splitlines()]:
                         if ln:
                             st.write(f"- {ln}")
                 xc = str(hit.get("extra_caption") or "").strip()
                 if xc:
                     st.caption(xc)
-                mf = [str(x).strip() for x in (hit.get("matched_features") or []) if str(x).strip()]
-                miss = [str(x).strip() for x in (hit.get("missing_features") or []) if str(x).strip()]
-                if mf:
-                    st.caption("一致した特徴: " + " / ".join(mf[:5]))
-                if miss:
-                    st.caption("未確認の特徴: " + " / ".join(miss[:5]))
                 cf = hit.get("confidence")
                 try:
                     cfn = float(cf) if cf is not None else None
@@ -6092,7 +6070,6 @@ def _stocktake_candidates_from_gemini_response(
                 "last_stocktake": str(tr.get(COL_LAST_STOCKTAKE, "") or "").strip(),
                 "image_url": str(tr.get(COL_IMAGE_URL, "") or "").strip(),
                 "memo": str(tr.get(COL_MEMO, "") or "").strip(),
-                "features": str(tr.get(COL_FEATURES, "") or "").strip(),
                 "feature_observation": str(
                     it.get("feature_observation") or ""
                 ).strip(),
