@@ -247,6 +247,8 @@ INV_GALLERY_PAGE_SIZE = 30
 STOCKTAKE_CAND_PAGE_SIZE = 5
 # 棚卸しスキャン: AI が返す候補の最大件数（UI は STOCKTAKE_CAND_PAGE_SIZE 件ずつページング）
 STOCKTAKE_CAND_AI_MAX = 40
+# 棚卸しスキャン: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
+STOCKTAKE_CAND_MIN_CONFIDENCE = 0.18
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 SESSION_KEY_STOCKTAKE_LAST_IMAGE_BYTES = "_stocktake_last_camera_bytes"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
@@ -257,6 +259,15 @@ INVENTORY_CATEGORY_CACHE_FILENAME = "inventory_category_cache.json"
 _SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY = "_inv_stocktake_work_remaining_mids"
 VOUCHER_DATA_EDITOR_KEY = "voucher_inventory_preview_editor"
 LEDGER_PICK_PLACEHOLDER = "（選ばない）"
+
+# 写真→台帳照合（仕入 AI・棚卸し・販売の写真紐付け）向け。和装専門店以外・雑貨・アパレルでも迷いにくくする。
+_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA = """
+照合の考え方（業種は限定しない）:
+- 在庫は **和服に限らず** 洋服・帽子・バッグ・アクセ・雑貨・アパレル全般・一点物があり得る。写真の品がリストのどれに相当するか、**色・シルエット・素材感・ブランド表記・タグ・価格帯**と台帳の商品名・カテゴリー・仕入金額の整合で推測する。
+- 商品名が **略称・英字・カタカナ・型番のみ** で、写真の見え方と文字が違っても同一在庫と判断できるならその management_id を選ぶ。
+- 柄は **和柄だけでなく** 無地・ストライプ・チェック・ロゴ・プリント等も手がかりにする。
+- 確信が低い場合でも **迷う上位の数件** は confidence を下げつつ候補に含めてよい（明らかに無関係な行は入れない）。
+""".strip()
 
 # 証憑取込（Gemini への共通指示・JSON 仕様）
 VOUCHER_EXTRACTION_RULES = """注意点:
@@ -976,6 +987,8 @@ def analyze_image_with_gemini(
     if inventory_context and inventory_context.strip():
         inv_block = f"""
 次のリストは、すでに台帳にある行の抜粋です（**在庫中・販売済などステータス付き**。最大約400件。写真と同一・類似の商品がありそうなら必ず照合してください）。
+{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
+
 {inventory_context.strip()}
 
 照合するときは必ず "match" オブジェクトを付け、少なくとも次を含めてください:
@@ -993,9 +1006,10 @@ def analyze_image_with_gemini(
             raise ValueError(
                 "棚卸しの照合には台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
             )
-        prompt = f"""この写真は **店舗で棚卸しのために撮影した現物1点** です（呉服・和装の在庫）。
+        prompt = f"""この写真は **店舗で棚卸しのために撮影した現物1点** です（衣料・アパレル・帽子・雑貨・一点物など **業種を限定しない**）。
 次のリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定した抜粋です（販売済は含みません。リスト外の管理IDは返さないこと）。
-同じ柄・同型で **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
+{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
+同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
 **リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
 
 {inventory_context.strip()}
@@ -1008,6 +1022,7 @@ def analyze_image_with_gemini(
   - "supplier" (string): その行の仕入先（参考）
   該当が1件も無いときは空配列 []。
   迷う場合は複数入れてよい（confidence が低いものも列挙してよい。ただし無関係な行は入れない）。
+  各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
 
 任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
         response = model.generate_content([prompt, image_data])
@@ -1019,7 +1034,8 @@ def analyze_image_with_gemini(
                 "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です（管理ID・商品名などが入っている行）。"
                 "在庫がすべて販売済のときや、台帳の読み込みに失敗しているときは使えません。"
             )
-        prompt = f"""この画像は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（呉服店の在庫）。
+        prompt = f"""この画像は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（衣料・アパレル・帽子・雑貨など **業種を限定しない** 在庫）。
+{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
 次のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。必ずこのリストの中からだけ management_id を選べ。
 写真と **同一の在庫1行** を選び、JSON だけを返してください（説明文・コードフェンス禁止）。
 
@@ -1037,15 +1053,15 @@ def analyze_image_with_gemini(
         response = model.generate_content([prompt, image_data])
         return response.text or ""
 
-    prompt = f"""この画像は呉服店の在庫・売買用の商品写真です。次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
+    prompt = f"""この画像は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
 説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
 
 必須キー（値の型を守ること）:
 - "product_name" (string): 商品名として適切な短い名称。不明なら ""
 - "supplier" (string): 仕入先・取引先として推測できる名称。不明なら ""
 - "quantity" (integer): 写っている点数・束の本数などの推定。最低 1
-- "inventory_category" (string): **在庫カテゴリー**（分析・構成比用の短いラベル。例: 帯、雑貨、飲料。業種は問わない）。20文字以内。推測できる場合は必ず入れる。本当に不明なら ""
-- "product_kind" (string): 種類の推定（例: 振袖、訪問着、帯、長襦袢）。不明なら ""
+- "inventory_category" (string): **在庫カテゴリー**（分析・構成比用の短いラベル。例: 帯、ジャケット、帽子、雑貨、飲料。業種は問わない）。20文字以内。推測できる場合は必ず入れる。本当に不明なら ""
+- "product_kind" (string): 種類の推定（例: 振袖、訪問着、帯、ニット、シャツ、キャップ、ワンピース）。不明なら ""
 - "color" (string): 色の推定。不明なら ""
 - "pattern" (string): 柄の推定。不明なら ""
 - "material" (string): 素材の推定。不明なら ""
@@ -2262,11 +2278,18 @@ def _build_gemini_inventory_context(
                 cat_seg = (
                     f" {COL_CATEGORY}={json.dumps(cat, ensure_ascii=False)}"
                 )
+        memo_seg = ""
+        if COL_MEMO in row.index:
+            memo = str(row.get(COL_MEMO, "") or "").strip().replace("\n", " ")
+            if memo:
+                if len(memo) > 56:
+                    memo = memo[:53] + "…"
+                memo_seg = f" メモ={json.dumps(memo, ensure_ascii=False)}"
         lines.append(
             f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
             f"商品名={json.dumps(pn, ensure_ascii=False)} "
             f"仕入先={json.dumps(su, ensure_ascii=False)} "
-            f"仕入金額税抜={cogs}{st_seg}{cat_seg}"
+            f"仕入金額税抜={cogs}{st_seg}{cat_seg}{memo_seg}"
         )
     return "\n".join(lines)
 
@@ -5274,7 +5297,7 @@ def _stocktake_candidates_from_gemini_response(
     res: dict[str, Any],
     df_ledger: pd.DataFrame,
     *,
-    min_conf: float = 0.22,
+    min_conf: float = STOCKTAKE_CAND_MIN_CONFIDENCE,
     max_n: int = STOCKTAKE_CAND_AI_MAX,
     allowed_management_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -5350,6 +5373,7 @@ def render_stocktake_scan_tab(df_ledger_hint: pd.DataFrame | None) -> None:
             st.session_state.pop(_k, None)
     st.caption(
         "現物を撮影し、**今回の棚卸対象リストにまだ残っている在庫中の行** だけを AI に渡し、複数候補を返します。"
+        "照合は **和装に限らず** 洋服・帽子・雑貨・アパレル・一点物も想定しています（台帳の **メモ**・カテゴリー・商品名の表記ゆれも手がかりになります）。"
         f"候補は **{STOCKTAKE_CAND_PAGE_SIZE}** 件ずつ表示し、ページを切り替えて全件を確認できます（AI は最大 "
         f"**{STOCKTAKE_CAND_AI_MAX}** 件まで）。"
         "**1件ずつ** または **チェックした複数を一度に**、棚卸日を **本日（JST）** に更新できます（新規行は追加しません）。"
@@ -6236,7 +6260,7 @@ def main():
         st.divider()
         st.markdown("##### クイック検索（写真から検索）")
         st.caption(
-            "**AIで画像を解析** で商品名・柄色などを推定しつつ在庫中と照合します。"
+            "**AIで画像を解析** で商品名・色・シルエットなどを推定しつつ在庫中と照合します（洋服・帽子・雑貨など **和装以外も** 想定）。"
             "解析後は下の「近い候補」も併せて確認してください。"
         )
 
