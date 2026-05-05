@@ -5836,7 +5836,7 @@ def render_inventory_list_page(*, view_mode: str = "table") -> None:
             if _ids_show:
                 tail = " …" if n_session_confirmed_display > len(_ids_show) else ""
                 _cap += (
-                    f" 今回の開始対象からリストが外れた在庫中の管理IDの例: "
+                    f" 今回の開始対象から外れた在庫中の管理IDの例: "
                     f"{', '.join(_ids_show)}{tail}"
                 )
             st.caption(_cap)
@@ -6624,6 +6624,7 @@ def _render_sales_management_tab(
     with c1:
         do_match = st.button(
             "AIで写真と照合",
+            type="primary",
             disabled=uploaded is None,
             key="sales_tab_photo_match_btn",
         )
@@ -6653,6 +6654,16 @@ def _render_sales_management_tab(
             st.session_state.pop("_sale_link_warn", None)
             st.session_state.pop("_sales_photo_match_card_hits", None)
             st.rerun()
+    if "sales_assist_visible" not in st.session_state:
+        st.session_state.sales_assist_visible = False
+    if st.button(
+        "台帳からの入力補助を表示"
+        if not st.session_state.sales_assist_visible
+        else "台帳からの入力補助を非表示",
+        key="sales_assist_toggle_btn",
+    ):
+        st.session_state.sales_assist_visible = not st.session_state.sales_assist_visible
+        st.rerun()
 
     if do_match and uploaded is not None:
         inv_ctx_sale = ""
@@ -6725,17 +6736,6 @@ def _render_sales_management_tab(
                 key="sale_pick_source_id",
                 on_change=_on_sale_pick_source_id,
             )
-    if "sales_assist_visible" not in st.session_state:
-        st.session_state.sales_assist_visible = False
-    if st.button(
-        "台帳からの入力補助を表示"
-        if not st.session_state.sales_assist_visible
-        else "台帳からの入力補助を非表示",
-        key="sales_assist_toggle_btn",
-    ):
-        st.session_state.sales_assist_visible = not st.session_state.sales_assist_visible
-        st.rerun()
-
     _spm_hits = st.session_state.get("_sales_photo_match_card_hits")
     if isinstance(_spm_hits, list) and _spm_hits:
         st.markdown("##### 写真照合の近い候補（カード）")
