@@ -718,14 +718,14 @@ def _apply_gemini_json_to_session(
         or r.get("category_label")
         or ""
     ).strip()
-    if isinstance(m, dict) and match_conf_ok:
-        mic = str(m.get("inventory_category") or m.get("在庫カテゴリー") or "").strip()
-        if mic:
-            ic = mic
-    if not ic and row_hit is not None and COL_CATEGORY in row_hit.index:
+    if row_hit is not None and COL_CATEGORY in row_hit.index:
         rc = str(row_hit.get(COL_CATEGORY, "") or "").strip()
         if rc:
             ic = rc
+    if isinstance(m, dict) and match_conf_ok:
+        mic = str(m.get("inventory_category") or m.get("在庫カテゴリー") or "").strip()
+        if mic and not ic:
+            ic = mic
     if ic:
         st.session_state.field_inventory_category = ic[:80]
 
@@ -949,6 +949,7 @@ def analyze_image_with_gemini(
 - "product_name" (string): 台帳の商品名に合わせた確定案（推測でも可）
 - "supplier" (string): 台帳の仕入先に合わせた確定案（推測でも可）
 - "line_price_excl" (integer or null): 台帳の仕入金額（税抜）と一致する整数。不明なら null
+- "inventory_category" (string): リストの照合先行に **{COL_CATEGORY}** が載っていればその行と同一の文字列。リストに無い・該当行が空なら ""
 - "confidence" (number): 0.0〜1.0 で、写真と台帳行が同一在庫である確信度
 
 同一行が見つからない場合は management_id を "" にし、confidence は 0.4 未満にしてください。
@@ -1017,8 +1018,8 @@ def analyze_image_with_gemini(
 - "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
 {inv_block}
 任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
-  例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "confidence": 0.85}}
-  照合先の行に **在庫カテゴリー** 列があれば "match" に "inventory_category"（その行の値と同じでよい）を含めてもよい。
+  例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
+  リストの行に **{COL_CATEGORY}** が載っているときは、照合して "match" に management_id を入れる場合 **必ず** 同じ行の値を "inventory_category" に含める。リストにカテゴリーが無いときのみ省略可。
   不要・該当なしのときは "match" キー自体を省略してもよい。"""
     response = model.generate_content([prompt, image_data])
     return response.text or ""
@@ -2190,11 +2191,18 @@ def _build_gemini_inventory_context(
         if COL_STOCK_STATUS in row.index:
             st_lbl = _normalize_stock_status(str(row.get(COL_STOCK_STATUS, "") or ""))
         st_seg = f" 状態={json.dumps(st_lbl, ensure_ascii=False)}" if st_lbl else ""
+        cat_seg = ""
+        if COL_CATEGORY in row.index:
+            cat = str(row.get(COL_CATEGORY, "") or "").strip().replace("\n", " ")
+            if cat:
+                cat_seg = (
+                    f" {COL_CATEGORY}={json.dumps(cat, ensure_ascii=False)}"
+                )
         lines.append(
             f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
             f"商品名={json.dumps(pn, ensure_ascii=False)} "
             f"仕入先={json.dumps(su, ensure_ascii=False)} "
-            f"仕入金額税抜={cogs}{st_seg}"
+            f"仕入金額税抜={cogs}{st_seg}{cat_seg}"
         )
     return "\n".join(lines)
 
@@ -5876,7 +5884,10 @@ def main():
             st.caption(f"マッチング用特徴: {st.session_state.ai_features or '—'}")
             mid_hit = st.session_state.get("_gemini_match_management_id")
             if mid_hit:
-                st.info(f"台帳照合: 管理ID **{mid_hit}** の在庫行に合わせて、商品名・仕入先・仕入金額（税抜）を反映しました。")
+                st.info(
+                    f"台帳照合: 管理ID **{mid_hit}** の在庫行に合わせて、商品名・仕入先・仕入金額（税抜）"
+                    f"・{COL_CATEGORY}を反映しました。"
+                )
     
         if df_ledger_hint is not None and not df_ledger_hint.empty:
             st.markdown("##### 台帳から入力補助（任意）")
