@@ -1915,51 +1915,29 @@ def _ledger_stocktake_date_token_for_mid(df: pd.DataFrame, mid: str) -> str:
     return _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
 
 
-def _count_stocktake_confirmed_this_session(
+def _management_ids_origin_cleared_session_in_stock(
     df: pd.DataFrame,
     origin_ids: set[str],
-    start_tokens: dict[str, str],
-) -> int:
-    """今回セッション開始時の棚卸日と比べ、**在庫中のまま** 棚卸日が変わった件数（開始時対象 ID のみ。日付の中身は問わない）。"""
-    if df.empty or not origin_ids or COL_MANAGEMENT_ID not in df.columns:
-        return 0
-    n = 0
-    for mid in origin_ids:
-        row = lookup_ledger_row_by_management_id(df, mid)
-        if row is None:
-            continue
-        if _normalize_stock_status(str(row.get(COL_STOCK_STATUS, ""))) != STATUS_IN_STOCK:
-            continue
-        cur_tok = _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
-        prev_tok = start_tokens.get(mid, "")
-        if cur_tok != prev_tok:
-            n += 1
-    return n
-
-
-def _management_ids_stocktake_confirmed_this_session(
-    df: pd.DataFrame,
-    origin_ids: set[str],
-    start_tokens: dict[str, str],
+    remaining_ids: set[str],
     *,
-    limit: int = 24,
+    limit: int = 18,
 ) -> list[str]:
-    """`_count_stocktake_confirmed_this_session` に該当する管理ID（表示用・先頭 limit 件）。"""
+    """今回リスト開始時の対象に含まれ、残リストから外れた **在庫中** の管理ID（キャプション用・先頭 limit 件）。"""
     if df.empty or not origin_ids or COL_MANAGEMENT_ID not in df.columns:
         return []
+    rem = {str(x).strip() for x in remaining_ids if str(x).strip()}
     out: list[str] = []
-    for mid in sorted(origin_ids):
+    for mid in sorted({str(m).strip() for m in origin_ids if str(m).strip()}):
+        if mid in rem:
+            continue
         row = lookup_ledger_row_by_management_id(df, mid)
         if row is None:
             continue
         if _normalize_stock_status(str(row.get(COL_STOCK_STATUS, ""))) != STATUS_IN_STOCK:
             continue
-        cur_tok = _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
-        prev_tok = start_tokens.get(mid, "")
-        if cur_tok != prev_tok:
-            out.append(str(mid).strip())
-            if len(out) >= limit:
-                break
+        out.append(mid)
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -4825,16 +4803,11 @@ def render_inventory_list_page() -> None:
         return
 
     _inv_stocktake_work_remaining_prune(df_sheet)
-    st_active, st_rem, st_base, st_origin, st_snap = (
+    st_active, st_rem, st_base, st_origin, _st_snap = (
         _inv_stocktake_work_remaining_read_state(df_sheet)
     )
     n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
     n_today_global = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
-    n_session_stocktake_done = (
-        _count_stocktake_confirmed_this_session(df_sheet, st_origin, st_snap)
-        if st_active and st_origin
-        else 0
-    )
     if st_active and COL_MANAGEMENT_ID in df_sheet.columns:
         _m_sess_ct = (
             df_sheet[COL_MANAGEMENT_ID]
@@ -4846,15 +4819,18 @@ def render_inventory_list_page() -> None:
         n_session_in_stock_pending = int(_m_sess_ct.sum())
     else:
         n_session_in_stock_pending = 0
+    n_session_confirmed_display: int | None = None
+    if st_active:
+        n_session_confirmed_display = max(0, n_in_stock - n_session_in_stock_pending)
     sk1, sk2, sk3, sk4 = st.columns(4)
     sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
     sk2.metric("今回の作業でまだ未確認（在庫中）", f"{n_session_in_stock_pending:,}")
     sk3.metric(
         "今回の作業で確認済（在庫中）",
-        f"{n_session_stocktake_done:,}",
+        f"{n_session_confirmed_display:,}" if n_session_confirmed_display is not None else "—",
         help=(
-            "「今回の棚卸を開始」を押した時点の棚卸日と比べ、**現在の台帳で棚卸日が変わっている在庫中** の件数です。"
-            "本日（JST）に限りません。新しいセッションを開始するとスナップショットが作り直されるため、前セッションの更新はここに含まれません。"
+            "「在庫中（件数）」−「今回の作業でまだ未確認（在庫中）」として表示しています。"
+            "作業セッション未開始のときは「—」です。セッション開始後に在庫が増えると、この差は今回リスト外の在庫分だけ大きくなることがあります。"
         ),
     )
     with sk4:
@@ -4948,16 +4924,26 @@ def render_inventory_list_page() -> None:
                 st.metric("この一覧の件数（今回の残り・在庫中）", f"{len(sess_df):,}")
                 st.dataframe(sess_df[_ucols], use_container_width=True, hide_index=True)
 
-    if st_active and st_origin and COL_MANAGEMENT_ID in df_sheet.columns:
-        if n_session_stocktake_done > 0:
-            _ids_show = _management_ids_stocktake_confirmed_this_session(
-                df_sheet, st_origin, st_snap, limit=18
+    if (
+        st_active
+        and st_origin
+        and COL_MANAGEMENT_ID in df_sheet.columns
+        and n_session_confirmed_display is not None
+        and n_session_confirmed_display > 0
+    ):
+        _ids_show = _management_ids_origin_cleared_session_in_stock(
+            df_sheet, st_origin, st_rem, limit=18
+        )
+        _cap = (
+            f"上記「確認済」＝在庫中（件数）−今回の作業でまだ未確認（在庫中）＝**{n_session_confirmed_display}** 件です。"
+        )
+        if _ids_show:
+            tail = " …" if n_session_confirmed_display > len(_ids_show) else ""
+            _cap += (
+                f" 今回の開始対象からリストが外れた在庫中の管理IDの例: "
+                f"{', '.join(_ids_show)}{tail}"
             )
-            tail = " …" if n_session_stocktake_done > len(_ids_show) else ""
-            st.caption(
-                f"今回の作業セッションで棚卸日が更新された在庫中（開始時リスト由来）: **{n_session_stocktake_done}** 件。"
-                f"管理IDの例: {', '.join(_ids_show)}{tail}"
-            )
+        st.caption(_cap)
     elif n_today_global > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
         _td_rows = df_sheet.loc[_mask_ledger_stocktake_today_jst(df_sheet)]
         _ids_show = (
