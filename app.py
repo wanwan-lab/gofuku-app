@@ -6178,8 +6178,25 @@ def render_stocktake_scan_tab(
                     except Exception as e:
                         st.session_state["_stocktake_scan_warn"] = str(e)
 
-    if _scan_targets_ok and df_ledger_hint is not None and not df_ledger_hint.empty:
-        st.markdown("##### 台帳から入力補助（任意）")
+    if "stocktake_assist_visible" not in st.session_state:
+        st.session_state.stocktake_assist_visible = False
+    if st.button(
+        "台帳からの入力補助を表示"
+        if not st.session_state.stocktake_assist_visible
+        else "台帳からの入力補助を非表示",
+        key="stocktake_assist_toggle_btn",
+    ):
+        st.session_state.stocktake_assist_visible = (
+            not st.session_state.stocktake_assist_visible
+        )
+        st.rerun()
+
+    if (
+        st.session_state.stocktake_assist_visible
+        and _scan_targets_ok
+        and df_ledger_hint is not None
+        and not df_ledger_hint.empty
+    ):
         _st_hint_df = _stocktake_assist_scope_dataframe(df_ledger_hint, st_rem_scan)
         if _st_hint_df is not None and not _st_hint_df.empty:
             _render_ledger_pick_assist_three_columns(
@@ -6254,7 +6271,11 @@ def render_stocktake_scan_tab(
                     )
         else:
             st.caption("今回のリストに該当する在庫中行が台帳にありません。")
-    elif df_ledger_hint is not None and not df_ledger_hint.empty:
+    elif (
+        st.session_state.stocktake_assist_visible
+        and df_ledger_hint is not None
+        and not df_ledger_hint.empty
+    ):
         st.caption(
             "**今回の棚卸を開始** して対象リストがあるときだけ、ここに仕入タブと同様の台帳入力補助が表示されます。"
         )
@@ -6672,8 +6693,22 @@ def _render_sales_management_tab(
             pick_mode="sale",
         )
 
-    if df_ledger_hint is not None and not df_ledger_hint.empty:
-        st.markdown("##### 台帳から入力補助（任意）")
+    if "sales_assist_visible" not in st.session_state:
+        st.session_state.sales_assist_visible = False
+    if st.button(
+        "台帳からの入力補助を表示"
+        if not st.session_state.sales_assist_visible
+        else "台帳からの入力補助を非表示",
+        key="sales_assist_toggle_btn",
+    ):
+        st.session_state.sales_assist_visible = not st.session_state.sales_assist_visible
+        st.rerun()
+
+    if (
+        st.session_state.sales_assist_visible
+        and df_ledger_hint is not None
+        and not df_ledger_hint.empty
+    ):
         _render_ledger_pick_assist_three_columns(
             df_ledger_hint,
             key_prefix="sales_",
@@ -7245,8 +7280,24 @@ def main():
                     f"・{COL_CATEGORY}を反映しました。"
                 )
     
-        if df_ledger_hint is not None and not df_ledger_hint.empty:
-            st.markdown("##### 台帳から入力補助（任意）")
+        if "purchase_assist_visible" not in st.session_state:
+            st.session_state.purchase_assist_visible = False
+        if st.button(
+            "台帳からの入力補助を表示"
+            if not st.session_state.purchase_assist_visible
+            else "台帳からの入力補助を非表示",
+            key="purchase_assist_toggle_btn",
+        ):
+            st.session_state.purchase_assist_visible = (
+                not st.session_state.purchase_assist_visible
+            )
+            st.rerun()
+
+        if (
+            st.session_state.purchase_assist_visible
+            and df_ledger_hint is not None
+            and not df_ledger_hint.empty
+        ):
             _render_ledger_pick_assist_three_columns(
                 df_ledger_hint,
                 key_prefix="",
@@ -7261,7 +7312,10 @@ def main():
                 on_pick_inventory_category=_on_ledger_pick_inventory_category,
                 on_pick_management_id=_on_ledger_pick_management_id,
             )
-        elif _uses_local_inventory_csv() or _secret_str(SECRET_GOOGLE_SPREADSHEET_ID):
+        elif (
+            st.session_state.purchase_assist_visible
+            and (_uses_local_inventory_csv() or _secret_str(SECRET_GOOGLE_SPREADSHEET_ID))
+        ):
             st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
     
         st.markdown("##### 必須入力項目")
