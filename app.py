@@ -6258,10 +6258,7 @@ def render_stocktake_scan_tab(
         st.caption(
             "**今回の棚卸を開始** して対象リストがあるときだけ、ここに仕入タブと同様の台帳入力補助が表示されます。"
         )
-    if (
-        st.session_state.stocktake_assist_visible
-        and st.button("入力をクリア", key="stocktake_assist_clear_btn")
-    ):
+    if st.button("入力をクリア", key="stocktake_assist_clear_btn"):
         st.session_state.stocktake_hint_filter_product_name = ""
         st.session_state.stocktake_hint_filter_supplier = ""
         st.session_state.stocktake_hint_filter_inventory_category = ""
