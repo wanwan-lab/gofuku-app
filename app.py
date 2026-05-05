@@ -81,7 +81,10 @@ import requests
 import streamlit as st
 from google.oauth2 import service_account
 from PIL import Image, ImageOps
-import qrcode
+try:
+    import qrcode
+except Exception:
+    qrcode = None
 
 try:
     from pyzbar.pyzbar import decode as _pyzbar_decode
@@ -4984,6 +4987,8 @@ def _google_drive_file_id_from_url(url: str) -> str | None:
 
 def _qr_png_bytes_for_management_id(management_id: str) -> bytes:
     """管理ID文字列をQR(PNG)化して返す。"""
+    if qrcode is None:
+        return b""
     data = str(management_id or "").strip()
     if not data:
         return b""
