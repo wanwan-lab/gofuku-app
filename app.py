@@ -35,10 +35,10 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
 列定義・CSV 入出力は **app.py 内に内包**しています。
 
 スプレッドシート1行目はヘッダーとして次の列順を想定:
-  日時 | 商品名 | 仕入先・取引先 | 仕入金額（税抜） | 仕入金額（税込）
+  日時 | 商品名 | 仕入先・取引先 | 数量 | 仕入金額（税抜） | 仕入金額（税込）
   | 販売予定金額（税抜） | 販売予定金額（税込） | 実売金額（税抜） | 実売金額（税込） | 粗利 | ステータス（在庫中/販売済） | メモ（任意） | 画像URL | 管理ID | 最後に確認した日付（棚卸日） | 証憑記録日時 | 証憑URL
   | 仕入日時 | 入庫種別 | 浮貸日時 | 販売日時 | 出庫種別
-  ※在庫は **1点につき1行** で統一します（数量列は持たず、常に1点として扱います）。
+  ※在庫は **1点につき1行** を基本とし、台帳の **数量** 列は主に入出庫集計用です（未入力・空は **1** として扱います）。
   ※写真は **1枚まで** アップロードできます。写真があるときは1回だけドライブに保存し、**複数行を同時に登録する** ときは **全行に同じ画像URL** を入れます。
   ※「管理ID」列は自動採番（例: G00000001）のシリアルです。既存行の末尾に列を追加しても列位置はずれません。
   ※「**日時**」列（A列）は **その行が最後に台帳へ保存された時点の JST 時刻**（登録・販売反映・一覧からの保存など）です。**仕入日時** は仕入の暦（EXIF 等を ``record_datetime`` に渡した値）、**入庫種別** は登録画面の区分（入庫（購入）・入庫（返品）・入庫（浮貸）等）です。**販売日時**・**出庫種別** は販売確定時に記録します。
@@ -84,7 +84,7 @@ from PIL import Image, ImageOps
 COL_DATETIME = "日時"
 # 旧シート互換（読み込み時のみ。列は台帳から廃止）
 LEGACY_COL_MOVEMENT_TYPE = "入出庫種別"
-LEGACY_COL_QTY = "数量"
+COL_QTY = "数量"
 LEGACY_COL_SALE_SOURCE_MGMT_ID = "販売元管理ID"
 COL_NAME = "商品名"
 COL_SUPPLIER = "仕入先・取引先"
@@ -131,6 +131,7 @@ EXPECTED_HEADERS: list[str] = [
     COL_DATETIME,
     COL_NAME,
     COL_SUPPLIER,
+    COL_QTY,
     COL_PRICE_EXCL,
     COL_PRICE_INCL,
     COL_PLANNED_SALE,
@@ -1741,6 +1742,16 @@ def _coerce_money_columns_for_recalc(df: pd.DataFrame) -> pd.DataFrame:
         x = pd.to_numeric(s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
         x = np.where(np.isfinite(x), np.rint(x), 0.0)
         out[c] = x.astype(np.int64)
+    if COL_QTY in out.columns:
+        s = (
+            _series_to_numeric_loose(out[COL_QTY])
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(1)
+        )
+        xq = pd.to_numeric(s, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        xq = np.where(np.isfinite(xq), np.rint(xq), 1.0)
+        xq = np.maximum(1.0, xq)
+        out[COL_QTY] = xq.astype(np.int64)
     return out
 
 
@@ -1800,6 +1811,75 @@ def _count_stocktake_today_jst_in_management_ids(
     return int(m.sum())
 
 
+def _stocktake_date_token_for_compare(val: Any) -> str:
+    """棚卸日セルの値を暦日（ISO）に正規化。空・解釈不能は空文字。"""
+    dt = pd.to_datetime(val, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return pd.Timestamp(dt).normalize().date().isoformat()
+
+
+def _ledger_stocktake_date_token_for_mid(df: pd.DataFrame, mid: str) -> str:
+    row = lookup_ledger_row_by_management_id(df, mid.strip())
+    if row is None:
+        return ""
+    return _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
+
+
+def _count_stocktake_today_confirmed_since_session_start(
+    df: pd.DataFrame,
+    origin_ids: set[str],
+    start_tokens: dict[str, str],
+) -> int:
+    """今回セッション開始時点の棚卸日と比べ、本日中（JST）に変わった在庫中の件数（同一暦日の再セッションで前回分を数えない）。"""
+    if df.empty or not origin_ids or COL_MANAGEMENT_ID not in df.columns:
+        return 0
+    today_s = _today_jst_date().isoformat()
+    n = 0
+    for mid in origin_ids:
+        row = lookup_ledger_row_by_management_id(df, mid)
+        if row is None:
+            continue
+        if _normalize_stock_status(str(row.get(COL_STOCK_STATUS, ""))) != STATUS_IN_STOCK:
+            continue
+        cur_tok = _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
+        if cur_tok != today_s:
+            continue
+        prev_tok = start_tokens.get(mid, "")
+        if cur_tok != prev_tok:
+            n += 1
+    return n
+
+
+def _management_ids_stocktake_today_confirmed_since_session_start(
+    df: pd.DataFrame,
+    origin_ids: set[str],
+    start_tokens: dict[str, str],
+    *,
+    limit: int = 24,
+) -> list[str]:
+    """上記カウントに該当する管理ID（表示用・先頭 limit 件）。"""
+    if df.empty or not origin_ids or COL_MANAGEMENT_ID not in df.columns:
+        return []
+    today_s = _today_jst_date().isoformat()
+    out: list[str] = []
+    for mid in sorted(origin_ids):
+        row = lookup_ledger_row_by_management_id(df, mid)
+        if row is None:
+            continue
+        if _normalize_stock_status(str(row.get(COL_STOCK_STATUS, ""))) != STATUS_IN_STOCK:
+            continue
+        cur_tok = _stocktake_date_token_for_compare(row.get(COL_LAST_STOCKTAKE))
+        if cur_tok != today_s:
+            continue
+        prev_tok = start_tokens.get(mid, "")
+        if cur_tok != prev_tok:
+            out.append(str(mid).strip())
+            if len(out) >= limit:
+                break
+    return out
+
+
 def _all_in_stock_management_ids(df: pd.DataFrame) -> set[str]:
     """在庫中の行の管理ID（空でないもの）の集合。"""
     if df.empty or COL_MANAGEMENT_ID not in df.columns:
@@ -1813,17 +1893,17 @@ def _stocktake_work_session_path() -> Path:
     return Path(__file__).resolve().parent / STOCKTAKE_WORK_SESSION_FILENAME
 
 
-def _inv_stocktake_work_read_disk() -> tuple[bool, set[str], int | None, set[str]]:
-    """ディスク上のセッション（migrate なし）。(有効, 残りID, baseline, 開始時対象の管理ID)。"""
+def _inv_stocktake_work_read_disk() -> tuple[bool, set[str], int | None, set[str], dict[str, str]]:
+    """ディスク上のセッション（migrate なし）。(有効, 残りID, baseline, 開始時対象の管理ID, 開始時棚卸日トークン)。"""
     p = _stocktake_work_session_path()
     if not p.is_file():
-        return (False, set(), None, set())
+        return (False, set(), None, set(), {})
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
-        return (False, set(), None, set())
+        return (False, set(), None, set(), {})
     if not isinstance(raw, dict) or not raw.get("active"):
-        return (False, set(), None, set())
+        return (False, set(), None, set(), {})
     rem = raw.get("remaining") or []
     if not isinstance(rem, list):
         rem = []
@@ -1834,17 +1914,42 @@ def _inv_stocktake_work_read_disk() -> tuple[bool, set[str], int | None, set[str
     if not isinstance(org_raw, list):
         org_raw = []
     orig = {str(x).strip() for x in org_raw if str(x).strip()}
-    return (True, s, bi, orig)
+    snap_raw = raw.get("session_stocktake_at_start")
+    snap: dict[str, str] = {}
+    if isinstance(snap_raw, dict):
+        for k, v in snap_raw.items():
+            ks = str(k).strip()
+            if not ks:
+                continue
+            snap[ks] = str(v).strip() if v is not None else ""
+    return (True, s, bi, orig, snap)
 
 
-def _inv_stocktake_work_remaining_read_state() -> tuple[bool, set[str], int, set[str]]:
-    """表示用のセッション状態。無効時 (False, set(), 0, set())。有効時 baseline は最低 1（旧ファイル互換）。"""
+def _inv_stocktake_work_remaining_read_state(
+    df: pd.DataFrame | None = None,
+) -> tuple[bool, set[str], int, set[str], dict[str, str]]:
+    """表示用のセッション状態。無効時 (False, set(), 0, set(), {})。有効時 baseline は最低 1（旧ファイル互換）。"""
     _inv_stocktake_work_remaining_migrate_legacy_from_session_state()
-    a, s, b, o = _inv_stocktake_work_read_disk()
+    a, s, b, o, snap = _inv_stocktake_work_read_disk()
     if not a:
-        return False, set(), 0, set()
+        return False, set(), 0, set(), {}
     eff_b = b if b is not None and b >= 1 else max(len(s), 1)
-    return True, s, eff_b, o
+    if df is not None and not df.empty and o and COL_MANAGEMENT_ID in df.columns:
+        snap_m = dict(snap)
+        dirty = any(m not in snap_m for m in o)
+        if dirty:
+            for m in o:
+                if m not in snap_m:
+                    snap_m[m] = _ledger_stocktake_date_token_for_mid(df, m)
+            _inv_stocktake_work_remaining_save(
+                True,
+                s,
+                baseline_override=eff_b,
+                session_origin=o,
+                stocktake_snapshot=snap_m,
+            )
+            snap = snap_m
+    return True, s, eff_b, o, snap
 
 
 def _inv_stocktake_work_remaining_save(
@@ -1853,8 +1958,9 @@ def _inv_stocktake_work_remaining_save(
     *,
     baseline_override: int | None = None,
     session_origin: set[str] | None = None,
+    stocktake_snapshot: dict[str, str] | None = None,
 ) -> None:
-    """有効時は JSON に保存（baseline・開始時対象 ID を維持または上書き）。無効時はファイル削除。"""
+    """有効時は JSON に保存（baseline・開始時対象 ID・開始時棚卸日スナップショットを維持または上書き）。無効時はファイル削除。"""
     st.session_state.pop(_SESSION_KEY_STOCKTAKE_WORK_REMAINING_LEGACY, None)
     p = _stocktake_work_session_path()
     if not active:
@@ -1864,7 +1970,7 @@ def _inv_stocktake_work_remaining_save(
         except OSError:
             pass
         return
-    _a, _old_rem, old_base, old_orig = _inv_stocktake_work_read_disk()
+    _a, _old_rem, old_base, old_orig, old_snap = _inv_stocktake_work_read_disk()
     eff_base = baseline_override if baseline_override is not None and baseline_override >= 1 else old_base
     if eff_base is None or eff_base < 1:
         eff_base = max(len(remaining), 1)
@@ -1874,11 +1980,20 @@ def _inv_stocktake_work_remaining_save(
         eff_origin = set(old_orig)
     else:
         eff_origin = {str(x).strip() for x in remaining if str(x).strip()}
+    if stocktake_snapshot is not None:
+        eff_snap = {
+            str(k).strip(): str(v).strip() if v is not None else ""
+            for k, v in stocktake_snapshot.items()
+            if str(k).strip()
+        }
+    else:
+        eff_snap = dict(old_snap) if old_snap else {}
     data = {
         "active": True,
         "remaining": sorted(remaining),
         "session_baseline_n": int(eff_base),
         "session_origin_ids": sorted(eff_origin),
+        "session_stocktake_at_start": {k: eff_snap[k] for k in sorted(eff_snap)},
     }
     tmp = p.with_name(p.name + ".tmp")
     try:
@@ -1922,7 +2037,7 @@ def _inv_stocktake_work_remaining_migrate_legacy_from_session_state() -> None:
 def _inv_stocktake_work_remaining_get() -> set[str] | None:
     """棚卸し作業セッションの残り管理 ID。未開始・全件確認済みで終了したあとは None。"""
     _inv_stocktake_work_remaining_migrate_legacy_from_session_state()
-    active, rem, _b, _o = _inv_stocktake_work_read_disk()
+    active, rem, _b, _o, _snap = _inv_stocktake_work_read_disk()
     if not active:
         return None
     return rem
@@ -1935,8 +2050,13 @@ def _inv_stocktake_work_remaining_start(df: pd.DataFrame) -> None:
         _inv_stocktake_work_remaining_save(False, set())
         return
     n0 = len(ids)
+    snap0 = {m: _ledger_stocktake_date_token_for_mid(df, m) for m in ids}
     _inv_stocktake_work_remaining_save(
-        True, ids, baseline_override=n0, session_origin=ids
+        True,
+        ids,
+        baseline_override=n0,
+        session_origin=ids,
+        stocktake_snapshot=snap0,
     )
 
 
@@ -1951,12 +2071,20 @@ def _inv_stocktake_work_remaining_prune(df: pd.DataFrame) -> None:
         return
     valid = _all_in_stock_management_ids(df)
     newrem = {m for m in cur if m in valid}
-    _, _, _, old_orig = _inv_stocktake_work_read_disk()
+    _, _, _, old_orig, old_snap = _inv_stocktake_work_read_disk()
     new_orig = (old_orig & valid) if old_orig else newrem
+    new_snap: dict[str, str] = {}
+    for m in new_orig:
+        if m in old_snap:
+            new_snap[m] = old_snap[m]
+        else:
+            new_snap[m] = _ledger_stocktake_date_token_for_mid(df, m)
     if not newrem:
         _inv_stocktake_work_remaining_save(False, set())
     else:
-        _inv_stocktake_work_remaining_save(True, newrem, session_origin=new_orig)
+        _inv_stocktake_work_remaining_save(
+            True, newrem, session_origin=new_orig, stocktake_snapshot=new_snap
+        )
 
 
 def _inv_stocktake_work_remaining_note_done(mids: set[str] | str) -> None:
@@ -2166,7 +2294,11 @@ def _recalc_gross_profit_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     cogs = _i64_col(COL_PRICE_EXCL)
     line_in = _i64_col(COL_PRICE_INCL)
-    qty = np.ones(n, dtype=np.int64)
+    if COL_QTY in out.columns:
+        qv = _i64_col(COL_QTY)
+        qty = np.maximum(1, qv).astype(np.int64, copy=False)
+    else:
+        qty = np.ones(n, dtype=np.int64)
     pu = _i64_col(COL_PLANNED_SALE)
     au = _i64_col(COL_ACTUAL_SALE)
 
@@ -2254,6 +2386,7 @@ def _inventory_row_values_for_append(
     management_id: str,
     memo: str,
     *,
+    quantity: int = 1,
     planned_sale_unit_excl_yen: int = 0,
     actual_sale_unit_excl_yen: int = 0,
     stock_status: str = STATUS_IN_STOCK,
@@ -2264,7 +2397,7 @@ def _inventory_row_values_for_append(
 ) -> list[Any]:
     """台帳 EXPECTED_HEADERS 順の1行分セル値を組み立てる（追記用）。"""
     cogs = _finite_int(line_price_excl_yen, 0)
-    qty_i = 1
+    qty_i = max(1, _finite_int(quantity, 1))
     pl_u = _finite_int(planned_sale_unit_excl_yen, 0)
     ac_u = _finite_int(actual_sale_unit_excl_yen, 0)
     stt = _normalize_stock_status(str(stock_status))
@@ -2300,6 +2433,7 @@ def _inventory_row_values_for_append(
         dt_a,
         product_name,
         supplier,
+        qty_i,
         line_price_excl_yen,
         line_price_incl_yen,
         planned_unit_cell,
@@ -2376,6 +2510,7 @@ def append_sheet_row(
     memo: str = "",
     record_datetime: str | None = None,
     *,
+    quantity: int = 1,
     planned_sale_unit_excl_yen: int = 0,
     actual_sale_unit_excl_yen: int = 0,
     stock_status: str = STATUS_IN_STOCK,
@@ -2401,6 +2536,7 @@ def append_sheet_row(
         image_url,
         management_id,
         memo,
+        quantity=quantity,
         planned_sale_unit_excl_yen=planned_sale_unit_excl_yen,
         actual_sale_unit_excl_yen=actual_sale_unit_excl_yen,
         stock_status=stock_status,
@@ -2420,8 +2556,6 @@ def _sheet_header_row_to_expected_list(header: list[str], row: list[Any]) -> lis
     r2: list[str] = []
     for i, nm in enumerate(h):
         if nm == LEGACY_COL_UNIT_PRICE:
-            continue
-        if nm == LEGACY_COL_QTY:
             continue
         if nm == LEGACY_COL_SALE_SOURCE_MGMT_ID:
             continue
@@ -2644,6 +2778,7 @@ def overwrite_inventory_worksheet_from_dataframe(
 def _ledger_df_loosen_numeric_columns_for_assignment(df: pd.DataFrame) -> None:
     """StringDtype 等の厳格な列に int を代入すると失敗するため、金額列を object に揃える（原地変更）。"""
     for _c in (
+        COL_QTY,
         COL_PRICE_EXCL,
         COL_PRICE_INCL,
         COL_PLANNED_SALE,
@@ -2935,7 +3070,15 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     if d.empty:
         return d
     d[COL_DATETIME] = pd.to_datetime(d[COL_DATETIME], errors="coerce")
-    qty = pd.Series(1.0, index=d.index, dtype=float)
+    if COL_QTY in d.columns:
+        qty = (
+            pd.to_numeric(d[COL_QTY], errors="coerce")
+            .fillna(1.0)
+            .clip(lower=1.0)
+            .astype(float)
+        )
+    else:
+        qty = pd.Series(1.0, index=d.index, dtype=float)
     line_stored_ex = _series_to_numeric_loose(d[COL_PRICE_EXCL]).fillna(0)
     line_stored_in = _series_to_numeric_loose(d[COL_PRICE_INCL]).fillna(0)
     if COL_STOCK_STATUS in d.columns:
@@ -3034,7 +3177,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
         f"入出庫の **金額** は「{COL_PRICE_EXCL}」「{COL_PRICE_INCL}」（仕入・税抜・税込）を行合計として集計します（販売済行の出庫側も実売ではなく当行の仕入金額で計上）。"
         f"仕入先・取引先別の粗利は「{COL_GROSS_PROFIT}」列を合算しています（税抜・台帳保存時の値）。"
-        "入出庫の **数量** は **1点1行** として、在庫中の入庫行と、販売済で実売がある行をそれぞれ1件ずつ計上します。"
+        f"入出庫の **数量** は「{COL_QTY}」列（空・未入力は **1**）を在庫中の入庫行・販売済で実売がある行で合算します。"
         "期間フィルタと月次の軸は **販売済は販売日時**（未入力の旧行は日時にフォールバック）、在庫中は **日時** です。"
         "（税抜の仕入金額が空で税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
         "カンマ区切り・円記号付きの数値も読み取ります。）"
@@ -3044,11 +3187,14 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         return
 
     df_in = df.copy()
-    for _col in (
-        COL_PRICE_EXCL,
-        COL_PRICE_INCL,
-        COL_GROSS_PROFIT,
-    ):
+    if COL_QTY in df_in.columns:
+        df_in[COL_QTY] = (
+            _series_to_numeric_loose(df_in[COL_QTY])
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(1)
+            .clip(lower=1)
+        )
+    for _col in (COL_PRICE_EXCL, COL_PRICE_INCL, COL_GROSS_PROFIT):
         if _col in df_in.columns:
             df_in[_col] = (
                 _series_to_numeric_loose(df_in[_col])
@@ -3123,7 +3269,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         )
     st.markdown("##### ライフサイクル指標")
     st.caption(
-        "次の3つは **From〜To・仕入先フィルタ** に合致する行のみを対象にします（数量は含みません）。"
+        "次の3つは **From〜To・仕入先フィルタ** に合致する行のみを対象にします（数量列による追加の絞り込みはありません）。"
         f"原価は台帳の **{COL_PRICE_EXCL}** / **{COL_PRICE_INCL}** を合算した税抜・税込の総額です。"
         "確定粗利は **販売済** 行の粗利列（税抜）の合計です。"
     )
@@ -3547,7 +3693,7 @@ def _render_inventory_price_summary(df: pd.DataFrame) -> None:
     st.markdown("##### 価格管理サマリー（在庫中）")
     st.caption(
         "上の表のうち、ステータスが「在庫中」の行だけを合算しています（未保存の編集を含みます）。"
-        "「販売予定金額（税抜）」列の値（1点あたり）の合計、税込列は仕入行と同じ税率で算出した値の合計です。"
+        f"「販売予定金額（税抜）」は1点あたりとして **{COL_QTY}** を掛けた行計の合計、税込列は再計算後の値の合計です。"
     )
     if df is None or df.empty:
         return
@@ -3561,7 +3707,11 @@ def _render_inventory_price_summary(df: pd.DataFrame) -> None:
         return
     cg = sub[COL_PRICE_EXCL].map(_int_from_cell)
     pl_u = sub[COL_PLANNED_SALE].map(_int_from_cell)
-    pl_line_ex = pl_u
+    if COL_QTY in sub.columns:
+        rq = sub[COL_QTY].map(lambda x: max(1, _finite_int(x, 1)))
+    else:
+        rq = pd.Series(1, index=sub.index, dtype=int)
+    pl_line_ex = pl_u * rq.astype(np.int64, copy=False)
     pl_in = sub[COL_PLANNED_SALE_INCL].map(_int_from_cell)
     total_cogs = int(cg.sum())
     total_planned_excl = int(pl_line_ex.sum())
@@ -3815,6 +3965,14 @@ def _render_inventory_ledger_data_editor_section(df_sorted: pd.DataFrame) -> Non
             disabled=True,
             help="1点1行の自動採番（シリアル）。通常は手入力しません。",
         )
+    if COL_QTY in df_sorted.columns:
+        _ledger_col_cfg[COL_QTY] = st.column_config.NumberColumn(
+            COL_QTY,
+            min_value=1,
+            step=1,
+            format="%d",
+            help="入出庫集計に使う点数（1以上の整数）。",
+        )
     if COL_STOCK_STATUS in df_sorted.columns:
         _ledger_col_cfg[COL_STOCK_STATUS] = st.column_config.SelectboxColumn(
             COL_STOCK_STATUS,
@@ -3967,11 +4125,15 @@ def render_inventory_list_page() -> None:
         return
 
     _inv_stocktake_work_remaining_prune(df_sheet)
-    st_active, st_rem, st_base, st_origin = _inv_stocktake_work_remaining_read_state()
+    st_active, st_rem, st_base, st_origin, st_snap = (
+        _inv_stocktake_work_remaining_read_state(df_sheet)
+    )
     n_in_stock = int(_mask_ledger_in_stock(df_sheet).sum())
     n_today_global = int(_mask_ledger_stocktake_today_jst(df_sheet).sum())
     n_session_today_done = (
-        _count_stocktake_today_jst_in_management_ids(df_sheet, st_origin)
+        _count_stocktake_today_confirmed_since_session_start(
+            df_sheet, st_origin, st_snap
+        )
         if st_active and st_origin
         else 0
     )
@@ -3990,8 +4152,12 @@ def render_inventory_list_page() -> None:
     sk1.metric("在庫中（件数）", f"{n_in_stock:,}")
     sk2.metric("今回の作業でまだ未確認（在庫中）", f"{n_session_in_stock_pending:,}")
     sk3.metric(
-        "今回リストで今日確認済（在庫中・JST）",
+        "今回リストで本セッション中に今日確認済（在庫中・JST）",
         f"{n_session_today_done:,}",
+        help=(
+            "「今回の棚卸を開始」を押した時点の棚卸日と比べ、今日（JST）に変わった件数だけです。"
+            "前のセッションで今日付けした分は、新しいセッション開始後はここに含まれません。"
+        ),
     )
     with sk4:
         if st_active and st_base > 0:
@@ -4086,16 +4252,12 @@ def render_inventory_list_page() -> None:
 
     if st_active and st_origin and COL_MANAGEMENT_ID in df_sheet.columns:
         if n_session_today_done > 0:
-            m_td_sess = _mask_ledger_stocktake_today_jst(df_sheet) & df_sheet[
-                COL_MANAGEMENT_ID
-            ].astype(str).str.strip().isin(st_origin)
-            _td_rows = df_sheet.loc[m_td_sess]
-            _ids_show = (
-                _td_rows[COL_MANAGEMENT_ID].astype(str).str.strip().head(18).tolist()
+            _ids_show = _management_ids_stocktake_today_confirmed_since_session_start(
+                df_sheet, st_origin, st_snap, limit=18
             )
-            tail = " …" if len(_td_rows) > len(_ids_show) else ""
+            tail = " …" if n_session_today_done > len(_ids_show) else ""
             st.caption(
-                f"今回の作業対象リストのうち、今日（JST {_today_jst_date().isoformat()}）の棚卸日が入っている在庫中: **{n_session_today_done}** 件。"
+                f"今回セッション開始後に、棚卸日が今日（JST {_today_jst_date().isoformat()}）に更新された在庫中: **{n_session_today_done}** 件。"
                 f"管理IDの例: {', '.join(_ids_show)}{tail}"
             )
     elif n_today_global > 0 and COL_MANAGEMENT_ID in df_sheet.columns:
@@ -4333,6 +4495,8 @@ def _init_registration_form_session_state() -> None:
         st.session_state.field_supplier = ""
     if "field_qty" not in st.session_state:
         st.session_state.field_qty = 1
+    if "field_row_quantity" not in st.session_state:
+        st.session_state.field_row_quantity = 1
     if "ai_kind" not in st.session_state:
         st.session_state.ai_kind = ""
     if "ai_features" not in st.session_state:
@@ -5192,6 +5356,7 @@ def main():
                 st.session_state.field_product_name = ""
                 st.session_state.field_supplier = ""
                 st.session_state.field_qty = 1
+                st.session_state.field_row_quantity = 1
                 st.session_state.ai_kind = ""
                 st.session_state.ai_features = ""
                 st.session_state.ai_parse_ran = False
@@ -5338,9 +5503,16 @@ def main():
                     hide_index=True,
                 )
     
+        st.number_input(
+            "数量（台帳の数量列・各行に同じ値を書き込み）",
+            min_value=1,
+            step=1,
+            key="field_row_quantity",
+            help="保存する各行の「数量」列です（入出庫集計に使います）。登録する行数とは別です。",
+        )
         st.caption(
-            "台帳は **1点1行** で保存します。**点数** は写真解析の推定数量または証憑取込の行数に従います（現在: "
-            f"**{max(1, int(st.session_state.get('field_qty', 1)))}** 点）。"
+            "台帳は **複数行** のとき **1点につき1行** で保存します。**保存する行数** は写真解析の推定数量または証憑取込の行数に従います（現在: "
+            f"**{max(1, int(st.session_state.get('field_qty', 1)))}** 行）。"
             "証憑取込やAI解析で複数行になる場合は自動で増えます。"
         )
 
@@ -5364,6 +5536,7 @@ def main():
         )
     
         _q = max(1, int(st.session_state.get("field_qty", 1)))
+        _rq = max(1, int(st.session_state.get("field_row_quantity", 1)))
         _lex_inp = int(line_excl_yen)
         _n_save = _q
         _line_ex_one = _lex_inp
@@ -5373,7 +5546,7 @@ def main():
         with price_row[0]:
             st.metric("仕入金額（税抜・1点）", f"¥{_line_ex_one:,}")
             _cap_rows = (
-                f"確定時は **{_n_save} 行**（各行1点）。税抜合計（参考） ¥{_line_ex_one * _n_save:,}。"
+                f"確定時は **{_n_save} 行**（各「{COL_QTY}」**{_rq}**）。税抜合計（参考） ¥{_line_ex_one * _rq * _n_save:,}。"
             )
             if _n_save > 1:
                 _cap_rows += (
@@ -5412,12 +5585,12 @@ def main():
         )
         _pl_u = int(planned_sale_excl)
         _act_u = 0
-        _cogs_preview = _lex_inp * _q
+        _cogs_preview = _lex_inp * _rq * _q
         _pl_u_gp = _pl_u
         _tax_preview = _tax_r
         _st_gp = STATUS_IN_STOCK
         _plex, _pin, _aex, _ain = _planned_actual_line_amounts(
-            _q, _pl_u_gp, _act_u, _st_gp, _tax_preview
+            _q * _rq, _pl_u_gp, _act_u, _st_gp, _tax_preview
         )
         _gp_preview = _compute_gross_profit_row(
             _cogs_preview,
@@ -5493,6 +5666,7 @@ def main():
                 memo_s = (memo or "").strip()
     
                 _q2 = max(1, int(st.session_state.get("field_qty", 1)))
+                _rq2 = max(1, int(st.session_state.get("field_row_quantity", 1)))
                 n_save = _q2
                 urls: list[str] = [""] * n_save
                 _record_dt = jst_now_str()
@@ -5560,6 +5734,7 @@ def main():
                                             urls[i],
                                             ids[i],
                                             memo_s,
+                                            quantity=_rq2,
                                             planned_sale_unit_excl_yen=_plan2,
                                             actual_sale_unit_excl_yen=_act_ex2,
                                             stock_status=_stat2,
