@@ -51,7 +51,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※金額列（仕入〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
   ※粗利は税抜ベースで「販売済」なら実売金額（税抜）−原価、「在庫中」なら販売予定金額（税抜）−原価（いずれも1点あたり）。台帳保存時に再計算します。
   ※「最後に確認した日付（棚卸日）」は棚卸作業用の任意列です（YYYY-MM-DD 推奨）。1人棚卸しの進捗把握に使います。
-  ※ **販売管理** タブで **在庫中の行の管理ID（G########）** を指定して出庫を記録します。出庫（販売）または出庫（浮貸）で **販売済** にするときは実売が必須で、各IDの行を順に更新します（新規行は追加しません）。出庫（浮貸）で **在庫中** のままにするときは **浮貸日時** 列に確定時の JST（または手入力）を記録します。
+  ※ **販売管理** タブで **在庫中の行の管理ID（G########）** を指定して出庫を記録します。出庫（販売）・出庫（処分）または出庫（浮貸）で **販売済** にするときは実売が必須で、各IDの行を順に更新します（新規行は追加しません）。出庫（浮貸）で **在庫中** のままにするときは **浮貸日時** 列に確定時の JST（または手入力）を記録します。
   ※「証憑記録日時」は証憑取込の **確定ボタンを押した JST 時刻**（recorded_at に相当）。「証憑URL」はその証憑を GAS 経由で Drive に保存したときの表示 URL（evidence_url）です。
   ※台帳一覧から手動で在庫行を販売済に編集する場合は、**販売日時**・**出庫種別**・実売・ステータスを整合させてください（保存時に変更があった行の「日時」は自動で更新されます）。
 """
@@ -3501,7 +3501,7 @@ def apply_outbound_sale_to_ledger_by_management_id(
     sale_voucher_evidence_url: str = "",
     sale_outbound_type: str = "出庫（販売）",
 ) -> None:
-    """在庫中の1行を販売済に更新（新規行なし）。A列「日時」は確定実行の JST。出庫種別は ``sale_outbound_type``（例: 出庫（販売）／出庫（浮貸））。"""
+    """在庫中の1行を販売済に更新（新規行なし）。A列「日時」は確定実行の JST。出庫種別は ``sale_outbound_type``（例: 出庫（販売）／出庫（処分）／出庫（浮貸））。"""
     sid = (source_management_id or "").strip()
     if not sid:
         raise ValueError("管理IDが空です。")
@@ -6233,21 +6233,21 @@ def render_stocktake_scan_tab(
                 and not _stk_c.empty
                 and df_ledger_hint is not None
             ):
-                with st.expander("近い候補（補助から照合・カード表示）", expanded=False):
-                    st.caption(
-                        "今回のリストの在庫中行のうち、補助で確定した内容に近い行を表示します。"
-                        "**この候補を選ぶ** で **選択中の管理ID** に反映され、下部の確定ボタンに進めます。"
-                    )
-                    _stk_hits = [
-                        _sale_card_hit_from_series(row)
-                        for _, row in _stk_c.iterrows()
-                    ]
-                    _render_mid_pick_candidate_cards(
-                        _stk_hits,
-                        widget_key_namespace="stk_assist",
-                        sold=False,
-                        pick_mode="stocktake",
-                    )
+                st.markdown("##### 近い候補（補助から照合・カード表示）")
+                st.caption(
+                    "今回のリストの在庫中行のうち、補助で確定した内容に近い行を表示します。"
+                    "**この候補を選ぶ** で **選択中の管理ID** に反映したあと、**台帳入力補助で選んだ管理IDの棚卸確定** または AI 照合ブロックの **棚卸を確定** で台帳に反映します。"
+                )
+                _stk_hits = [
+                    _sale_card_hit_from_series(row)
+                    for _, row in _stk_c.iterrows()
+                ]
+                _render_mid_pick_candidate_cards(
+                    _stk_hits,
+                    widget_key_namespace="stk_assist",
+                    sold=False,
+                    pick_mode="stocktake",
+                )
         else:
             st.caption("今回のリストに該当する在庫中行が台帳にありません。")
     elif (
@@ -6258,6 +6258,43 @@ def render_stocktake_scan_tab(
         st.caption(
             "**今回の棚卸を開始** して対象リストがあるときだけ、ここに仕入タブと同様の台帳入力補助が表示されます。"
         )
+
+    _cands_pre = st.session_state.get("_stocktake_scan_candidates")
+    _has_ai_stocktake_cands = isinstance(_cands_pre, list) and len(_cands_pre) > 0
+    _mid_from_assist = str(
+        st.session_state.get("_stocktake_selected_mid") or ""
+    ).strip()
+    if (
+        _scan_targets_ok
+        and not _has_ai_stocktake_cands
+        and _mid_from_assist
+    ):
+        st.markdown("##### 台帳入力補助で選んだ管理IDの棚卸確定")
+        st.caption(
+            "AI 照合の候補がないとき、または補助の近い候補カードで管理IDを選んだあと、ここから棚卸日を本日（JST）に更新できます。"
+        )
+        st.info(f"選択中の管理ID: **`{_mid_from_assist}`**")
+        if st.button(
+            "棚卸を確定（棚卸日を本日・JST に更新）",
+            type="primary",
+            key="stocktake_confirm_from_ledger_assist",
+        ):
+            try:
+                with st.spinner("台帳を更新しています…"):
+                    apply_last_stocktake_jst_for_management_ids([_mid_from_assist])
+            except Exception as e:
+                st.error(str(e))
+            else:
+                st.session_state.pop("_stocktake_scan_candidates", None)
+                st.session_state.pop("_stocktake_selected_mid", None)
+                st.session_state.pop("stocktake_multi_done_mids", None)
+                st.session_state.pop("stocktake_cand_page", None)
+                st.success(
+                    f"管理ID **{_mid_from_assist}** の棚卸日を更新しました。"
+                )
+                st.session_state.pop(LEDGER_DATA_EDITOR_KEY, None)
+                st.rerun()
+
     if st.button("入力をクリア", key="stocktake_assist_clear_btn"):
         st.session_state.stocktake_hint_filter_product_name = ""
         st.session_state.stocktake_hint_filter_supplier = ""
@@ -6588,20 +6625,20 @@ def _render_sales_management_tab(
     uploaded,
     df_ledger_hint: pd.DataFrame | None,
 ) -> None:
-    """販売管理タブ: 出庫（販売）／出庫（浮貸）と管理ID・実売または浮貸日時の更新。"""
+    """販売管理タブ: 出庫（販売）／出庫（処分）／出庫（浮貸）と管理ID・実売または浮貸日時の更新。"""
     st.markdown("##### 販売管理")
     st.caption(
         "在庫中の管理IDを指定して、1件または複数件をまとめて反映できます。"
     )
     with st.expander("使い方", expanded=False):
         st.markdown(
-            "- **出庫（販売）**: 在庫行を販売済に更新します。\n"
+            "- **出庫（販売）** / **出庫（処分）**: 在庫行を販売済に更新します（台帳の **出庫種別** に区別が入ります）。\n"
             "- **出庫（浮貸）**: 在庫中のまま浮貸日時を記録、または販売済へ更新できます。\n"
             "- 写真照合は上部の共通アップローダ画像を使用します。"
         )
     outbound_kind = st.radio(
         "出庫区分",
-        ("出庫（販売）", "出庫（浮貸）"),
+        ("出庫（販売）", "出庫（処分）", "出庫（浮貸）"),
         horizontal=True,
         key="sales_tab_outbound_kind",
     )
@@ -6619,7 +6656,7 @@ def _render_sales_management_tab(
     _loan_as_sale = (
         outbound_kind == "出庫（浮貸）" and loan_target_status == STATUS_SOLD
     )
-    _plain_sale = outbound_kind == "出庫（販売）"
+    _plain_sale = outbound_kind in ("出庫（販売）", "出庫（処分）")
     do_match = st.button(
         "AIで写真と照合",
         type="primary",
@@ -6848,20 +6885,17 @@ def _render_sales_management_tab(
             and not _sac.empty
             and df_ledger_hint is not None
         ):
-            with st.expander(
-                "近い候補（補助で選んだ項目・入力から照合・カード）",
-                expanded=False,
-            ):
-                st.caption(
-                    "入力補助で確定した項目と表記が近い **在庫中** を表示します（棚卸し登録の照合と同レイアウト）。"
-                )
-                _s_hits = [_sale_card_hit_from_series(row) for _, row in _sac.iterrows()]
-                _render_mid_pick_candidate_cards(
-                    _s_hits,
-                    widget_key_namespace="sales_assist_cards",
-                    sold=False,
-                    pick_mode="sale",
-                )
+            st.markdown("##### 近い候補（補助で選んだ項目・入力から照合・カード）")
+            st.caption(
+                "入力補助で確定した項目と表記が近い **在庫中** を表示します（棚卸し登録の照合と同レイアウト）。"
+            )
+            _s_hits = [_sale_card_hit_from_series(row) for _, row in _sac.iterrows()]
+            _render_mid_pick_candidate_cards(
+                _s_hits,
+                widget_key_namespace="sales_assist_cards",
+                sold=False,
+                pick_mode="sale",
+            )
 
     st.text_input(
         "販売する管理ID（手入力可）",
@@ -6882,7 +6916,7 @@ def _render_sales_management_tab(
         key="field_actual_sale_excl",
         disabled=_loan_keep_stock,
         help=(
-            "出庫（販売）または出庫（浮貸）で **販売済** のときに使用（0円以上）。"
+            "出庫（販売）・出庫（処分）または出庫（浮貸）で **販売済** のときに使用（0円以上）。"
             "出庫（浮貸）で **在庫中** のときは不要です。"
         ),
     )
@@ -7059,7 +7093,11 @@ def _render_sales_management_tab(
     _confirm_lbl = (
         "浮貸を確定（在庫中のまま・浮貸日時のみ）"
         if _loan_keep_stock
-        else "販売を確定（在庫行のみ更新・新規行なし）"
+        else (
+            "処分を確定（在庫行のみ更新・新規行なし）"
+            if outbound_kind == "出庫（処分）"
+            else "販売を確定（在庫行のみ更新・新規行なし）"
+        )
     )
     confirm_sale = st.button(_confirm_lbl, type="primary", key="sales_tab_confirm_btn")
 
@@ -7147,7 +7185,10 @@ def _render_sales_management_tab(
                                     memo_suffix=memo_s,
                                 )
                     else:
-                        _ot = "出庫（販売）" if _plain_sale else "出庫（浮貸）"
+                        if _loan_as_sale:
+                            _ot = "出庫（浮貸）"
+                        else:
+                            _ot = (outbound_kind or "").strip() or "出庫（販売）"
                         _spin_sale = (
                             "該当の在庫行を販売済に更新しています…"
                             if _n_ids <= 1
@@ -7396,7 +7437,7 @@ def main():
         st.markdown("##### 必須入力項目")
         st.caption(
             "このタブの確定は **在庫中** の新規行のみを追加します（入庫（購入）／入庫（返品）／入庫（浮貸））。"
-            "**出庫（浮貸）・出庫（販売）** は **販売管理** タブで行ってください。"
+            "**出庫（浮貸）・出庫（販売）・出庫（処分）** は **販売管理** タブで行ってください。"
         )
         product_name = st.text_input("商品名（必須）", key="field_product_name")
         supplier = st.text_input("仕入先・取引先（必須）", key="field_supplier")
