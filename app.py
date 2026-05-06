@@ -2195,14 +2195,21 @@ def _inv_stocktake_work_remaining_clear() -> None:
 
 
 def _inv_stocktake_work_remaining_prune(df: pd.DataFrame) -> None:
-    """販売済・削除などで在庫中でなくなった ID を残リストから外す。空になればセッション終了。"""
+    """棚卸セッションの残り管理IDを同期する。
+
+    - 販売済・削除などで在庫中でなくなった ID は残リストから外す
+    - セッション開始後に新規追加された在庫中 ID は残リストへ自動追加する
+    - 残りが空ならセッション終了
+    """
     cur = _inv_stocktake_work_remaining_get()
     if cur is None:
         return
     valid = _all_in_stock_management_ids(df)
-    newrem = {m for m in cur if m in valid}
     _, _, _, old_orig, old_snap = _inv_stocktake_work_read_disk()
-    new_orig = (old_orig & valid) if old_orig else newrem
+    base_orig = set(old_orig) if old_orig else set(cur)
+    new_added = valid - base_orig
+    newrem = ({m for m in cur if m in valid}) | new_added
+    new_orig = (base_orig & valid) | new_added
     new_snap: dict[str, str] = {}
     for m in new_orig:
         if m in old_snap:
@@ -2844,10 +2851,57 @@ def _sheet_header_row_to_expected_list(header: list[str], row: list[Any]) -> lis
     return [out[c] for c in EXPECTED_HEADERS]
 
 
+def _repair_rows_shifted_by_sale_image_column(df: pd.DataFrame) -> pd.DataFrame:
+    """販売画像URL列追加前の旧列順で追記された行を補正する。"""
+    if df is None or df.empty:
+        return df
+    req_cols = (
+        COL_SALE_IMAGE_URL,
+        COL_MANAGEMENT_ID,
+        COL_LAST_STOCKTAKE,
+        COL_VOUCHER_RECORDED_AT,
+        COL_VOUCHER_EVIDENCE_URL,
+        COL_PURCHASE_DATETIME,
+        COL_PURCHASE_MOVEMENT,
+        COL_LOAN_DATETIME,
+        COL_SALE_DATETIME,
+        COL_SALE_OUTBOUND_TYPE,
+    )
+    if any(c not in df.columns for c in req_cols):
+        return df
+    out = df.copy()
+    sale_img = out[COL_SALE_IMAGE_URL].astype(str).str.strip()
+    mid = out[COL_MANAGEMENT_ID].astype(str).str.strip()
+    mask = mid.eq("") & sale_img.str.fullmatch(r"G\d{8,}", na=False)
+    if not mask.any():
+        return out
+    for idx in out.index[mask]:
+        v16 = str(out.at[idx, COL_SALE_IMAGE_URL] or "").strip()
+        v17 = str(out.at[idx, COL_MANAGEMENT_ID] or "").strip()
+        v18 = str(out.at[idx, COL_LAST_STOCKTAKE] or "").strip()
+        v19 = str(out.at[idx, COL_VOUCHER_RECORDED_AT] or "").strip()
+        v20 = str(out.at[idx, COL_VOUCHER_EVIDENCE_URL] or "").strip()
+        v21 = str(out.at[idx, COL_PURCHASE_DATETIME] or "").strip()
+        v22 = str(out.at[idx, COL_PURCHASE_MOVEMENT] or "").strip()
+        v23 = str(out.at[idx, COL_LOAN_DATETIME] or "").strip()
+        v24 = str(out.at[idx, COL_SALE_DATETIME] or "").strip()
+        out.at[idx, COL_SALE_IMAGE_URL] = ""
+        out.at[idx, COL_MANAGEMENT_ID] = v16
+        out.at[idx, COL_LAST_STOCKTAKE] = v17
+        out.at[idx, COL_VOUCHER_RECORDED_AT] = v18
+        out.at[idx, COL_VOUCHER_EVIDENCE_URL] = v19
+        out.at[idx, COL_PURCHASE_DATETIME] = v20
+        out.at[idx, COL_PURCHASE_MOVEMENT] = v21
+        out.at[idx, COL_LOAN_DATETIME] = v22
+        out.at[idx, COL_SALE_DATETIME] = v23
+        out.at[idx, COL_SALE_OUTBOUND_TYPE] = v24
+    return out
+
+
 def load_inventory_dataframe() -> pd.DataFrame | None:
     """1行目をヘッダー、2行目以降をデータとして読み込み、列は EXPECTED_HEADERS に揃える。"""
     if _uses_local_inventory_csv():
-        return _inventory_csv_read_df()
+        return _repair_rows_shifted_by_sale_image_column(_inventory_csv_read_df())
     sid = _secret_str(SECRET_GOOGLE_SPREADSHEET_ID)
     if not sid:
         return None
@@ -2868,7 +2922,9 @@ def load_inventory_dataframe() -> pd.DataFrame | None:
     header0 = [("" if c is None else str(c)).strip() for c in raw[0]]
     rows = raw[1:]
     data_rows = [_sheet_header_row_to_expected_list(header0, list(r)) for r in rows]
-    return pd.DataFrame(data_rows, columns=EXPECTED_HEADERS)
+    return _repair_rows_shifted_by_sale_image_column(
+        pd.DataFrame(data_rows, columns=EXPECTED_HEADERS)
+    )
 
 
 def _ledger_hint_dataframe() -> pd.DataFrame | None:
