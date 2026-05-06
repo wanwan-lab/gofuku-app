@@ -100,6 +100,7 @@ COL_ACTUAL_SALE_INCL = "実売金額（税込）"
 COL_GROSS_PROFIT = "粗利"
 COL_STOCK_STATUS = "ステータス（在庫中/販売済）"
 COL_IMAGE_URL = "画像URL"
+COL_SALE_IMAGE_URL = "販売画像URL"
 COL_MEMO = "メモ"
 COL_CATEGORY = "在庫カテゴリー"
 COL_MANAGEMENT_ID = "管理ID"
@@ -146,6 +147,7 @@ EXPECTED_HEADERS: list[str] = [
     COL_MEMO,
     COL_CATEGORY,
     COL_IMAGE_URL,
+    COL_SALE_IMAGE_URL,
     COL_MANAGEMENT_ID,
     COL_LAST_STOCKTAKE,
     COL_VOUCHER_RECORDED_AT,
@@ -3548,6 +3550,8 @@ def apply_outbound_sale_to_ledger_by_management_id(
     nu = (new_image_url or "").strip()
     if not cur_img and nu:
         df_src.loc[msk, COL_IMAGE_URL] = nu
+    if COL_SALE_IMAGE_URL in df_src.columns and nu:
+        df_src.loc[msk, COL_SALE_IMAGE_URL] = nu
     if (memo_suffix or "").strip():
         old_memo = str(df_src.loc[msk, COL_MEMO].iloc[0] or "").strip()
         tag = (memo_suffix or "").strip()
@@ -6868,7 +6872,9 @@ def _inventory_gallery_detail_dialog(row_dict: dict[str, Any]) -> None:
         if k not in row_dict:
             continue
         v = row_dict.get(k)
-        if k == COL_IMAGE_URL and str(v or "").strip().startswith("http"):
+        if k in (COL_IMAGE_URL, COL_SALE_IMAGE_URL) and str(v or "").strip().startswith(
+            "http"
+        ):
             st.markdown(f"**{k}**")
             st.image(str(v).strip(), use_container_width=True)
         else:
