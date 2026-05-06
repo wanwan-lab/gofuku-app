@@ -251,6 +251,10 @@ STOCKTAKE_CAND_PAGE_SIZE = 5
 STOCKTAKE_CAND_AI_MAX = 40
 # 棚卸し登録: 表記ゆれ・洋服・雑貨でも候補を拾うため既定をやや低め（無関係行はプロンプトで除外指示）
 STOCKTAKE_CAND_MIN_CONFIDENCE = 0.14
+# 棚卸しAI照合: 台帳コンテキストの最大行数（対象リスト内で上限）
+STOCKTAKE_AI_CONTEXT_MAX_LINES = 2000
+# 販売管理AI照合: 台帳コンテキストの最大行数（在庫中を広く拾うため通常より大きめ）
+SALES_AI_CONTEXT_MAX_LINES = 2000
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
 STOCKTAKE_WORK_SESSION_FILENAME = "stocktake_work_session.json"
@@ -2288,6 +2292,15 @@ def _iterate_gemini_inventory_rows(
     sub = _ledger_in_stock_rows(df) if only_in_stock else df
     if sub.empty:
         return
+    # 販売・棚卸し照合（only_in_stock=True）では最新登録行を優先して
+    # コンテキストに含める。台帳件数が多い場合に新規追加行が max_lines で
+    # 切り落とされるのを防ぐ。
+    if management_ids_filter is None and only_in_stock and COL_DATETIME in sub.columns:
+        _dt = pd.to_datetime(sub[COL_DATETIME], errors="coerce")
+        sub = sub.assign(_dt_for_gemini_sort=_dt).sort_values(
+            "_dt_for_gemini_sort", ascending=False, na_position="last"
+        )
+        sub = sub.drop(columns=["_dt_for_gemini_sort"], errors="ignore")
     eff_max_lines = int(max_lines)
     if management_ids_filter is not None:
         filt = {str(x).strip() for x in management_ids_filter if str(x).strip()}
@@ -6252,8 +6265,14 @@ def render_stocktake_scan_tab(
         elif df_ledger_hint is None or df_ledger_hint.empty:
             st.session_state["_stocktake_scan_warn"] = "台帳を読み込めないため照合できません。"
         else:
+            n_scope_st = len(st_rem_run or [])
+            max_lines_st_ctx = min(
+                STOCKTAKE_AI_CONTEXT_MAX_LINES,
+                max(400, n_scope_st + 20),
+            )
             inv_ctx_st = _build_gemini_inventory_context(
                 df_ledger_hint,
+                max_lines=max_lines_st_ctx,
                 only_in_stock=True,
                 management_ids_filter=st_rem_run,
             )
@@ -7033,8 +7052,15 @@ def _render_sales_management_tab(
     if do_match and uploaded is not None:
         inv_ctx_sale = ""
         if df_ledger_hint is not None and not df_ledger_hint.empty:
+            n_in_stock_ctx = int(_mask_ledger_in_stock(df_ledger_hint).sum())
+            max_lines_sale_ctx = min(
+                SALES_AI_CONTEXT_MAX_LINES,
+                max(400, n_in_stock_ctx + 20),
+            )
             inv_ctx_sale = _build_gemini_inventory_context(
-                df_ledger_hint, only_in_stock=True
+                df_ledger_hint,
+                only_in_stock=True,
+                max_lines=max_lines_sale_ctx,
             )
         if do_match and not (inv_ctx_sale or "").strip():
             st.warning(
