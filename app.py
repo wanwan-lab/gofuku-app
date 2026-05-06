@@ -1776,11 +1776,21 @@ def ensure_worksheet_header():
     try:
         first = ws.row_values(1)
         if not first or first[: len(EXPECTED_HEADERS)] != EXPECTED_HEADERS:
-            ws.update("A1", [EXPECTED_HEADERS], value_input_option="USER_ENTERED")
+            # ヘッダー差分があると追記列が右にずれて保存されるため、既存データ行も
+            # 旧ヘッダー名ベースで EXPECTED_HEADERS 順へ正規化してから書き戻す。
+            raw = ws.get_all_values()
+            values: list[list[Any]] = [EXPECTED_HEADERS]
+            if raw:
+                header0 = [("" if c is None else str(c)).strip() for c in raw[0]]
+                for rr in raw[1:]:
+                    values.append(_sheet_header_row_to_expected_list(header0, list(rr)))
+            ws.clear()
+            ws.update("A1", values, value_input_option="USER_ENTERED")
             try:
                 _apply_inventory_amount_number_formats(ws)
             except Exception:
                 pass
+            _bump_inventory_sheet_cache_bust()
         return ws
     except Exception:
         return None
@@ -2690,36 +2700,38 @@ def _inventory_row_values_for_append(
     )
     gross_cell = 0 if gp is None else _finite_int(gp, 0)
     pm = (purchase_movement or "").strip()
-    return [
-        dt_a,
-        product_name,
-        supplier,
-        qty_i,
-        line_price_excl_yen,
-        line_price_incl_yen,
-        planned_unit_cell,
-        planned_incl_cell,
-        actual_unit_cell,
-        actual_incl_cell,
-        gross_cell,
-        stt,
-        memo,
-        (inventory_category or "").strip(),
-        image_url,
-        management_id,
-        "",
-        (voucher_recorded_at or "").strip(),
-        (voucher_evidence_url or "").strip(),
-        dt_purchase,
-        pm,
-        (loan_datetime or "").strip(),
-        (dt_a if stt == STATUS_SOLD else ""),
-        (
+    row_map: dict[str, Any] = {
+        COL_DATETIME: dt_a,
+        COL_NAME: product_name,
+        COL_SUPPLIER: supplier,
+        COL_QTY: qty_i,
+        COL_PRICE_EXCL: line_price_excl_yen,
+        COL_PRICE_INCL: line_price_incl_yen,
+        COL_PLANNED_SALE: planned_unit_cell,
+        COL_PLANNED_SALE_INCL: planned_incl_cell,
+        COL_ACTUAL_SALE: actual_unit_cell,
+        COL_ACTUAL_SALE_INCL: actual_incl_cell,
+        COL_GROSS_PROFIT: gross_cell,
+        COL_STOCK_STATUS: stt,
+        COL_MEMO: memo,
+        COL_CATEGORY: (inventory_category or "").strip(),
+        COL_IMAGE_URL: image_url,
+        COL_SALE_IMAGE_URL: "",
+        COL_MANAGEMENT_ID: management_id,
+        COL_LAST_STOCKTAKE: "",
+        COL_VOUCHER_RECORDED_AT: (voucher_recorded_at or "").strip(),
+        COL_VOUCHER_EVIDENCE_URL: (voucher_evidence_url or "").strip(),
+        COL_PURCHASE_DATETIME: dt_purchase,
+        COL_PURCHASE_MOVEMENT: pm,
+        COL_LOAN_DATETIME: (loan_datetime or "").strip(),
+        COL_SALE_DATETIME: (dt_a if stt == STATUS_SOLD else ""),
+        COL_SALE_OUTBOUND_TYPE: (
             pm
             if stt == STATUS_SOLD and _movement_is_outbound(pm)
             else ("出庫（販売）" if stt == STATUS_SOLD else "")
         ),
-    ]
+    }
+    return [row_map.get(c, "") for c in EXPECTED_HEADERS]
 
 
 def _append_inventory_data_rows(rows: list[list[Any]]) -> None:
