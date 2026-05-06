@@ -6210,6 +6210,10 @@ def render_stocktake_scan_tab(
     df_ledger_hint: pd.DataFrame | None,
 ) -> None:
     """棚卸し登録: 共通アップロード画像で AI 照合 → 棚卸日の確定更新のみ。"""
+    if df_ledger_hint is not None and not df_ledger_hint.empty:
+        # 在庫追加・販売反映のあとにこのタブを開いたときも、
+        # 「今回の対象リスト」を最新の在庫中管理IDへ自動同期する。
+        _inv_stocktake_work_remaining_prune(df_ledger_hint)
     st.markdown("##### 棚卸し登録（AI 照合）")
     st_rem_scan = _inv_stocktake_work_remaining_get()
     _scan_targets_ok = st_rem_scan is not None and len(st_rem_scan) > 0
