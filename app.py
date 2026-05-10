@@ -4674,23 +4674,30 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
     mx2.metric("出庫 合計金額（税抜）", f"¥{ex_out:,}")
     mx3.metric("入庫÷ステータス在庫中（税抜比率）", ex_ratio_in)
     mx4.metric("出庫÷ステータス在庫中（税抜比率）", ex_ratio_out)
+    _gp_period: int | None = None
     if COL_GROSS_PROFIT in flt.columns:
-        gp_tot = _finite_int(
+        _gp_period = _finite_int(
             _series_to_numeric_loose(flt[COL_GROSS_PROFIT]).fillna(0).sum(), 0
         )
-        st.metric("粗利合計（税抜）", f"¥{gp_tot:,}")
+    if _gp_period is not None:
+        st.metric("粗利合計（税抜）", f"¥{_gp_period:,}")
     else:
         st.metric("粗利合計（税抜）", "—")
 
     st.markdown("##### 期間内の金額（仕入ベース・税込）")
     st.caption(
         f"比率の分母は、フィルタ後の **{STATUS_IN_STOCK}** 行の **{COL_PRICE_INCL}**（仕入・税込）の合計です。"
+        "粗利は台帳の **税抜** 列の期間合計です（上の税抜ブロックと同一値）。"
     )
     mi1, mi2, mi3, mi4 = st.columns(4)
     mi1.metric("入庫 合計金額（税込）", f"¥{in_in:,}")
     mi2.metric("出庫 合計金額（税込）", f"¥{in_out:,}")
     mi3.metric("入庫÷ステータス在庫中（税込比率）", in_ratio_in)
     mi4.metric("出庫÷ステータス在庫中（税込比率）", in_ratio_out)
+    if _gp_period is not None:
+        st.metric("粗利合計（税抜）", f"¥{_gp_period:,}")
+    else:
+        st.metric("粗利合計（税抜）", "—")
 
     st.markdown("##### 仕入先・取引先別サマリー（税抜金額・数量・粗利）")
     sup_col = "仕入先・取引先"
