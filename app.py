@@ -773,10 +773,12 @@ def _apply_gemini_sale_link_to_session(
     *,
     fill_product_preview_fields: bool = True,
     restrict_to_sold: bool = False,
+    restrict_to_float_loan_outbound: bool = False,
 ) -> None:
     """販売管理の「販売する管理ID」欄へ、写真照合で得た管理IDを session_state に反映する。
 
     ``restrict_to_sold=True`` … **販売済** の行のみ有効（出庫（返品）の写真照合用）。
+    ``restrict_to_float_loan_outbound=True`` … **在庫中かつ出庫種別が出庫（浮貸）** の行のみ（出庫（戻入）の写真照合用）。
     """
     st.session_state.pop("_sale_link_management_id", None)
     st.session_state.pop("_sale_link_warn", None)
@@ -812,7 +814,8 @@ def _apply_gemini_sale_link_to_session(
             df_ledger,
             pn0,
             su0,
-            only_in_stock=not restrict_to_sold,
+            only_float_loan_outbound=restrict_to_float_loan_outbound,
+            only_in_stock=not restrict_to_sold and not restrict_to_float_loan_outbound,
             only_sold=restrict_to_sold,
             limit=14,
         )
@@ -835,14 +838,19 @@ def _apply_gemini_sale_link_to_session(
         and COL_MANAGEMENT_ID in df_ledger.columns
     ):
         mask_mid = df_ledger[COL_MANAGEMENT_ID].astype(str).str.strip() == mid
-        hits_ok = df_ledger.loc[
-            mask_mid
-            & (
-                _mask_ledger_sold(df_ledger)
-                if restrict_to_sold
-                else _mask_ledger_in_stock(df_ledger)
-            )
-        ]
+        if restrict_to_float_loan_outbound:
+            hits_ok = df_ledger.loc[
+                mask_mid & _mask_ledger_in_stock_outbound_float_loan(df_ledger)
+            ]
+        else:
+            hits_ok = df_ledger.loc[
+                mask_mid
+                & (
+                    _mask_ledger_sold(df_ledger)
+                    if restrict_to_sold
+                    else _mask_ledger_in_stock(df_ledger)
+                )
+            ]
         if len(hits_ok) == 1:
             row_hit = hits_ok.iloc[0]
     if not mid:
@@ -860,7 +868,11 @@ def _apply_gemini_sale_link_to_session(
                 stt_bad = _normalize_stock_status(
                     str(hits_any.iloc[0].get(COL_STOCK_STATUS, ""))
                 )
-                need = "販売済" if restrict_to_sold else "在庫中"
+                need = (
+                    "出庫種別が出庫（浮貸）の在庫中"
+                    if restrict_to_float_loan_outbound
+                    else ("販売済" if restrict_to_sold else "在庫中")
+                )
                 st.session_state["_sale_link_warn"] = (
                     f"管理ID {mid} は「{stt_bad}」のためこの出庫区分では使えません。"
                     f"照合対象は **{need}** の行のみです。"
@@ -1064,6 +1076,34 @@ JSON だけを返してください（説明文・コードフェンス禁止）
   - "supplier" (string): その行の仕入先（参考）
   - "line_price_excl" (null のみ): API に仕入金額は渡していないため **必ず null**
   - "feature_observation" (string): 現在画像で確認できた特徴の補足。なければ ""
+
+該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
+        response = model.generate_content([prompt, subject])
+        return response.text or ""
+
+    if prompt_mode == "sale_link_float_loan":
+        if not inv_stripped:
+            raise ValueError(
+                "戻入の写真照合には、台帳に **在庫中かつ出庫種別が出庫（浮貸）** の行が少なくとも1行必要です。"
+                "該当がない場合や **管理ID** が空の行しかない場合は使えません。"
+            )
+        prompt = f"""**直後の画像** は、**出庫（戻入）でどの在庫行に対応するか** を特定するための商品写真です（浮貸からの戻しを紐付けるため）。
+{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
+
+次の **続きのテキスト** のリストは台帳のうち **在庫中** であり、かつ **出庫種別** が **出庫（浮貸）** の行だけです（それ以外の在庫行・販売済は含みません）。**行の選定に金額の一致は使わない。** 必ずこのリストの中からだけ management_id を選べ。
+各行の「商品名」「仕入先・取引先」の一致度を優先し、画像全体の見た目で同一商品かを判断する。
+JSON だけを返してください（説明文・コードフェンス禁止）。
+---
+{inv_stripped}
+
+返却形式（キーは次のみ）:
+- "match" (object): 必須。フィールド:
+  - "management_id" (string): 選んだ行の管理ID（G########）。該当なしなら ""
+  - "confidence" (number): 0.0〜1.0
+  - "product_name" (string): その行の商品名（参考）
+  - "supplier" (string): その行の仕入先（参考）
+  - "line_price_excl" (null のみ): API に仕入金額は渡していないため **必ず null**
+  - "feature_observation" (string): 現在画像で確認できた特徴の補足（メモ追記用）。なければ ""
 
 該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
         response = model.generate_content([prompt, subject])
@@ -2053,6 +2093,17 @@ def _mask_ledger_sold(df: pd.DataFrame) -> pd.Series:
     )
 
 
+def _mask_ledger_in_stock_outbound_float_loan(df: pd.DataFrame) -> pd.Series:
+    """在庫中かつ **出庫種別** が **出庫（浮貸）** の行（出庫（戻入）の検索・候補用）。"""
+    if COL_STOCK_STATUS not in df.columns:
+        return pd.Series(False, index=df.index)
+    m_in = _mask_ledger_in_stock(df)
+    if COL_SALE_OUTBOUND_TYPE not in df.columns:
+        return pd.Series(False, index=df.index)
+    ot = df[COL_SALE_OUTBOUND_TYPE].astype(str).str.strip()
+    return m_in & (ot == "出庫（浮貸）")
+
+
 def _mask_ledger_stocktake_unverified(df: pd.DataFrame) -> pd.Series:
     """在庫中かつ棚卸日が空または解釈不能な行。"""
     m_in = _mask_ledger_in_stock(df)
@@ -2415,6 +2466,13 @@ def _ledger_in_stock_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[_mask_ledger_in_stock(df)].copy()
 
 
+def _ledger_in_stock_outbound_float_loan_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """在庫中かつ出庫種別が出庫（浮貸）の行のみ。"""
+    if df.empty:
+        return df.iloc[:0].copy()
+    return df.loc[_mask_ledger_in_stock_outbound_float_loan(df)].copy()
+
+
 def _ledger_sold_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or COL_STOCK_STATUS not in df.columns:
         return df.iloc[:0].copy()
@@ -2428,6 +2486,7 @@ def _iterate_gemini_inventory_rows(
     only_in_stock: bool = True,
     only_sold: bool = False,
     management_ids_filter: set[str] | None = None,
+    sale_outbound_type_eq: str | None = None,
 ) -> Iterator[pd.Series]:
     """`_build_gemini_inventory_context` と同一の順序・終了条件でイテレート（参照画像収集用）。"""
     if df.empty:
@@ -2438,6 +2497,13 @@ def _iterate_gemini_inventory_rows(
         sub = _ledger_in_stock_rows(df)
     else:
         sub = df
+    _eq = (sale_outbound_type_eq or "").strip()
+    if _eq:
+        if COL_SALE_OUTBOUND_TYPE not in sub.columns:
+            return
+        sub = sub.loc[
+            sub[COL_SALE_OUTBOUND_TYPE].astype(str).str.strip() == _eq
+        ].copy()
     if sub.empty:
         return
     # 販売・棚卸し照合（在庫中のみ）では最新登録行を優先して
@@ -2505,6 +2571,7 @@ def _build_gemini_inventory_context(
     only_in_stock: bool = True,
     only_sold: bool = False,
     management_ids_filter: set[str] | None = None,
+    sale_outbound_type_eq: str | None = None,
 ) -> str:
     """台帳行を短い箇条書きにし、画像照合用プロンプトへ埋め込む（**金額・原価・メモ等は送らない**）。
 
@@ -2512,6 +2579,7 @@ def _build_gemini_inventory_context(
     ``only_sold=True`` … **販売済** のみ（出庫（返品）の写真照合用）。``only_in_stock`` と同時には使わない。
     ``only_in_stock=False`` … 登録画面の AI 解析用（在庫中・販売済など全行を最大 max_lines 件）。
     ``management_ids_filter`` … 指定時はその管理 ID に含まれる行だけ（棚卸し「今回の残リスト」向け）。
+    ``sale_outbound_type_eq`` … 指定時は **出庫種別** がその文字列と一致する行に限定（出庫（戻入）の **出庫（浮貸）** 絞り込み等）。
     **管理IDが空の行はスキップ** し、行数上限を無駄に使わない。
     """
     lines: list[str] = []
@@ -2521,6 +2589,7 @@ def _build_gemini_inventory_context(
         only_in_stock=only_in_stock and not only_sold,
         only_sold=only_sold,
         management_ids_filter=management_ids_filter,
+        sale_outbound_type_eq=sale_outbound_type_eq,
     ):
         lines.append(_inventory_line_text_for_gemini_prompt(row))
     return "\n".join(lines)
@@ -2582,12 +2651,15 @@ def _single_row_fuzzy_ledger_match(
     *,
     only_in_stock: bool = False,
     only_sold: bool = False,
+    only_float_loan_outbound: bool = False,
     limit: int = 12,
 ) -> pd.Series | None:
     """商品名・仕入先の近い台帳行が **1件に一意に** 定まるときだけその行を返す（AI の match 補完用）。"""
     if df is None or df.empty:
         return None
-    if only_sold:
+    if only_float_loan_outbound:
+        base = _ledger_in_stock_outbound_float_loan_rows(df)
+    elif only_sold:
         base = _ledger_sold_rows(df)
     elif only_in_stock:
         base = _ledger_in_stock_rows(df)
@@ -3170,6 +3242,7 @@ def _render_ledger_pick_assist_three_columns(
     on_pick_management_id: Any,
     empty_message: str = "台帳が空か読み込めないため、入力補助の候補は表示できません。",
     sales_restrict_to_sold: bool = False,
+    sales_restrict_to_float_loan_outbound: bool = False,
 ) -> None:
     """商品名／仕入先／カテゴリー／管理IDの絞り込みと台帳プルダウン（仕入・販売・棚卸で共用）。"""
     if df is None or df.empty:
@@ -3179,11 +3252,13 @@ def _render_ledger_pick_assist_three_columns(
     st.caption(body_caption)
     df_mid_scope = df
     if key_prefix == "sales_" and COL_MANAGEMENT_ID in df.columns:
-        df_mid_scope = (
-            df.loc[_mask_ledger_sold(df)]
-            if sales_restrict_to_sold
-            else df.loc[_mask_ledger_in_stock(df)]
-        )
+        if sales_restrict_to_sold:
+            df_mid_scope = df.loc[_mask_ledger_sold(df)]
+        elif sales_restrict_to_float_loan_outbound:
+            df_mid_scope = df.loc[_mask_ledger_in_stock_outbound_float_loan(df)]
+        else:
+            df_mid_scope = df.loc[_mask_ledger_in_stock(df)]
+    df_opts = df_mid_scope if key_prefix == "sales_" else df
     hc1, hc2 = st.columns(2)
     with hc1:
         st.text_input(
@@ -3195,7 +3270,7 @@ def _render_ledger_pick_assist_three_columns(
         if st.session_state.get(k["seen_fp"], "") != fp:
             st.session_state[k["seen_fp"]] = fp
             st.session_state[k["pick_p"]] = LEDGER_PICK_PLACEHOLDER
-        opts_p = _ledger_unique_col_values(df, COL_NAME)
+        opts_p = _ledger_unique_col_values(df_opts, COL_NAME)
         if fp.casefold():
             q = fp.casefold()
             opts_p = [x for x in opts_p if q in x.casefold()][:400]
@@ -3215,7 +3290,7 @@ def _render_ledger_pick_assist_three_columns(
         if st.session_state.get(k["seen_fs"], "") != fs:
             st.session_state[k["seen_fs"]] = fs
             st.session_state[k["pick_s"]] = LEDGER_PICK_PLACEHOLDER
-        opts_s = _ledger_unique_col_values(df, COL_SUPPLIER)
+        opts_s = _ledger_unique_col_values(df_opts, COL_SUPPLIER)
         if fs.casefold():
             q = fs.casefold()
             opts_s = [x for x in opts_s if q in x.casefold()][:400]
@@ -3238,7 +3313,7 @@ def _render_ledger_pick_assist_three_columns(
             if st.session_state.get(k["seen_fc"], "") != fc:
                 st.session_state[k["seen_fc"]] = fc
                 st.session_state[k["pick_c"]] = LEDGER_PICK_PLACEHOLDER
-            opts_c = _ledger_unique_col_values(df, COL_CATEGORY)
+            opts_c = _ledger_unique_col_values(df_opts, COL_CATEGORY)
             if fc.casefold():
                 q = fc.casefold()
                 opts_c = [x for x in opts_c if q in x.casefold()][:400]
@@ -3254,15 +3329,19 @@ def _render_ledger_pick_assist_three_columns(
         if COL_MANAGEMENT_ID not in df.columns:
             st.caption("台帳に管理ID列がありません。")
         elif df_mid_scope is None or df_mid_scope.empty:
-            st.caption(
-                "販売済で **管理ID** のある行がありません。"
-                if key_prefix == "sales_" and sales_restrict_to_sold
-                else (
-                    "在庫中で **管理ID** のある行がありません（すべて販売済みの可能性があります）。"
-                    if key_prefix == "sales_"
-                    else "管理IDが付いた対象行がありません。"
+            if key_prefix == "sales_" and sales_restrict_to_sold:
+                _mid_empty_msg = "販売済で **管理ID** のある行がありません。"
+            elif key_prefix == "sales_" and sales_restrict_to_float_loan_outbound:
+                _mid_empty_msg = (
+                    "在庫中かつ **出庫種別** が **出庫（浮貸）** で **管理ID** のある行がありません。"
                 )
-            )
+            elif key_prefix == "sales_":
+                _mid_empty_msg = (
+                    "在庫中で **管理ID** のある行がありません（すべて販売済みの可能性があります）。"
+                )
+            else:
+                _mid_empty_msg = "管理IDが付いた対象行がありません。"
+            st.caption(_mid_empty_msg)
         else:
             st.text_input(
                 "管理IDの絞り込み（部分一致）",
@@ -3291,7 +3370,11 @@ def _render_ledger_pick_assist_three_columns(
                     (
                         "入力補助：販売済の管理IDから選ぶ"
                         if sales_restrict_to_sold
-                        else "入力補助：在庫中の管理IDから選ぶ"
+                        else (
+                            "入力補助：出庫（浮貸）の在庫の管理IDから選ぶ"
+                            if sales_restrict_to_float_loan_outbound
+                            else "入力補助：在庫中の管理IDから選ぶ"
+                        )
                     )
                     if key_prefix == "sales_"
                     else "入力補助：対象リストの管理IDから選ぶ"
@@ -3325,7 +3408,7 @@ def _stocktake_assist_scope_dataframe(
 def _sales_rows_matching_assist_buffers() -> tuple[pd.DataFrame, list[str]]:
     """販売用: 入力補助バッファに一致する台帳行と管理 ID 一覧。
 
-    **出庫（返品）** のときは **販売済** の行のみ対象。それ以外は **在庫中**。
+    **出庫（返品）** のときは **販売済** の行のみ。**出庫（戻入）** のときは **在庫中かつ出庫種別が出庫（浮貸）** の行のみ。それ以外は **在庫中**。
     """
     try:
         df = load_inventory_dataframe()
@@ -3337,11 +3420,16 @@ def _sales_rows_matching_assist_buffers() -> tuple[pd.DataFrame, list[str]]:
         str(st.session_state.get("sales_tab_outbound_kind", "") or "").strip()
         == "出庫（返品）"
     )
-    sub = (
-        df.loc[_mask_ledger_sold(df)]
-        if _sold_scope
-        else df.loc[_mask_ledger_in_stock(df)]
+    _receipt_scope = (
+        str(st.session_state.get("sales_tab_outbound_kind", "") or "").strip()
+        == "出庫（戻入）"
     )
+    if _sold_scope:
+        sub = df.loc[_mask_ledger_sold(df)]
+    elif _receipt_scope:
+        sub = df.loc[_mask_ledger_in_stock_outbound_float_loan(df)]
+    else:
+        sub = df.loc[_mask_ledger_in_stock(df)]
     pn = str(st.session_state.get("sales_assist_buf_product_name", "") or "").strip()
     su = str(st.session_state.get("sales_assist_buf_supplier", "") or "").strip()
     cat = str(st.session_state.get("sales_assist_buf_inventory_category", "") or "").strip()
@@ -3403,7 +3491,7 @@ def _on_sales_assist_pick_management_id() -> None:
 
 
 def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None:
-    """販売タブ・入力補助バッファから在庫中（または返品時は販売済）の近い行を一覧用に格納する。"""
+    """販売タブ・入力補助バッファから近い行を一覧用に格納する（返品＝販売済、戻入＝出庫浮貸の在庫中、他＝在庫中）。"""
     if df_hint is None or df_hint.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
         return
@@ -3413,11 +3501,16 @@ def _refresh_sales_assist_quick_candidates(df_hint: pd.DataFrame | None) -> None
         str(st.session_state.get("sales_tab_outbound_kind", "") or "").strip()
         == "出庫（返品）"
     )
-    sub = (
-        df_hint.loc[_mask_ledger_sold(df_hint)]
-        if _sold_scope
-        else df_hint.loc[_mask_ledger_in_stock(df_hint)]
+    _receipt_scope = (
+        str(st.session_state.get("sales_tab_outbound_kind", "") or "").strip()
+        == "出庫（戻入）"
     )
+    if _sold_scope:
+        sub = df_hint.loc[_mask_ledger_sold(df_hint)]
+    elif _receipt_scope:
+        sub = df_hint.loc[_mask_ledger_in_stock_outbound_float_loan(df_hint)]
+    else:
+        sub = df_hint.loc[_mask_ledger_in_stock(df_hint)]
     if sub.empty:
         st.session_state.pop("sales_assist_quick_candidates", None)
         return
@@ -3531,6 +3624,18 @@ def _ledger_sold_management_ids(df: pd.DataFrame, *, max_n: int = 600) -> list[s
     if df is None or df.empty or COL_MANAGEMENT_ID not in df.columns:
         return []
     sub = df.loc[_mask_ledger_sold(df)]
+    s = sub[COL_MANAGEMENT_ID].astype(str).str.strip()
+    s = s[s != ""]
+    return sorted(set(s.tolist()), key=lambda x: (x.casefold(), x))[:max_n]
+
+
+def _ledger_in_stock_outbound_float_loan_management_ids(
+    df: pd.DataFrame, *, max_n: int = 600
+) -> list[str]:
+    """在庫中かつ出庫種別が出庫（浮貸）の管理ID一覧（出庫（戻入）のプルダウン用）。"""
+    if df is None or df.empty or COL_MANAGEMENT_ID not in df.columns:
+        return []
+    sub = df.loc[_mask_ledger_in_stock_outbound_float_loan(df)]
     s = sub[COL_MANAGEMENT_ID].astype(str).str.strip()
     s = s[s != ""]
     return sorted(set(s.tolist()), key=lambda x: (x.casefold(), x))[:max_n]
@@ -5665,18 +5770,23 @@ def _sales_photo_match_card_hits_from_result(
     df_ledger: pd.DataFrame | None,
     *,
     sold_rows_only: bool = False,
+    float_loan_outbound_only: bool = False,
 ) -> list[dict[str, Any]]:
     """写真照合 JSON と台帳から、カード候補（全件）を組み立てる。
 
     ``sold_rows_only=True`` … **販売済** の行のみ（出庫（返品）の写真照合用）。
+    ``float_loan_outbound_only=True`` … **在庫中かつ出庫種別が出庫（浮貸）** のみ（出庫（戻入）の写真照合用）。
     """
     if df_ledger is None or df_ledger.empty:
         return []
-    sub = (
-        df_ledger.loc[_mask_ledger_sold(df_ledger)]
-        if sold_rows_only
-        else df_ledger.loc[_mask_ledger_in_stock(df_ledger)]
-    )
+    if float_loan_outbound_only:
+        sub = df_ledger.loc[_mask_ledger_in_stock_outbound_float_loan(df_ledger)]
+    else:
+        sub = (
+            df_ledger.loc[_mask_ledger_sold(df_ledger)]
+            if sold_rows_only
+            else df_ledger.loc[_mask_ledger_in_stock(df_ledger)]
+        )
     if sub.empty:
         return []
     m = result.get("match")
@@ -7549,6 +7659,20 @@ def _render_sales_management_tab(
                     only_sold=True,
                     max_lines=max_lines_sale_ctx,
                 )
+            elif _receipt_flow:
+                n_ctx = int(
+                    _mask_ledger_in_stock_outbound_float_loan(df_ledger_hint).sum()
+                )
+                max_lines_sale_ctx = min(
+                    SALES_AI_CONTEXT_MAX_LINES,
+                    max(400, n_ctx + 20),
+                )
+                inv_ctx_sale = _build_gemini_inventory_context(
+                    df_ledger_hint,
+                    only_in_stock=True,
+                    max_lines=max_lines_sale_ctx,
+                    sale_outbound_type_eq="出庫（浮貸）",
+                )
             else:
                 n_in_stock_ctx = int(_mask_ledger_in_stock(df_ledger_hint).sum())
                 max_lines_sale_ctx = min(
@@ -7567,6 +7691,12 @@ def _render_sales_management_tab(
                     "該当がない場合や **管理ID** が空の行しかない場合はリストを作れません。"
                     "ページ先頭の台帳読み込みエラーが出ていないかも確認してください。"
                 )
+            elif _receipt_flow:
+                st.warning(
+                    "戻入の写真照合には、台帳に **在庫中かつ出庫種別が出庫（浮貸）** の行が少なくとも1行必要です。"
+                    "該当がない場合や **管理ID** が空の行しかない場合はリストを作れません。"
+                    "ページ先頭の台帳読み込みエラーが出ていないかも確認してください。"
+                )
             else:
                 st.warning(
                     "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です。"
@@ -7577,14 +7707,26 @@ def _render_sales_management_tab(
             _spin_msg = (
                 "画像を解析して返品対象を照合しています…"
                 if _return_flow
-                else "画像を解析して販売元を照合しています…"
+                else (
+                    "画像を解析して戻入対象を照合しています…"
+                    if _receipt_flow
+                    else "画像を解析して販売元を照合しています…"
+                )
             )
             with st.spinner(_spin_msg):
                 try:
                     raw_text = analyze_image_with_gemini(
                         uploaded,
                         inventory_context=inv_ctx_sale or None,
-                        prompt_mode="sale_link_sold" if _return_flow else "sale_link",
+                        prompt_mode=(
+                            "sale_link_sold"
+                            if _return_flow
+                            else (
+                                "sale_link_float_loan"
+                                if _receipt_flow
+                                else "sale_link"
+                            )
+                        ),
                     )
                     result = _parse_json_from_model(raw_text or "")
                     _apply_gemini_sale_link_to_session(
@@ -7592,11 +7734,13 @@ def _render_sales_management_tab(
                         df_ledger_hint,
                         fill_product_preview_fields=False,
                         restrict_to_sold=_return_flow,
+                        restrict_to_float_loan_outbound=_receipt_flow,
                     )
                     _pm_cards = _sales_photo_match_card_hits_from_result(
                         result,
                         df_ledger_hint,
                         sold_rows_only=_return_flow,
+                        float_loan_outbound_only=_receipt_flow,
                     )
                     if _pm_cards:
                         st.session_state["_sales_photo_match_card_hits"] = _pm_cards
@@ -7623,11 +7767,14 @@ def _render_sales_management_tab(
 
     _sale_id_opts: list[str] = []
     if df_ledger_hint is not None and not df_ledger_hint.empty:
-        _sale_id_opts = (
-            _ledger_sold_management_ids(df_ledger_hint)
-            if _return_flow
-            else _ledger_in_stock_management_ids(df_ledger_hint)
-        )
+        if _return_flow:
+            _sale_id_opts = _ledger_sold_management_ids(df_ledger_hint)
+        elif _receipt_flow:
+            _sale_id_opts = _ledger_in_stock_outbound_float_loan_management_ids(
+                df_ledger_hint
+            )
+        else:
+            _sale_id_opts = _ledger_in_stock_management_ids(df_ledger_hint)
     _sale_pick_mode = st.radio(
         "販売対象の選択",
         ("1件選択", "複数選択（一括反映）"),
@@ -7640,7 +7787,11 @@ def _render_sales_management_tab(
                 (
                     "販売済の管理ID（すぐ選ぶ）"
                     if _return_flow
-                    else "在庫中の管理ID（すぐ選ぶ）"
+                    else (
+                        "出庫（浮貸）の在庫の管理ID（すぐ選ぶ）"
+                        if _receipt_flow
+                        else "在庫中の管理ID（すぐ選ぶ）"
+                    )
                 ),
                 options=[LEDGER_PICK_PLACEHOLDER] + _sale_id_opts,
                 key="sale_pick_source_id",
@@ -7654,8 +7805,15 @@ def _render_sales_management_tab(
                 "AI の商品名・仕入先・管理IDと表記が近い **販売済** の行です。"
                 "**この候補を販売元にする** でその管理IDへ切り替えられます。"
                 if _return_flow
-                else "AI の商品名・仕入先・管理IDと表記が近い **在庫中** の行です。"
-                "**この候補を販売元にする** でその管理IDへ切り替えられます。"
+                else (
+                    "AI の商品名・仕入先・管理IDと表記が近い、**在庫中かつ出庫種別が出庫（浮貸）** の行です。"
+                    "**この候補を販売元にする** でその管理IDへ切り替えられます。"
+                    if _receipt_flow
+                    else (
+                        "AI の商品名・仕入先・管理IDと表記が近い **在庫中** の行です。"
+                        "**この候補を販売元にする** でその管理IDへ切り替えられます。"
+                    )
+                )
             )
         )
         _spm_mids = [str(h.get("management_id") or "").strip() for h in _spm_hits]
@@ -7743,6 +7901,7 @@ def _render_sales_management_tab(
             df_ledger_hint,
             key_prefix="sales_",
             sales_restrict_to_sold=_return_flow,
+            sales_restrict_to_float_loan_outbound=_receipt_flow,
             body_caption=(
                 (
                     "仕入タブと同様に、商品名・仕入先・在庫カテゴリー・**管理ID** を選べます。"
@@ -7751,9 +7910,17 @@ def _render_sales_management_tab(
                 )
                 if _return_flow
                 else (
-                    "仕入タブと同様に、商品名・仕入先・在庫カテゴリー・**管理ID** を、文字での絞り込みまたはプルダウンから選べます。"
-                    "**在庫中** に限定した上でフィルタを **AND** した結果がちょうど1件のときのみ、自動で "
-                    "**販売する管理ID** に反映します。その他は下のカードから選ぶか手入力してください。"
+                    (
+                        "仕入タブと同様に、商品名・仕入先・在庫カテゴリー・**管理ID** を、文字での絞り込みまたはプルダウンから選べます。"
+                        "**在庫中かつ出庫種別が出庫（浮貸）** に限定した上でフィルタを **AND** した結果がちょうど1件のときのみ、自動で "
+                        "**販売する管理ID** に反映します。その他は下のカードから選ぶか手入力してください。"
+                    )
+                    if _receipt_flow
+                    else (
+                        "仕入タブと同様に、商品名・仕入先・在庫カテゴリー・**管理ID** を、文字での絞り込みまたはプルダウンから選べます。"
+                        "**在庫中** に限定した上でフィルタを **AND** した結果がちょうど1件のときのみ、自動で "
+                        "**販売する管理ID** に反映します。その他は下のカードから選ぶか手入力してください。"
+                    )
                 )
             ),
             on_pick_product_name=_on_sales_assist_pick_product_name,
@@ -7763,7 +7930,15 @@ def _render_sales_management_tab(
         )
         nm = int(st.session_state.get("sales_assist_last_n_matching_mids", 0) or 0)
         if nm > 1:
-            _scope_lbl = "販売済" if _return_flow else "在庫中"
+            _scope_lbl = (
+                "販売済"
+                if _return_flow
+                else (
+                    "出庫種別が出庫（浮貸）の在庫中"
+                    if _receipt_flow
+                    else "在庫中"
+                )
+            )
             st.info(
                 f"補助条件に一致する **{_scope_lbl}** が **{nm}** 件あります。"
                 "一致が1件だけのときだけ **販売する管理ID** が自動入力されます。それ以外は一覧か手入力で特定してください。"
@@ -7785,9 +7960,17 @@ def _render_sales_management_tab(
                 )
                 if _return_flow
                 else (
-                    "入力補助で確定した項目と表記が近い **在庫中** を表示します。"
-                    "上の **販売対象の選択** が **複数選択** のときは、AI 写真照合と同様に一覧・ボタンで **販売する管理ID** に追加できます。"
-                    "カードの **この候補を販売元にする** は選択に追加（既存のIDは残します）。"
+                    (
+                        "入力補助で確定した項目と表記が近い、**在庫中かつ出庫種別が出庫（浮貸）** の行を表示します。"
+                        "上の **販売対象の選択** が **複数選択** のときは、AI 写真照合と同様に一覧・ボタンで **販売する管理ID** に追加できます。"
+                        "カードの **この候補を販売元にする** は選択に追加（既存のIDは残します）。"
+                    )
+                    if _receipt_flow
+                    else (
+                        "入力補助で確定した項目と表記が近い **在庫中** を表示します。"
+                        "上の **販売対象の選択** が **複数選択** のときは、AI 写真照合と同様に一覧・ボタンで **販売する管理ID** に追加できます。"
+                        "カードの **この候補を販売元にする** は選択に追加（既存のIDは残します）。"
+                    )
                 )
             )
             _s_hits = [_sale_card_hit_from_series(row) for _, row in _sac.iterrows()]
