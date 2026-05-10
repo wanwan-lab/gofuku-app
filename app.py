@@ -61,6 +61,7 @@ from __future__ import annotations
 import contextlib
 import base64
 import difflib
+import hashlib
 import io
 import json
 import math
@@ -233,6 +234,10 @@ DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS = 300
 
 # --- 画像アップロード前処理 ---
 UPLOAD_JPEG_MAX_LONG_EDGE = 1280
+# Gemini 画像解析・写真照合API向け（トークン削減・コスト最適化）
+GEMINI_ANALYSIS_MAX_LONG_EDGE = 1024
+GEMINI_ANALYSIS_JPEG_QUALITY = 78
+GEMINI_IMAGE_ANALYSIS_CACHE_ENTRIES = 128
 UPLOAD_JPEG_QUALITY = 80
 # 仕入れ登録タブから Drive へ保存する商品写真（長辺・品質）
 PURCHASE_DRIVE_JPEG_MAX_LONG_EDGE = 2000
@@ -253,8 +258,13 @@ STOCKTAKE_CAND_AI_MAX = 40
 STOCKTAKE_CAND_MIN_CONFIDENCE = 0.14
 # 棚卸しAI照合: 台帳コンテキストの最大行数（対象リスト内で上限）
 STOCKTAKE_AI_CONTEXT_MAX_LINES = 2000
+# 一括棚卸の台帳保存を分割（API タイムアウト・行数制限の回避）
+STOCKTAKE_SHEET_SAVE_MAX_IDS = 40
 # 販売管理AI照合: 台帳コンテキストの最大行数（在庫中を広く拾うため通常より大きめ）
 SALES_AI_CONTEXT_MAX_LINES = 2000
+# 棚卸 multiselect: ボタンで値を変えるときウィジェットキーと競合しないよう pending キーに取り直す
+_PENDING_STOCKTAKE_ASSIST_BATCH_MIDS = "_pending_stocktake_assist_batch_mids"
+_PENDING_STOCKTAKE_MULTI_DONE_MIDS = "_pending_stocktake_multi_done_mids"
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
 STOCKTAKE_WORK_SESSION_FILENAME = "stocktake_work_session.json"
@@ -269,9 +279,9 @@ LEDGER_PICK_PLACEHOLDER = "（選ばない）"
 # 写真→台帳照合（仕入 AI・棚卸し・販売の写真紐付け）向け。和装専門店以外・雑貨・アパレルでも迷いにくくする。
 _GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA = """
 照合の考え方（業種は限定しない）:
-- 在庫は **和服に限らず** 洋服・帽子・バッグ・アクセ・雑貨・アパレル全般・一点物があり得る。写真の品がリストのどれに相当するか、**色・シルエット・素材感・ブランド表記・タグ**と台帳の **商品名・カテゴリー・メモ・仕入先** で推測する。**どの行を選ぶかの判断に、台帳の金額や写真から読める価格が一致するかは使わない。**
-- **飲料・カップ麺などパッケージにロゴや商品名が大きく写る品**は文字・形状で照合しやすい。**無包装の衣料・帽子・布小物**は似た見た目が多く判別が難しい。首元・ウエスト・内側の **ケアタグ・サイズ・品番・紙タグ・下札** が写っていれば必ず読み取り、リストの商品名・メモと突き合わせる。
-- タグが読めない衣料では、**同じ仕入先で商品名やメモの語が写真の品とかぶる行**を候補に含めてよい。**無関係な別仕入先**の行は入れない。
+- 在庫は **和服に限らず** 洋服・帽子・バッグ・アクセ・雑貨・アパレル全般・一点物があり得る。写真の品がリストのどれに相当するか、**色・シルエット・素材感・ブランド表記・タグ**と、API に渡る台帳抜粋の **管理ID・商品名・在庫カテゴリー・仕入先名（メーカー名）・在庫状態** で推測する（**メモ・金額・原価・税・連絡先は API には送らない**）。**どの行を選ぶかの判断に、台帳の金額や写真から読める価格が一致するかは使わない。**
+- **飲料・カップ麺などパッケージにロゴや商品名が大きく写る品**は文字・形状で照合しやすい。**無包装の衣料・帽子・布小物**は似た見た目が多く判別が難しい。首元・ウエスト・内側の **ケアタグ・サイズ・品番・紙タグ・下札** が写っていれば必ず読み取り、リストの **商品名** と突き合わせる。
+- タグが読めない衣料では、**同じ仕入先名で商品名の語が写真の品とかぶる行**を候補に含めてよい。**無関係な別仕入先**の行は入れない。
 - 商品名が **略称・英字・カタカナ・型番のみ** で、写真の見え方と文字が違っても同一在庫と判断できるならその management_id を選ぶ。
 - 柄は **和柄だけでなく** 無地・ストライプ・チェック・ロゴ・プリント等も手がかりにする。
 - 衣料・帽子で確信が低いときは **候補数を増やし** confidence を **0.12〜0.35** 程度まで下げてよい（明らかに無関係な行は入れない）。
@@ -854,8 +864,12 @@ def _apply_gemini_sale_link_to_session(
 
 
 def _gemini_input_image_from_upload(uploaded) -> Image.Image:
-    """解析直前に ``prepare_upload_image_jpeg`` と同じ圧縮・リサイズを適用した PIL 画像を返す。"""
-    jpeg_bytes, _ = prepare_upload_image_jpeg(uploaded.getvalue())
+    """Gemini 写真照合用に長辺を抑えた JPEG と同等の RGB PIL を返す（Drive 保存用とは解像度が異なる）。"""
+    jpeg_bytes, _ = prepare_upload_image_jpeg(
+        uploaded.getvalue(),
+        max_long_edge=GEMINI_ANALYSIS_MAX_LONG_EDGE,
+        quality=GEMINI_ANALYSIS_JPEG_QUALITY,
+    )
     return Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
 
 
@@ -874,6 +888,161 @@ def _pil_image_for_gemini(image_data: Any) -> Image.Image:
     raise TypeError(
         "image_data は PIL.Image / bytes / getvalue() を持つオブジェクトである必要があります。"
     )
+
+
+def _gemini_analysis_jpeg_bytes(image_data: Any) -> bytes:
+    """Gemini 画像解析API向けに長辺を抑えた JPEG bytes（キャッシュキー・入力兼用）。"""
+    if isinstance(image_data, (bytes, bytearray, memoryview)):
+        raw = bytes(image_data)
+    elif hasattr(image_data, "getvalue") and callable(getattr(image_data, "getvalue")):
+        raw = image_data.getvalue()
+    else:
+        pil = _pil_image_for_gemini(image_data)
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        raw = buf.getvalue()
+    return prepare_upload_image_jpeg(
+        raw,
+        max_long_edge=GEMINI_ANALYSIS_MAX_LONG_EDGE,
+        quality=GEMINI_ANALYSIS_JPEG_QUALITY,
+    )[0]
+
+
+def _gemini_image_analysis_session_key(
+    jpeg_bytes: bytes,
+    inventory_context: str,
+    prompt_mode: str,
+    model_name: str,
+) -> str:
+    jh = hashlib.sha256(jpeg_bytes).hexdigest()
+    ih = hashlib.sha256(inventory_context.encode("utf-8")).hexdigest()[:24]
+    safe_mode = re.sub(r"[^a-zA-Z0-9_.-]", "_", prompt_mode)
+    safe_model = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name)
+    return f"_gemini_imgtxt_{jh}_{ih}_{safe_mode}_{safe_model}"
+
+
+@st.cache_data(
+    max_entries=GEMINI_IMAGE_ANALYSIS_CACHE_ENTRIES,
+    show_spinner=False,
+    hash_funcs={bytes: lambda b: hashlib.sha256(b).hexdigest()},
+)
+def _cached_gemini_product_image_analysis(
+    jpeg_bytes: bytes,
+    inventory_context: str,
+    prompt_mode: str,
+    model_name: str,
+) -> str:
+    """商品写真の Gemini 解析（同一 JPEG・同一コンテキストではキャッシュヒットし API を呼ばない）。"""
+    api_key = _secret_str(SECRET_GEMINI_API_KEY)
+    if not api_key:
+        raise RuntimeError(
+            f"{SECRET_GEMINI_API_KEY} が設定されていません。`.streamlit/secrets.toml` を確認してください。"
+        )
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+    subject = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+
+    inv_stripped = (inventory_context or "").strip()
+    inv_tail_for_match = ""
+    if inv_stripped:
+        inv_tail_for_match = f"""
+次のリストは、すでに台帳にある行の抜粋です（**在庫中・販売済などステータス付き**。最大約400件。写真と同一・類似の商品がありそうなら必ず照合してください）。
+各行には **管理ID・商品名・仕入先名・在庫カテゴリー・在庫状態** のみが含まれます（**原価・税込・連絡先・メモなど機密・金額情報は API に送信していません**。台帳に数値列があっても、**行の選び方に金額の一致は使わないこと**）。
+{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
+
+{inv_stripped}
+
+照合するときは必ず "match" オブジェクトを付け、少なくとも次を含めてください:
+- "management_id" (string): 上のリストにある行の **管理ID** と完全一致する値。リストには **在庫中・販売済などすべてのステータス** が含まれます。**写真と同一・類似の台帳上の1行** に対応するときは、その行の管理IDを選ぶこと（仕入れの入力補助のため。ステータスで候補を除外しない）。該当がなければ ""
+- "product_name" (string): 台帳の商品名に合わせた確定案（推測でも可）
+- "supplier" (string): 台帳の仕入先に合わせた確定案（推測でも可）
+- "line_price_excl" (null のみ): API に仕入金額・原価は渡していないため **必ず null**
+- "inventory_category" (string): リストの照合先行に **{COL_CATEGORY}** が載っていればその行と同一の文字列。リストに無い・該当行が空なら ""
+- "confidence" (number): 0.0〜1.0 で、写真と台帳行が同一在庫である確信度
+
+同一行が見つからない場合は management_id を "" にし、confidence は 0.4 未満にしてください。
+"""
+    if prompt_mode == "stocktake_match":
+        if not inv_stripped:
+            raise ValueError(
+                "棚卸しの照合には台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
+            )
+        prompt = f"""**直後の画像** が、棚卸しのために撮影した **現物1点** です（衣料・アパレル・帽子・雑貨・一点物など **業種を限定しない** ）。
+{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
+
+次の **続きのテキスト** に示すリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定します（販売済は含みません。リスト外の管理IDは返さない）。
+同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
+**どの行が写真の品かは、金額の一致では判断しない**（商品名・在庫カテゴリー・仕入先名・タグ・色形などで推測する）。
+台帳の「商品名」「仕入先・取引先」と現在画像の見た目・文脈を基に、同一商品の可能性を評価する。
+**リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
+---
+{inv_stripped}
+
+返却形式（キーは次のみ）:
+- "stocktake_candidates" (array): 必須。各要素は object で、次のフィールドを持つ:
+  - "management_id" (string): リストにある在庫中行の管理ID（G########）
+  - "confidence" (number): 0.0〜1.0（写真と同一在庫である確信度。表示順はアプリ側で管理IDの昇順に整列する）
+  - "product_name" (string): その行の商品名（参考）
+  - "supplier" (string): その行の仕入先（参考）
+  - "feature_observation" (string): この画像で見えた特徴の補足（任意）。なければ ""
+  該当が1件も無いときは空配列 []。
+  迷う場合は複数入れてよい（confidence が低いものも列挙してよい。ただし無関係な行は入れない）。
+
+任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
+        response = model.generate_content([prompt, subject])
+        return response.text or ""
+
+    if prompt_mode == "sale_link":
+        if not inv_stripped:
+            raise ValueError(
+                "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です（管理ID・商品名などが入っている行）。"
+                "在庫がすべて販売済のときや、台帳の読み込みに失敗しているときは使えません。"
+            )
+        prompt = f"""**直後の画像** は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（衣料・アパレル・帽子・雑貨など **業種を限定しない** 在庫）。
+{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
+
+次の **続きのテキスト** のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。**行の選定に金額の一致は使わない。** 必ずこのリストの中からだけ management_id を選べ。
+各行の「商品名」「仕入先・取引先」の一致度を優先し、画像全体の見た目で同一商品かを判断する。
+JSON だけを返してください（説明文・コードフェンス禁止）。
+---
+{inv_stripped}
+
+返却形式（キーは次のみ）:
+- "match" (object): 必須。フィールド:
+  - "management_id" (string): 選んだ行の管理ID（G########）。該当なしなら ""
+  - "confidence" (number): 0.0〜1.0
+  - "product_name" (string): その行の商品名（参考）
+  - "supplier" (string): その行の仕入先（参考）
+  - "line_price_excl" (null のみ): API に仕入金額は渡していないため **必ず null**
+  - "feature_observation" (string): 現在画像で確認できた特徴の補足（メモ追記用）。なければ ""
+
+該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
+        response = model.generate_content([prompt, subject])
+        return response.text or ""
+
+    schema_intro = f"""**直後の画像** は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。この画像について次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
+説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
+
+必須キー（値の型を守ること）:
+- "product_name" (string): 商品名として適切な短い名称。不明なら ""
+- "supplier" (string): 仕入先・取引先として推測できる名称。不明なら ""
+- "quantity" (integer): 写っている点数・束の本数などの推定。最低 1
+- "inventory_category" (string): **在庫カテゴリー**（分析・構成比用の短いラベル。例: 帯、ジャケット、帽子、雑貨、飲料。業種は問わない）。20文字以内。推測できる場合は必ず入れる。本当に不明なら ""
+- "product_kind" (string): 種類の推定（例: 振袖、訪問着、帯、ニット、シャツ、キャップ、ワンピース）。不明なら ""
+- "color" (string): 色の推定。不明なら ""
+- "pattern" (string): 柄の推定。不明なら ""
+- "material" (string): 素材の推定。不明なら ""
+- "condition" (string): 状態の推定。不明なら ""
+- "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
+"""
+    schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
+  例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": null, "inventory_category": "帯", "confidence": 0.85}}
+  リストの行に **{COL_CATEGORY}** が載っているときは、照合して "match" に management_id を入れる場合 **必ず** 同じ行の値を "inventory_category" に含める。リストにカテゴリーが無いときのみ省略可。
+  **API に台帳の金額・原価は含めていない**ため、"match"."line_price_excl" は **必ず null**。
+  不要・該当なしのときは "match" キー自体を省略してもよい。"""
+    prompt = schema_intro + inv_tail_for_match + schema_footer
+    response = model.generate_content([prompt, subject])
+    return response.text or ""
 
 
 def _consumption_tax_rate_from_choice_label(label: str) -> float:
@@ -1001,117 +1170,25 @@ def analyze_image_with_gemini(
     inventory_context: str | None = None,
     prompt_mode: str = "full",
 ) -> str:
+    """商品写真の Gemini 解析。画像は長辺約1024pxのJPEGに正規化し、同一内容は ``@st.cache_data`` と session で再利用する。"""
     api_key = _secret_str(SECRET_GEMINI_API_KEY)
     if not api_key:
         raise RuntimeError(
             f"{SECRET_GEMINI_API_KEY} が設定されていません。`.streamlit/secrets.toml` を確認してください。"
         )
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(_gemini_model_name())
-    subject = _pil_image_for_gemini(image_data)
-
-    inv_stripped = (inventory_context or "").strip()
-    inv_tail_for_match = ""
-    if inv_stripped:
-        inv_tail_for_match = f"""
-次のリストは、すでに台帳にある行の抜粋です（**在庫中・販売済などステータス付き**。最大約400件。写真と同一・類似の商品がありそうなら必ず照合してください）。
-各行は **管理ID・商品名・仕入先** に加え **メモ**・**在庫カテゴリー** が付く場合があります（台帳に数値列があっても、**行の選び方に金額の一致は使わないこと**）。
-{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
-
-{inv_stripped}
-
-照合するときは必ず "match" オブジェクトを付け、少なくとも次を含めてください:
-- "management_id" (string): 上のリストにある行の **管理ID** と完全一致する値。リストには **在庫中・販売済などすべてのステータス** が含まれます。**写真と同一・類似の台帳上の1行** に対応するときは、その行の管理IDを選ぶこと（仕入れの入力補助・単価参照のため。ステータスで候補を除外しない）。該当がなければ ""
-- "product_name" (string): 台帳の商品名に合わせた確定案（推測でも可）
-- "supplier" (string): 台帳の仕入先に合わせた確定案（推測でも可）
-- "line_price_excl" (integer or null): 照合で選んだ台帳行の仕入金額（税抜）をそのまま入れる（**行の選定に写真と金額が一致するかは使わない**）。不明なら null
-- "inventory_category" (string): リストの照合先行に **{COL_CATEGORY}** が載っていればその行と同一の文字列。リストに無い・該当行が空なら ""
-- "confidence" (number): 0.0〜1.0 で、写真と台帳行が同一在庫である確信度
-
-同一行が見つからない場合は management_id を "" にし、confidence は 0.4 未満にしてください。
-"""
-    if prompt_mode == "stocktake_match":
-        if not inv_stripped:
-            raise ValueError(
-                "棚卸しの照合には台帳に在庫中の行が必要です（スプレッドシートを確認してください）。"
-            )
-        prompt = f"""**直後の画像** が、棚卸しのために撮影した **現物1点** です（衣料・アパレル・帽子・雑貨・一点物など **業種を限定しない** ）。
-{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
-
-次の **続きのテキスト** に示すリストは、**今回の棚卸作業でまだ未確認として残っている在庫中の行** に限定します（販売済は含みません。リスト外の管理IDは返さない）。
-同じ型・同シリーズ・同仕入れロットで **複数行あることが多い** ので、写真に合いそうな行を **複数** 挙げてください（最大{STOCKTAKE_CAND_AI_MAX}件。アプリでは画面を{STOCKTAKE_CAND_PAGE_SIZE}件ずつに分けて表示します）。
-**どの行が写真の品かは、金額の一致では判断しない**（商品名・メモ・カテゴリー・仕入先・タグ・色形などで推測する）。
-台帳の「商品名」「仕入先・取引先」と現在画像の見た目・文脈を基に、同一商品の可能性を評価する。
-**リストに無い管理IDは絶対に返さない** でください。JSON だけを返す（説明文・Markdown のコードフェンス禁止）。
----
-{inv_stripped}
-
-返却形式（キーは次のみ）:
-- "stocktake_candidates" (array): 必須。各要素は object で、次のフィールドを持つ:
-  - "management_id" (string): リストにある在庫中行の管理ID（G########）
-  - "confidence" (number): 0.0〜1.0（写真と同一在庫である確信度。表示順はアプリ側で管理IDの昇順に整列する）
-  - "product_name" (string): その行の商品名（参考）
-  - "supplier" (string): その行の仕入先（参考）
-  - "feature_observation" (string): この画像で見えた特徴の補足メモ。なければ ""
-  該当が1件も無いときは空配列 []。
-  迷う場合は複数入れてよい（confidence が低いものも列挙してよい。ただし無関係な行は入れない）。
-  各行に **メモ** が付いていれば、型番・色・一点物メモなどの手がかりに使う。
-
-任意で互換用に "match" (object) を1件だけ付けてもよい（先頭候補と同じ内容でよい）。"""
-        response = model.generate_content([prompt, subject])
-        return response.text or ""
-
-    if prompt_mode == "sale_link":
-        if not inv_stripped:
-            raise ValueError(
-                "販売元の写真照合には、台帳に **在庫中** の行が少なくとも1行必要です（管理ID・商品名などが入っている行）。"
-                "在庫がすべて販売済のときや、台帳の読み込みに失敗しているときは使えません。"
-            )
-        prompt = f"""**直後の画像** は、**販売時にどの在庫行に対応するか** を特定するための商品写真です（衣料・アパレル・帽子・雑貨など **業種を限定しない** 在庫）。
-{_GEMINI_LEDGER_PHOTO_MATCH_GUIDANCE_JA}
-
-次の **続きのテキスト** のリストは台帳の **在庫中** の行だけです（**販売済の行は含めていません**）。**行の選定に金額の一致は使わない。** 必ずこのリストの中からだけ management_id を選べ。
-各行の「商品名」「仕入先・取引先」の一致度を優先し、画像全体の見た目で同一商品かを判断する。
-JSON だけを返してください（説明文・コードフェンス禁止）。
----
-{inv_stripped}
-
-返却形式（キーは次のみ）:
-- "match" (object): 必須。フィールド:
-  - "management_id" (string): 選んだ行の管理ID（G########）。該当なしなら ""
-  - "confidence" (number): 0.0〜1.0
-  - "product_name" (string): その行の商品名（参考）
-  - "supplier" (string): その行の仕入先（参考）
-  - "line_price_excl" (integer or null): 選んだ行の仕入金額（税抜）を台帳どおり（**写真と金額が一致するかで行を決めない**）。不明なら null
-  - "feature_observation" (string): 現在画像で確認できた特徴の補足（メモ追記用）。なければ ""
-
-該当がなければ management_id を ""、confidence は 0.25 以下にする。"""
-        response = model.generate_content([prompt, subject])
-        return response.text or ""
-
-    schema_intro = f"""**直後の画像** は **小売・卸の在庫・売買用** の商品写真です（呉服に限らず洋服・帽子・バッグ・雑貨など）。この画像について次のキーだけを持つ JSON オブジェクトを 1 つだけ返してください。
-説明文や Markdown のコードフェンスは付けず、JSON のみを出力してください。
-
-必須キー（値の型を守ること）:
-- "product_name" (string): 商品名として適切な短い名称。不明なら ""
-- "supplier" (string): 仕入先・取引先として推測できる名称。不明なら ""
-- "quantity" (integer): 写っている点数・束の本数などの推定。最低 1
-- "inventory_category" (string): **在庫カテゴリー**（分析・構成比用の短いラベル。例: 帯、ジャケット、帽子、雑貨、飲料。業種は問わない）。20文字以内。推測できる場合は必ず入れる。本当に不明なら ""
-- "product_kind" (string): 種類の推定（例: 振袖、訪問着、帯、ニット、シャツ、キャップ、ワンピース）。不明なら ""
-- "color" (string): 色の推定。不明なら ""
-- "pattern" (string): 柄の推定。不明なら ""
-- "material" (string): 素材の推定。不明なら ""
-- "condition" (string): 状態の推定。不明なら ""
-- "unit_price_excl" (integer or null): 1点あたりの税抜の仕入金額（円）の推定。相場・品質から読めない場合は null（勝手に 1 にしない）
-"""
-    schema_footer = f"""任意: 台帳照合結果を "match" にまとめる（上記リストがあるときはできる限り付与）
-  例: {{"management_id": "G00000001", "product_name": "…", "supplier": "…", "line_price_excl": 12345, "inventory_category": "帯", "confidence": 0.85}}
-  リストの行に **{COL_CATEGORY}** が載っているときは、照合して "match" に management_id を入れる場合 **必ず** 同じ行の値を "inventory_category" に含める。リストにカテゴリーが無いときのみ省略可。
-  不要・該当なしのときは "match" キー自体を省略してもよい。"""
-    prompt = schema_intro + inv_tail_for_match + schema_footer
-    response = model.generate_content([prompt, subject])
-    return response.text or ""
-
+    jpeg_bytes = _gemini_analysis_jpeg_bytes(image_data)
+    inv_s = (inventory_context or "").strip()
+    model_name = _gemini_model_name()
+    ss_key = _gemini_image_analysis_session_key(
+        jpeg_bytes, inv_s, prompt_mode, model_name
+    )
+    if ss_key in st.session_state:
+        return st.session_state[ss_key]
+    out = _cached_gemini_product_image_analysis(
+        jpeg_bytes, inv_s, prompt_mode, model_name
+    )
+    st.session_state[ss_key] = out
+    return out
 
 def _voucher_configure_model():
     api_key = _secret_str(SECRET_GEMINI_API_KEY)
@@ -2326,6 +2403,7 @@ def _iterate_gemini_inventory_rows(
 
 
 def _inventory_line_text_for_gemini_prompt(row: pd.Series) -> str:
+    """Gemini 向け台帳1行。原価・金額・メモ・連絡先等は API に送らない（照合に不要な機密の隔離）。"""
     mid = str(row.get(COL_MANAGEMENT_ID, "") or "").strip()
     pn = str(row.get(COL_NAME, "") or "").strip().replace("\n", " ")
     su = str(row.get(COL_SUPPLIER, "") or "").strip().replace("\n", " ")
@@ -2340,18 +2418,11 @@ def _inventory_line_text_for_gemini_prompt(row: pd.Series) -> str:
             cat_seg = (
                 f" {COL_CATEGORY}={json.dumps(cat, ensure_ascii=False)}"
             )
-    memo_seg = ""
-    if COL_MEMO in row.index:
-        memo = str(row.get(COL_MEMO, "") or "").strip().replace("\n", " ")
-        if memo:
-            if len(memo) > 56:
-                memo = memo[:53] + "…"
-            memo_seg = f" メモ={json.dumps(memo, ensure_ascii=False)}"
     return (
         f"- 管理ID={json.dumps(mid, ensure_ascii=False)} "
         f"商品名={json.dumps(pn, ensure_ascii=False)} "
         f"仕入先={json.dumps(su, ensure_ascii=False)}"
-        f"{st_seg}{cat_seg}{memo_seg}"
+        f"{st_seg}{cat_seg}"
     )
 
 
@@ -2362,7 +2433,7 @@ def _build_gemini_inventory_context(
     only_in_stock: bool = True,
     management_ids_filter: set[str] | None = None,
 ) -> str:
-    """台帳行を短い箇条書きにし、画像照合用プロンプトへ埋め込む。
+    """台帳行を短い箇条書きにし、画像照合用プロンプトへ埋め込む（**金額・原価・メモ等は送らない**）。
 
     ``only_in_stock=True`` … 販売照合・棚卸し用（在庫中のみ）。
     ``only_in_stock=False`` … 登録画面の AI 解析用（在庫中・販売済など全行を最大 max_lines 件）。
@@ -3696,13 +3767,31 @@ def apply_outbound_loan_in_stock_datetime_by_management_id(
 def apply_last_stocktake_jst_for_management_ids(
     management_ids: Iterable[str],
 ) -> tuple[int, list[str]]:
-    """複数の在庫中の行について棚卸日を本日（JST）にし、1回の読込・保存で反映する。
+    """複数の在庫中の行について棚卸日を本日（JST）にし、読込・保存で反映する。
+
+    件数が多いときは分割して保存し、スプレッドシートAPIの制限・タイムアウトを避ける。
 
     戻り値: (更新に成功した件数, スキップ理由の短文リスト。重複・不在・在庫外などはスキップ)
     """
-    ids = {str(x).strip() for x in management_ids if str(x).strip()}
-    if not ids:
+    ids_sorted = sorted({str(x).strip() for x in management_ids if str(x).strip()})
+    if not ids_sorted:
         raise ValueError("管理IDが1件以上必要です。")
+    if len(ids_sorted) <= STOCKTAKE_SHEET_SAVE_MAX_IDS:
+        return _apply_last_stocktake_jst_for_management_ids_one_save(ids_sorted)
+    total_ok = 0
+    all_skips: list[str] = []
+    for i in range(0, len(ids_sorted), STOCKTAKE_SHEET_SAVE_MAX_IDS):
+        chunk = ids_sorted[i : i + STOCKTAKE_SHEET_SAVE_MAX_IDS]
+        n_ok, sk = _apply_last_stocktake_jst_for_management_ids_one_save(chunk)
+        total_ok += n_ok
+        all_skips.extend(sk)
+    return total_ok, all_skips
+
+
+def _apply_last_stocktake_jst_for_management_ids_one_save(
+    ids_sorted: list[str],
+) -> tuple[int, list[str]]:
+    ids = set(ids_sorted)
     df_src = load_inventory_dataframe()
     if df_src is None or df_src.empty:
         raise RuntimeError("台帳を読み込めませんでした。")
@@ -5221,7 +5310,7 @@ def _render_mid_pick_candidate_cards(
                             if str(x).strip()
                         }
                         _cur_m.add(mid)
-                        st.session_state["stocktake_assist_batch_mids"] = sorted(
+                        st.session_state[_PENDING_STOCKTAKE_ASSIST_BATCH_MIDS] = sorted(
                             _cur_m, key=_management_id_sort_key
                         )
                     elif pick_mode == "purchase":
@@ -6205,11 +6294,30 @@ def _stocktake_candidates_from_gemini_response(
     return out[:max_n]
 
 
+def _flush_stocktake_multiselect_pending() -> None:
+    """ボタンからの multiselect 更新を rerun 先頭で適用し、Streamlit のウィジェット状態競合を避ける。"""
+    pk = _PENDING_STOCKTAKE_ASSIST_BATCH_MIDS
+    if pk in st.session_state:
+        v = st.session_state.pop(pk)
+        if v is None:
+            st.session_state.pop("stocktake_assist_batch_mids", None)
+        else:
+            st.session_state["stocktake_assist_batch_mids"] = v
+    pk2 = _PENDING_STOCKTAKE_MULTI_DONE_MIDS
+    if pk2 in st.session_state:
+        v2 = st.session_state.pop(pk2)
+        if v2 is None:
+            st.session_state.pop("stocktake_multi_done_mids", None)
+        else:
+            st.session_state["stocktake_multi_done_mids"] = v2
+
+
 def render_stocktake_scan_tab(
     uploaded,
     df_ledger_hint: pd.DataFrame | None,
 ) -> None:
     """棚卸し登録: 共通アップロード画像で AI 照合 → 棚卸日の確定更新のみ。"""
+    _flush_stocktake_multiselect_pending()
     if df_ledger_hint is not None and not df_ledger_hint.empty:
         # 在庫追加・販売反映のあとにこのタブを開いたときも、
         # 「今回の対象リスト」を最新の在庫中管理IDへ自動同期する。
@@ -6288,9 +6396,8 @@ def render_stocktake_scan_tab(
             else:
                 with st.spinner("画像を解析して台帳と照合しています…"):
                     try:
-                        img_pil = _gemini_input_image_from_upload(uploaded)
                         raw = analyze_image_with_gemini(
-                            img_pil,
+                            uploaded,
                             inventory_context=inv_ctx_st or None,
                             prompt_mode="stocktake_match",
                         )
@@ -6434,7 +6541,7 @@ def render_stocktake_scan_tab(
                             key="stocktake_assist_sel_all",
                             disabled=not _mid_opts_a,
                         ):
-                            st.session_state["stocktake_assist_batch_mids"] = list(
+                            st.session_state[_PENDING_STOCKTAKE_ASSIST_BATCH_MIDS] = list(
                                 _mid_opts_a
                             )
                             st.rerun()
@@ -6449,13 +6556,13 @@ def render_stocktake_scan_tab(
                                 or []
                             )
                             _cur.update(page_mids_a)
-                            st.session_state["stocktake_assist_batch_mids"] = sorted(
+                            st.session_state[_PENDING_STOCKTAKE_ASSIST_BATCH_MIDS] = sorted(
                                 _cur, key=_management_id_sort_key
                             )
                             st.rerun()
                     with ba3:
                         if st.button("選択をクリア", key="stocktake_assist_clr_sel"):
-                            st.session_state["stocktake_assist_batch_mids"] = []
+                            st.session_state[_PENDING_STOCKTAKE_ASSIST_BATCH_MIDS] = None
                             st.rerun()
                     with ba4:
                         st.caption(
@@ -6486,7 +6593,7 @@ def render_stocktake_scan_tab(
                                 if str(x).strip()
                             ]
                         )
-                        st.session_state["stocktake_assist_batch_mids"] = sorted(
+                        st.session_state[_PENDING_STOCKTAKE_ASSIST_BATCH_MIDS] = sorted(
                             _cur, key=_management_id_sort_key
                         )
                         st.rerun()
@@ -6575,7 +6682,7 @@ def render_stocktake_scan_tab(
                             st.session_state.pop("_stocktake_selected_mid", None)
                             st.session_state.pop("stocktake_multi_done_mids", None)
                             st.session_state.pop("stocktake_cand_page", None)
-                            st.session_state["stocktake_assist_batch_mids"] = []
+                            st.session_state.pop("stocktake_assist_batch_mids", None)
                             st.session_state.pop("stocktake_assist_page_pick", None)
                             st.success(
                                 f"**{n_ok}** 件の棚卸日を本日（JST）に更新しました。"
@@ -6725,7 +6832,7 @@ def render_stocktake_scan_tab(
             ba1, ba2, ba3, ba4 = st.columns(4)
             with ba1:
                 if st.button("すべての候補を選択", key="stocktake_sel_all_cands"):
-                    st.session_state["stocktake_multi_done_mids"] = list(_mid_opts)
+                    st.session_state[_PENDING_STOCKTAKE_MULTI_DONE_MIDS] = list(_mid_opts)
                     st.rerun()
             with ba2:
                 _page_mids = [
@@ -6740,11 +6847,11 @@ def render_stocktake_scan_tab(
                 ):
                     _cur = set(st.session_state.get("stocktake_multi_done_mids") or [])
                     _cur.update(_page_mids)
-                    st.session_state["stocktake_multi_done_mids"] = sorted(_cur)
+                    st.session_state[_PENDING_STOCKTAKE_MULTI_DONE_MIDS] = sorted(_cur)
                     st.rerun()
             with ba3:
                 if st.button("選択をクリア", key="stocktake_clr_multi_sel"):
-                    st.session_state["stocktake_multi_done_mids"] = []
+                    st.session_state[_PENDING_STOCKTAKE_MULTI_DONE_MIDS] = None
                     st.rerun()
             with ba4:
                 st.caption(f"候補 **{n_total}** 件中、選択中 **{len(st.session_state.get('stocktake_multi_done_mids') or [])}** 件")
@@ -6772,7 +6879,7 @@ def render_stocktake_scan_tab(
                         if str(x).strip()
                     ]
                 )
-                st.session_state["stocktake_multi_done_mids"] = sorted(_cur)
+                st.session_state[_PENDING_STOCKTAKE_MULTI_DONE_MIDS] = sorted(_cur)
                 st.rerun()
             st.multiselect(
                 "一括で棚卸確定する管理ID（任意に追加・解除）",
@@ -7075,9 +7182,8 @@ def _render_sales_management_tab(
         elif do_match:
             with st.spinner("画像を解析して販売元を照合しています…"):
                 try:
-                    img = _gemini_input_image_from_upload(uploaded)
                     raw_text = analyze_image_with_gemini(
-                        img,
+                        uploaded,
                         inventory_context=inv_ctx_sale or None,
                         prompt_mode="sale_link",
                     )
@@ -7854,14 +7960,13 @@ def main():
         if analyze and uploaded is not None:
             with st.spinner("画像を解析しています…"):
                 try:
-                    img = _gemini_input_image_from_upload(uploaded)
                     inv_ctx = ""
                     if df_ledger_hint is not None and not df_ledger_hint.empty:
                         inv_ctx = _build_gemini_inventory_context(
                             df_ledger_hint, only_in_stock=False
                         )
                     raw_text = analyze_image_with_gemini(
-                        img,
+                        uploaded,
                         inventory_context=inv_ctx or None,
                     )
                     result = _parse_json_from_model(raw_text or "")
