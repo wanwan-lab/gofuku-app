@@ -4337,8 +4337,8 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     """入出庫判定・行金額・年月などの派生列を付与したコピーを返す。
 
     1点1行ライフサイクル前提: **在庫中** かつ **入庫** だけを仕入（入庫）側に計上し、
-    **販売済** かつ実売がある行は **出庫側の金額を実売ではなく当行の仕入金額（税抜・税込）** で計上する
-    （「入庫種別」が空の在庫中は入庫扱い。数量の出庫計上は販売済＋実売で行い、金額の入出庫は仕入列で統一）。
+    **販売済** の行は **出庫側の金額を実売ではなく当行の仕入金額（税抜・税込）** で計上する
+    （「入庫種別」が空の在庫中は入庫扱い。数量の出庫計上は販売済行および在庫中で出庫種別が出庫の行。金額の入出庫は仕入列で統一）。
     **在庫中** のまま **出庫種別** が「出庫」で始まる行（浮貸・戻入など）は仕入列ベースで出庫に含める。
     """
     d = df.copy()
@@ -4392,13 +4392,8 @@ def _prepare_ledger_analysis(df: pd.DataFrame) -> pd.DataFrame:
     line_ex = line_ex.fillna(0).replace([np.inf, -np.inf], 0)
     line_in = line_in.fillna(0).replace([np.inf, -np.inf], 0)
 
-    ac_u = _series_to_numeric_loose(
-        d[COL_ACTUAL_SALE] if COL_ACTUAL_SALE in d.columns else 0
-    ).fillna(0)
-    rev_ex = (ac_u * qty).clip(lower=0)
     m_stock_in = is_in_mv & (st_col == STATUS_IN_STOCK)
-    # 販売済は実売ベースで売上計上（区分がまだ入庫の旧行も、実売があればここに含める）
-    m_sold_rev = (st_col == STATUS_SOLD) & (rev_ex > 0)
+    m_sold_rev = st_col == STATUS_SOLD
     m_float_out = is_outbound_sale_kind & (st_col == STATUS_IN_STOCK)
 
     d["_qty_in"] = qty.where(m_stock_in, 0.0).fillna(0).astype(float)
@@ -4456,7 +4451,7 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
         "上の表の現在の内容（未保存の編集を含む）を集計します。"
         f"入出庫の **金額** は「{COL_PRICE_EXCL}」「{COL_PRICE_INCL}」（仕入・税抜・税込）を行合計として集計します（販売済行の出庫側も実売ではなく当行の仕入金額で計上）。"
         f"仕入先・取引先別の粗利は「{COL_GROSS_PROFIT}」列を合算しています（税抜・台帳保存時の値）。"
-        f"入出庫の **数量** は「{COL_QTY}」列（空・未入力は **1**）を、出庫側は **販売済で実売がある行** または "
+        f"入出庫の **数量** は「{COL_QTY}」列（空・未入力は **1**）を、出庫側は **販売済の行** または "
         f"**在庫中で {COL_SALE_OUTBOUND_TYPE} が「出庫」で始まる行** で合算します（入庫側は在庫中の入庫行）。"
         "期間フィルタと月次の軸は **販売済は販売日時**（未入力の旧行は日時にフォールバック）、在庫中は **日時** です。"
         "（税抜の仕入金額が空で税込だけある行は、10%/8%/非課税のいずれかに税込が一致する税抜を逆算します。"
