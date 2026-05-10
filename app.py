@@ -51,7 +51,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   ※金額列（仕入〜粗利まで）は書き込み時に表示形式 **#,##0** を適用します。
   ※粗利は税抜ベースで「販売済」なら実売金額（税抜）−原価、「在庫中」なら販売予定金額（税抜）−原価（いずれも1点あたり）。台帳保存時に再計算します。
   ※「最後に確認した日付（棚卸日）」は棚卸作業用の任意列です（YYYY-MM-DD 推奨）。1人棚卸しの進捗把握に使います。
-  ※ **販売管理** タブで管理ID（G########）を指定して出庫を記録します。出庫（販売）・出庫（処分）・出庫（浮貸）で **販売済** にするときは実売が必須です（処分で **対象外** のときは実売不要）。出庫（浮貸）・出庫（戻入）で **在庫中** のままにするときは **浮貸日時** に確定時の JST（または手入力）を記録します。**出庫（返品）** は **販売済** 行を **在庫中** に戻し、販売日時・出庫種別を更新します。
+  ※ **販売管理** タブで管理ID（G########）を指定して出庫を記録します。出庫（販売）・出庫（除外）・出庫（浮貸）で **販売済** にするときは実売が必須です（除外で **対象外** のときは実売不要）。出庫（浮貸）・出庫（戻入）で **在庫中** のままにするときは **浮貸日時** に確定時の JST（または手入力）を記録します。**出庫（返品）** は **販売済** 行を **在庫中** に戻し、販売日時・出庫種別を更新します。
   ※「証憑記録日時」は証憑取込の **確定ボタンを押した JST 時刻**（recorded_at に相当）。「証憑URL」はその証憑を GAS 経由で Drive に保存したときの表示 URL（evidence_url）です。
   ※台帳一覧から手動で在庫行を販売済に編集する場合は、**販売日時**・**出庫種別**・実売・ステータスを整合させてください（保存時に変更があった行の「日時」は自動で更新されます）。
 """
@@ -124,6 +124,16 @@ STOCK_STATUS_OPTIONS: tuple[str, ...] = (
     STATUS_SOLD,
     STATUS_EXCLUDED,
 )
+
+OUTBOUND_KIND_EXCLUDE = "出庫（除外）"
+OUTBOUND_KIND_DISPOSAL_LEGACY = "出庫（処分）"
+
+
+def _is_outbound_exclude_kind(kind: str) -> bool:
+    """出庫（除外）および台帳に残る旧ラベル「出庫（処分）」を同一区分として扱う。"""
+    k = (kind or "").strip()
+    return k == OUTBOUND_KIND_EXCLUDE or k == OUTBOUND_KIND_DISPOSAL_LEGACY
+
 
 def _movement_is_outbound(mv: str) -> bool:
     """入出庫種別が出庫（販売・浮貸など）かどうか。"""
@@ -3879,7 +3889,7 @@ def apply_outbound_disposal_excluded_by_management_id(
     new_image_url: str = "",
     memo_suffix: str = "",
 ) -> None:
-    """出庫（処分）かつ **対象外**: 在庫中の1行をステータス **対象外** に更新（新規行なし）。
+    """出庫（除外）かつ **対象外**: 在庫中の1行をステータス **対象外** に更新（新規行なし）。
 
     販売日時・出庫種別・日時は確定実行の JST。実売・販売画像はクリアして粗利を再計算する。
     """
@@ -3901,7 +3911,7 @@ def apply_outbound_disposal_excluded_by_management_id(
     )
     if cur_st != STATUS_IN_STOCK:
         raise RuntimeError(
-            f"管理ID {sid} は「{cur_st}」のため、処分（対象外）の対象外です（在庫中の行のみ）。"
+            f"管理ID {sid} は「{cur_st}」のため、除外（対象外）の対象外です（在庫中の行のみ）。"
         )
     now_exec = jst_now_str()
     df_src.loc[msk, COL_DATETIME] = now_exec
@@ -3909,7 +3919,7 @@ def apply_outbound_disposal_excluded_by_management_id(
     if COL_SALE_DATETIME in df_src.columns:
         df_src.loc[msk, COL_SALE_DATETIME] = now_exec
     if COL_SALE_OUTBOUND_TYPE in df_src.columns:
-        df_src.loc[msk, COL_SALE_OUTBOUND_TYPE] = "出庫（処分）"
+        df_src.loc[msk, COL_SALE_OUTBOUND_TYPE] = OUTBOUND_KIND_EXCLUDE
     df_src.loc[msk, COL_ACTUAL_SALE] = 0
     if COL_ACTUAL_SALE_INCL in df_src.columns:
         df_src.loc[msk, COL_ACTUAL_SALE_INCL] = 0
@@ -3939,7 +3949,7 @@ def apply_outbound_sale_to_ledger_by_management_id(
     loan_datetime_jst: str | None = None,
 ) -> None:
     """在庫中の1行を販売済に更新（新規行なし）。A列「日時」は確定実行の JST。出庫種別は ``sale_outbound_type``
-    （例: 出庫（販売）／出庫（処分）／出庫（浮貸）／出庫（戻入））。
+    （例: 出庫（販売）／出庫（除外）／出庫（浮貸）／出庫（戻入））。
     ``loan_datetime_jst`` を渡したときは **浮貸日時** 列にも記録する（出庫（戻入）で販売済にするときなど）。
     """
     sid = (source_management_id or "").strip()
@@ -4532,18 +4542,59 @@ def render_ledger_dashboard(df: pd.DataFrame) -> None:
             .sum(),
             0,
         )
+    period_sale_excl = 0
+    period_sale_incl = 0
+    if not flt.empty and COL_STOCK_STATUS in flt.columns:
+        _sold_sub = flt.loc[
+            flt[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
+            == STATUS_SOLD
+        ]
+        if (
+            not _sold_sub.empty
+            and COL_ACTUAL_SALE in _sold_sub.columns
+        ):
+            _au = _series_to_numeric_loose(_sold_sub[COL_ACTUAL_SALE]).fillna(0)
+            if COL_QTY in _sold_sub.columns:
+                _qv = _sold_sub[COL_QTY].map(lambda x: max(1, _finite_int(x, 1)))
+            else:
+                _qv = pd.Series(1, index=_sold_sub.index, dtype=int)
+            _m_au = _au > 0
+            period_sale_excl = _finite_int(
+                (_au * _qv.astype(np.int64)).loc[_m_au].sum(),
+                0,
+            )
+            if COL_ACTUAL_SALE_INCL in _sold_sub.columns:
+                period_sale_incl = _finite_int(
+                    _series_to_numeric_loose(
+                        _sold_sub.loc[_m_au, COL_ACTUAL_SALE_INCL]
+                    )
+                    .fillna(0)
+                    .sum(),
+                    0,
+                )
     st.markdown("##### ライフサイクル指標")
     st.caption(
-        "次の3つは **From〜To・仕入先フィルタ** に合致する行のみを対象にします（数量列による追加の絞り込みはありません）。"
+        "次の **5つ** は **From〜To・仕入先フィルタ** に合致する行のみを対象にします（数量列による追加の絞り込みはありません）。"
         f"原価は台帳の **{COL_PRICE_EXCL}** / **{COL_PRICE_INCL}** を合算した税抜・税込の総額です。"
+        "実売は **販売済** 行の **実売金額（税抜・税込）** を行計で合算したものです（実売単価が 0 の行は含みません）。"
         "確定粗利は **販売済** 行の粗利列（税抜）の合計です。"
     )
-    _lc1, _lc2, _lc3 = st.columns(3)
+    _lc1, _lc2, _lc3, _lc4, _lc5 = st.columns(5)
     with _lc1:
         st.metric("税抜原価総額（期間内）", f"¥{period_cogs_ex:,}")
     with _lc2:
         st.metric("税込原価総額（期間内）", f"¥{period_cogs_in:,}")
     with _lc3:
+        st.metric(
+            "実売金額合計（税抜・期間内・販売済）",
+            f"¥{period_sale_excl:,}",
+        )
+    with _lc4:
+        st.metric(
+            "実売金額合計（税込・期間内・販売済）",
+            f"¥{period_sale_incl:,}",
+        )
+    with _lc5:
         st.metric("確定粗利（期間内・販売済・税抜）", f"¥{gp_sold_period:,}")
 
     if flt.empty:
@@ -5283,6 +5334,213 @@ def _analytics_table_multisort(
     return out.drop(columns=drops, errors="ignore")
 
 
+def _sold_actual_sale_line_totals(df: pd.DataFrame) -> tuple[int, int]:
+    """販売済行について、実売の行計を税抜・税込で合算（単価0の行は除く）。"""
+    if df is None or df.empty:
+        return 0, 0
+    need = (COL_STOCK_STATUS, COL_ACTUAL_SALE, COL_ACTUAL_SALE_INCL)
+    if not all(c in df.columns for c in need):
+        return 0, 0
+    sn = df[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
+    sold = df.loc[sn == STATUS_SOLD]
+    if sold.empty:
+        return 0, 0
+    au = _series_to_numeric_loose(sold[COL_ACTUAL_SALE]).fillna(0)
+    if COL_QTY in sold.columns:
+        qv = sold[COL_QTY].map(lambda x: max(1, _finite_int(x, 1)))
+    else:
+        qv = pd.Series(1, index=sold.index, dtype=int)
+    m = au > 0
+    if not bool(m.any()):
+        return 0, 0
+    total_excl = int((au * qv.astype(np.int64)).loc[m].sum())
+    inc = _series_to_numeric_loose(sold.loc[m, COL_ACTUAL_SALE_INCL]).fillna(0)
+    total_incl = int(inc.sum())
+    return total_excl, total_incl
+
+
+def _purchase_age_days_series(df: pd.DataFrame) -> pd.Series:
+    """仕入日時からの経過日数（JST 今日との差）。列が無い・日時が無効な行は NaN。"""
+    if df is None or df.empty or COL_PURCHASE_DATETIME not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=np.float64)
+    p = pd.to_datetime(df[COL_PURCHASE_DATETIME], errors="coerce")
+    if getattr(p.dtype, "tz", None) is not None:
+        p = p.dt.tz_convert(TZ_JP).dt.tz_localize(None)
+    pur = p.dt.normalize()
+    today = pd.Timestamp.combine(_today_jst_date(), datetime.min.time())
+    td = today - pur
+    return td.dt.days
+
+
+def _mask_stagnant_inventory(df: pd.DataFrame, *, min_days: int = 90) -> pd.Series:
+    """在庫中かつ仕入日時から min_days 日超が経過した行。"""
+    if df is None or df.empty:
+        return pd.Series(False, index=df.index)
+    m_in = _mask_ledger_in_stock(df)
+    age = _purchase_age_days_series(df)
+    return m_in & age.notna() & (age > float(min_days))
+
+
+def render_stagnant_inventory_section(calc: pd.DataFrame) -> None:
+    """滞留在庫: 在庫中で仕入から90日超の行をカテゴリー別・仕入先別に可視化。"""
+    st.subheader("滞留在庫")
+    st.caption(
+        f"**{STATUS_IN_STOCK}** かつ **{COL_PURCHASE_DATETIME}**（仕入が表示される日時）からの経過が "
+        "**90日を超える** 行を対象にしています。日時が空・不正な行は含みません。"
+    )
+    if COL_PURCHASE_DATETIME not in calc.columns:
+        st.warning(
+            f"「{COL_PURCHASE_DATETIME}」列がないため、滞留在庫を集計できません。"
+        )
+        return
+    if COL_STOCK_STATUS not in calc.columns:
+        st.warning(
+            f"「{COL_STOCK_STATUS}」列がないため、滞留在庫を集計できません。"
+        )
+        return
+    m_st = _mask_stagnant_inventory(calc, min_days=90)
+    stg = calc.loc[m_st].copy()
+    n_st = int(len(stg))
+    m1, m2 = st.columns(2)
+    m1.metric("滞留在庫 件数", f"{n_st:,}")
+    if stg.empty:
+        m2.metric("滞留在庫 原価合計（税抜・行計）", "—")
+        st.info("条件に合う行がありません（在庫の仕入日時を確認してください）。")
+        return
+    cg = _series_to_numeric_loose(stg[COL_PRICE_EXCL]).fillna(0)
+    if COL_QTY in stg.columns:
+        rq = stg[COL_QTY].map(lambda x: max(1, _finite_int(x, 1)))
+        line_cost = cg * rq.astype(np.int64, copy=False)
+    else:
+        line_cost = cg
+    total_cogs = int(line_cost.sum())
+    m2.metric("滞留在庫 原価合計（税抜・行計）", f"¥{total_cogs:,}")
+
+    _cat_cache = _inventory_category_cache_load()
+    stg["_cat_label"] = stg.apply(
+        lambda r: _resolve_inventory_category_label(r, _cat_cache), axis=1
+    )
+    stg["_age_days"] = _purchase_age_days_series(stg)
+    stg["_line_cost"] = line_cost
+
+    cat_agg = (
+        stg.groupby("_cat_label", dropna=False)
+        .agg(件数=("_line_cost", "count"), 原価税抜=("_line_cost", "sum"))
+        .reset_index()
+        .rename(columns={"_cat_label": "カテゴリー"})
+    )
+    cat_agg["原価税抜"] = pd.to_numeric(cat_agg["原価税抜"], errors="coerce").fillna(0)
+    cat_agg = cat_agg.sort_values("原価税抜", ascending=False, kind="mergesort")
+
+    st.markdown("##### 商品カテゴリー別（滞留在庫）")
+    st.caption(
+        "カテゴリーは分析と同じ優先（台帳の在庫カテゴリー → キャッシュ → キーワード → その他）。"
+        "グラフ・一覧は **原価（仕入・税抜）の行計** で集計しています。"
+    )
+    if not cat_agg.empty and float(cat_agg["原価税抜"].sum()) > 0:
+        cat_chart = (
+            alt.Chart(cat_agg)
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "原価税抜:Q",
+                    title="原価合計（税抜・円）",
+                    axis=alt.Axis(format=",.0f"),
+                ),
+                y=alt.Y("カテゴリー:N", sort="-x", title=None),
+                tooltip=[
+                    alt.Tooltip("カテゴリー:N"),
+                    alt.Tooltip("件数:Q", title="件数", format=",.0f"),
+                    alt.Tooltip("原価税抜:Q", title="原価（税抜）", format=",.0f"),
+                ],
+            )
+            .properties(height=min(420, max(220, 28 * len(cat_agg))))
+        )
+        st.altair_chart(cat_chart, use_container_width=True)
+    else:
+        st.caption("グラフ用の原価が付いた行がありません。")
+    _disp_cat = cat_agg.copy()
+    _disp_cat["原価税抜"] = _disp_cat["原価税抜"].map(lambda x: f"¥{int(x):,}")
+    st.dataframe(_disp_cat, use_container_width=True, hide_index=True)
+
+    sup_col = COL_SUPPLIER
+    st.markdown("##### 仕入先・取引先別（滞留在庫）")
+    if sup_col in stg.columns:
+        stg["_sup"] = stg[sup_col].fillna("(未設定)").astype(str)
+    else:
+        stg["_sup"] = pd.Series("(未設定)", index=stg.index, dtype=str)
+
+    sup_agg = (
+        stg.groupby("_sup", dropna=False)
+        .agg(件数=("_line_cost", "count"), 原価税抜=("_line_cost", "sum"))
+        .reset_index()
+        .rename(columns={"_sup": sup_col})
+    )
+    sup_agg["原価税抜"] = pd.to_numeric(sup_agg["原価税抜"], errors="coerce").fillna(0)
+    sup_agg = sup_agg.sort_values("原価税抜", ascending=False, kind="mergesort")
+
+    if not sup_agg.empty and float(sup_agg["原価税抜"].sum()) > 0:
+        sup_chart = (
+            alt.Chart(sup_agg.head(25))
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "原価税抜:Q",
+                    title="原価合計（税抜・円）",
+                    axis=alt.Axis(format=",.0f"),
+                ),
+                y=alt.Y(f"{sup_col}:N", sort="-x", title=None),
+                tooltip=[
+                    alt.Tooltip(f"{sup_col}:N", title=sup_col),
+                    alt.Tooltip("件数:Q", title="件数", format=",.0f"),
+                    alt.Tooltip("原価税抜:Q", title="原価（税抜）", format=",.0f"),
+                ],
+            )
+            .properties(height=min(520, max(240, 22 * min(25, len(sup_agg)))))
+        )
+        st.altair_chart(sup_chart, use_container_width=True)
+        if len(sup_agg) > 25:
+            st.caption("グラフは原価合計の上位 **25** 件まで表示しています。一覧は全件です。")
+    else:
+        st.caption("グラフ用のデータがありません。")
+    _disp_sup = sup_agg.copy()
+    _disp_sup["原価税抜"] = _disp_sup["原価税抜"].map(lambda x: f"¥{int(x):,}")
+    st.dataframe(_disp_sup, use_container_width=True, hide_index=True)
+
+    _tbl_cols = [
+        c
+        for c in (
+            COL_MANAGEMENT_ID,
+            COL_NAME,
+            COL_SUPPLIER,
+            COL_CATEGORY,
+            "_cat_label",
+            COL_PURCHASE_DATETIME,
+            "_age_days",
+            COL_PRICE_EXCL,
+            COL_QTY,
+        )
+        if c in stg.columns
+    ]
+    if _tbl_cols:
+        with st.expander("滞留在庫の行一覧", expanded=False):
+            _show = stg[_tbl_cols].copy()
+            if "_cat_label" in _show.columns:
+                _show.rename(columns={"_cat_label": "カテゴリー（解析用）"}, inplace=True)
+            if "_age_days" in _show.columns:
+                _show.rename(columns={"_age_days": "経過日数"}, inplace=True)
+            _sort_cols = [
+                c for c in ("経過日数", COL_PURCHASE_DATETIME) if c in _show.columns
+            ]
+            if _sort_cols:
+                _show = _show.sort_values(
+                    _sort_cols,
+                    ascending=[False] * len(_sort_cols),
+                    kind="mergesort",
+                )
+            st.dataframe(_show, use_container_width=True, hide_index=True)
+
+
 def render_analytics_dashboard_page() -> None:
     """集計・分析: メトリクス・Plotly・既存の月次ダッシュボード。"""
     st.subheader("分析")
@@ -5345,20 +5603,30 @@ def render_analytics_dashboard_page() -> None:
     total_inv = int(cg.sum())
     n_lines = int(len(sub))
     gp_s = _series_to_numeric_loose(sub[COL_GROSS_PROFIT]).fillna(0)
-    ratios: list[float] = []
-    for i in range(len(sub)):
-        c = float(cg.iloc[i])
-        g = float(gp_s.iloc[i])
-        if c > 0:
-            ratios.append(100.0 * g / c)
-    avg_ratio = float(np.mean(ratios)) if ratios else None
+    gp_total = int(gp_s.sum())
+
+    total_sale_excl, total_sale_incl = _sold_actual_sale_line_totals(calc)
 
     k1, k2, k3 = st.columns(3)
     k1.metric(f"対象（{_status_lbl}）総額（仕入・税抜）", f"¥{total_inv:,}")
     k2.metric(f"対象（{_status_lbl}）行数", f"{n_lines:,}")
     k3.metric(
-        f"対象（{_status_lbl}）平均粗利率（粗利÷原価）",
-        f"{avg_ratio:.1f} %" if avg_ratio is not None else "—",
+        f"対象（{_status_lbl}）粗利合計（税抜）",
+        f"¥{gp_total:,}",
+    )
+
+    st.caption(
+        "販売済の実売は、次の2つは **ステータスが販売済の行（台帳全体）** の合計です（上のステータス絞り込みとは独立）。"
+        "単価0の販売済行は含みません。"
+    )
+    s1, s2 = st.columns(2)
+    s1.metric(
+        "販売済・実売金額合計（税抜・行計）",
+        f"¥{total_sale_excl:,}",
+    )
+    s2.metric(
+        "販売済・実売金額合計（税込・行計）",
+        f"¥{total_sale_incl:,}",
     )
 
     st.markdown("##### カテゴリー別 在庫原価（税抜）の構成比")
@@ -5468,6 +5736,9 @@ def render_analytics_dashboard_page() -> None:
                 st.dataframe(_view, use_container_width=True, hide_index=True)
             else:
                 st.caption("表示できる列がありません。")
+
+    st.divider()
+    render_stagnant_inventory_section(calc)
 
     st.divider()
     render_ledger_dashboard(calc)
@@ -7531,11 +7802,11 @@ def _render_sales_management_tab(
     st.markdown("##### 販売管理")
     st.caption(
         "区分に応じて **在庫中** の管理IDを指定して反映します。"
-        "**出庫（処分）** では結果を **販売済** または **対象外** にできます。"
+        "**出庫（除外）** では結果を **販売済** または **対象外** にできます。"
     )
     with st.expander("使い方", expanded=False):
         st.markdown(
-            "- **出庫（販売）** / **出庫（処分）**: **在庫中** の行を **販売済** または（処分のみ）**対象外** に更新します。\n"
+            "- **出庫（販売）** / **出庫（除外）**: **在庫中** の行を **販売済** または（除外のみ）**対象外** に更新します。\n"
             "- **出庫（浮貸）**: 在庫中のまま浮貸日時を記録するか、販売済へ更新できます。\n"
             "- **出庫（返品）**: **販売済** の行を **在庫中** に戻します（写真照合・台帳補助は販売済行が対象）。\n"
             "- **出庫（戻入）**: **在庫中** の行に浮貸日時と出庫（戻入）を記録するか、販売済へ更新できます（浮貸と同様にステータスを選べます）。\n"
@@ -7545,7 +7816,7 @@ def _render_sales_management_tab(
         "出庫区分",
         (
             "出庫（販売）",
-            "出庫（処分）",
+            OUTBOUND_KIND_EXCLUDE,
             "出庫（浮貸）",
             "出庫（返品）",
             "出庫（戻入）",
@@ -7570,9 +7841,9 @@ def _render_sales_management_tab(
             key="sales_tab_receipt_stock_status",
         )
     disposal_target_status: str | None = None
-    if outbound_kind == "出庫（処分）":
+    if _is_outbound_exclude_kind(outbound_kind):
         disposal_target_status = st.radio(
-            "出庫（処分）の結果ステータス",
+            "出庫（除外）の結果ステータス",
             (STATUS_SOLD, STATUS_EXCLUDED),
             format_func=lambda x: (
                 "販売済（実売で計上）" if x == STATUS_SOLD else "対象外"
@@ -7593,10 +7864,12 @@ def _render_sales_management_tab(
         outbound_kind == "出庫（戻入）" and receipt_target_status == STATUS_SOLD
     )
     _plain_sale = outbound_kind == "出庫（販売）" or (
-        outbound_kind == "出庫（処分）" and disposal_target_status == STATUS_SOLD
+        _is_outbound_exclude_kind(outbound_kind)
+        and disposal_target_status == STATUS_SOLD
     )
     _disposal_excluded = (
-        outbound_kind == "出庫（処分）" and disposal_target_status == STATUS_EXCLUDED
+        _is_outbound_exclude_kind(outbound_kind)
+        and disposal_target_status == STATUS_EXCLUDED
     )
     _return_flow = outbound_kind == "出庫（返品）"
     _receipt_flow = outbound_kind == "出庫（戻入）"
@@ -8143,7 +8416,7 @@ def _render_sales_management_tab(
         key="field_actual_sale_excl",
         disabled=not (_plain_sale or _loan_as_sale or _receipt_as_sale),
         help=(
-            "出庫（販売）・出庫（処分）・出庫（浮貸）で **販売済** にするとき、または **出庫（戻入）で販売済** にするときに使用（0円以上）。"
+            "出庫（販売）・出庫（除外）・出庫（浮貸）で **販売済** にするとき、または **出庫（戻入）で販売済** にするときに使用（0円以上）。"
             "在庫中のまま（浮貸・戻入）記録のみのときは不要です。**出庫（返品）** のときも不要です。"
         ),
     )
@@ -8350,11 +8623,11 @@ def _render_sales_management_tab(
                     "浮貸を確定（在庫中のまま・浮貸日時のみ）"
                     if _loan_keep_stock
                     else (
-                        "処分を確定（対象外・実売クリア・新規行なし）"
+                        "除外を確定（対象外・実売クリア・新規行なし）"
                         if _disposal_excluded
                         else (
-                            "処分を確定（在庫行のみ更新・新規行なし）"
-                            if outbound_kind == "出庫（処分）"
+                            "除外を確定（在庫行のみ更新・新規行なし）"
+                            if _is_outbound_exclude_kind(outbound_kind)
                             else "販売を確定（在庫行のみ更新・新規行なし）"
                         )
                     )
@@ -8500,9 +8773,9 @@ def _render_sales_management_tab(
                                 )
                     elif _disposal_excluded:
                         _spin_dx = (
-                            "処分（対象外）を台帳に反映しています…"
+                            "除外（対象外）を台帳に反映しています…"
                             if _n_ids <= 1
-                            else f"**{_n_ids} 件** の処分（対象外）を反映しています…"
+                            else f"**{_n_ids} 件** の除外（対象外）を反映しています…"
                         )
                         with st.spinner(_spin_dx):
                             for _sid_save in _ids_sale_val:
@@ -8566,7 +8839,7 @@ def _render_sales_management_tab(
                     elif _disposal_excluded:
                         if len(_ids_sale_val) <= 1:
                             st.success(
-                                f"管理ID **{_ids_sale_val[0]}** を **対象外** に更新しました（出庫（処分）・日時は確定の JST）。"
+                                f"管理ID **{_ids_sale_val[0]}** を **対象外** に更新しました（{OUTBOUND_KIND_EXCLUDE}・日時は確定の JST）。"
                             )
                         else:
                             st.success(
@@ -8802,7 +9075,7 @@ def main():
         st.caption(
             "このタブの確定は **在庫中** の行の追加（入庫（購入）／入庫（浮貸））です。"
             "顧客返品で在庫へ戻す操作は **販売管理** の **出庫（返品）** を使用してください。"
-            "**出庫（浮貸）・出庫（販売）・出庫（処分）・出庫（返品）・出庫（戻入）** は **販売管理** タブで行ってください。"
+            "**出庫（浮貸）・出庫（販売）・出庫（除外）・出庫（返品）・出庫（戻入）** は **販売管理** タブで行ってください。"
         )
         product_name = st.text_input("商品名（必須）", key="field_product_name")
         supplier = st.text_input("仕入先・取引先（必須）", key="field_supplier")
