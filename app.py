@@ -5334,31 +5334,6 @@ def _analytics_table_multisort(
     return out.drop(columns=drops, errors="ignore")
 
 
-def _sold_actual_sale_line_totals(df: pd.DataFrame) -> tuple[int, int]:
-    """販売済行について、実売の行計を税抜・税込で合算（単価0の行は除く）。"""
-    if df is None or df.empty:
-        return 0, 0
-    need = (COL_STOCK_STATUS, COL_ACTUAL_SALE, COL_ACTUAL_SALE_INCL)
-    if not all(c in df.columns for c in need):
-        return 0, 0
-    sn = df[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
-    sold = df.loc[sn == STATUS_SOLD]
-    if sold.empty:
-        return 0, 0
-    au = _series_to_numeric_loose(sold[COL_ACTUAL_SALE]).fillna(0)
-    if COL_QTY in sold.columns:
-        qv = sold[COL_QTY].map(lambda x: max(1, _finite_int(x, 1)))
-    else:
-        qv = pd.Series(1, index=sold.index, dtype=int)
-    m = au > 0
-    if not bool(m.any()):
-        return 0, 0
-    total_excl = int((au * qv.astype(np.int64)).loc[m].sum())
-    inc = _series_to_numeric_loose(sold.loc[m, COL_ACTUAL_SALE_INCL]).fillna(0)
-    total_incl = int(inc.sum())
-    return total_excl, total_incl
-
-
 def _purchase_age_days_series(df: pd.DataFrame) -> pd.Series:
     """仕入日時からの経過日数（JST 今日との差）。列が無い・日時が無効な行は NaN。"""
     if df is None or df.empty or COL_PURCHASE_DATETIME not in df.columns:
@@ -5605,28 +5580,12 @@ def render_analytics_dashboard_page() -> None:
     gp_s = _series_to_numeric_loose(sub[COL_GROSS_PROFIT]).fillna(0)
     gp_total = int(gp_s.sum())
 
-    total_sale_excl, total_sale_incl = _sold_actual_sale_line_totals(calc)
-
     k1, k2, k3 = st.columns(3)
     k1.metric(f"対象（{_status_lbl}）総額（仕入・税抜）", f"¥{total_inv:,}")
     k2.metric(f"対象（{_status_lbl}）行数", f"{n_lines:,}")
     k3.metric(
         f"対象（{_status_lbl}）粗利合計（税抜）",
         f"¥{gp_total:,}",
-    )
-
-    st.caption(
-        "販売済の実売は、次の2つは **ステータスが販売済の行（台帳全体）** の合計です（上のステータス絞り込みとは独立）。"
-        "単価0の販売済行は含みません。"
-    )
-    s1, s2 = st.columns(2)
-    s1.metric(
-        "販売済・実売金額合計（税抜・行計）",
-        f"¥{total_sale_excl:,}",
-    )
-    s2.metric(
-        "販売済・実売金額合計（税込・行計）",
-        f"¥{total_sale_incl:,}",
     )
 
     st.markdown("##### カテゴリー別 在庫原価（税抜）の構成比")
@@ -5653,6 +5612,65 @@ def render_analytics_dashboard_page() -> None:
         pie_df = pie_df.sort_values("カテゴリー", ascending=True, kind="mergesort")
     _pie_chart_title = f"原価シェア（在庫カテゴリー）— {_status_lbl}"
     _render_inventory_category_pie(pie_df, chart_title=_pie_chart_title)
+
+    st.markdown("##### カテゴリー別 予定・実売（税抜）の構成比")
+    st.caption(
+        f"対象ステータス: **{_status_lbl}**。カテゴリー付けは上の原価チャートと同じです。"
+        f"**{STATUS_IN_STOCK}** の行は **{COL_PLANNED_SALE}（税抜）×数量** の行計、"
+        f"**{STATUS_SOLD}** の行は **{COL_ACTUAL_SALE}（税抜）×数量** の行計とします"
+        "（販売済で実売単価が0の行は0）。**対象外** はこのチャートでは金額に含めません。"
+    )
+    if sub.empty:
+        mix_df = pd.DataFrame(columns=["カテゴリー", "金額税抜"])
+    else:
+        _stn = sub[COL_STOCK_STATUS].astype(str).map(_normalize_stock_status)
+        _pu = (
+            _series_to_numeric_loose(sub[COL_PLANNED_SALE]).fillna(0)
+            if COL_PLANNED_SALE in sub.columns
+            else pd.Series(0.0, index=sub.index)
+        )
+        _au = (
+            _series_to_numeric_loose(sub[COL_ACTUAL_SALE]).fillna(0)
+            if COL_ACTUAL_SALE in sub.columns
+            else pd.Series(0.0, index=sub.index)
+        )
+        if COL_QTY in sub.columns:
+            _rq_m = sub[COL_QTY].map(lambda x: max(1, _finite_int(x, 1)))
+        else:
+            _rq_m = pd.Series(1, index=sub.index, dtype=int)
+        _rq_i = _rq_m.astype(np.int64, copy=False)
+        _line_pl = _pu * _rq_i
+        _line_ac = _au * _rq_i
+        _mix = pd.Series(0.0, index=sub.index, dtype=np.float64)
+        _mix.loc[_stn == STATUS_IN_STOCK] = _line_pl.loc[_stn == STATUS_IN_STOCK]
+        _m_sv = (_stn == STATUS_SOLD) & (_au > 0)
+        _mix.loc[_m_sv] = _line_ac.loc[_m_sv]
+        sub["_mix_rev_tax_ex"] = _mix
+        mix_df = (
+            sub.groupby("_category", dropna=False)["_mix_rev_tax_ex"]
+            .sum()
+            .reset_index()
+        )
+        mix_df.columns = ["カテゴリー", "金額税抜"]
+        if _pie_sort == "金額の多い順":
+            mix_df = mix_df.sort_values("金額税抜", ascending=False, kind="mergesort")
+        elif _pie_sort == "金額の少ない順":
+            mix_df = mix_df.sort_values("金額税抜", ascending=True, kind="mergesort")
+        else:
+            mix_df = mix_df.sort_values("カテゴリー", ascending=True, kind="mergesort")
+    _mix_chart_title = f"予定・実売シェア（税抜・カテゴリー）— {_status_lbl}"
+    _mix_sum = (
+        float(pd.to_numeric(mix_df["金額税抜"], errors="coerce").fillna(0).sum())
+        if not mix_df.empty
+        else 0.0
+    )
+    if mix_df.empty or _mix_sum <= 0:
+        st.caption(
+            "予定・実売（税抜）の合計が0のため、構成比の円グラフは表示できません。"
+            "（例: **対象外** のみ選択／該当行に予定・実売がない場合など）"
+        )
+    else:
+        _render_inventory_category_pie(mix_df, chart_title=_mix_chart_title)
 
     with st.expander("分析: 対象行一覧（ソート）", expanded=False):
         st.caption(
