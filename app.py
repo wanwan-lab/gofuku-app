@@ -15,15 +15,13 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   GOOGLE_SPREADSHEET_ID      … 記録用スプレッドシートID（``INVENTORY_SOURCE=csv`` のときは不要で、共有 ``inventory.csv`` を使用）
 
 任意:
-  GEMINI_MODEL_NAME          … Gemini モデル ID（未設定時は下記 DEFAULT_GEMINI_MODEL）
-  GEMINI_VOUCHER_MODEL_NAME  … 証憑（納品書等）画像解析専用モデル（未設定時は GEMINI_MODEL_NAME と同じ既定）
   GOOGLE_WORKSHEET_NAME      … ワークシート名（未設定時は DEFAULT_WORKSHEET_NAME）
   GAS_UPLOAD_TIMEOUT_SECONDS … GAS への POST タイムアウト秒（既定 300、1〜3600 にクランプ）
   FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED … GAS 未設定時に台帳の画像URL列へ入れるプレースホルダ URL
   APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
   INVENTORY_SOURCE           … ``csv`` | ``sheet`` 。未指定時は **GOOGLE_SPREADSHEET_ID があるとき sheet**、無いとき **csv**（リポジトリ直下 ``inventory.csv`` または環境変数 ``GOFUKU_INVENTORY_CSV``）。
 
-※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（未設定時は ``gemini-3.1-flash-lite``）。
+※ 画像の Gemini 解析は **google-generativeai** を使用します。モデルは常に ``gemini-3.1-flash-lite``（``DEFAULT_GEMINI_MODEL``。secrets では変更できません）。
 ※ **登録（インプット）** ページの証憑取込で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
 ※ PDF/Excel/Word 取込には ``pypdf`` / ``pymupdf`` / ``openpyxl`` / ``python-docx`` を使用します（requirements.txt）。
 ※ アップロード画像は任意。商品写真は Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
@@ -227,8 +225,6 @@ def _inventory_csv_write_df(df: pd.DataFrame) -> None:
 
 # --- st.secrets のキー名（文字列リテラルの散在を避ける） ---
 SECRET_GEMINI_API_KEY = "GEMINI_API_KEY"
-SECRET_GEMINI_MODEL_NAME = "GEMINI_MODEL_NAME"
-SECRET_GEMINI_VOUCHER_MODEL_NAME = "GEMINI_VOUCHER_MODEL_NAME"
 SECRET_GAS_UPLOAD_URL = "GAS_UPLOAD_URL"
 SECRET_GAS_API_KEY = "GAS_API_KEY"
 SECRET_GAS_UPLOAD_TIMEOUT_SECONDS = "GAS_UPLOAD_TIMEOUT_SECONDS"
@@ -241,7 +237,7 @@ SECRET_APP_PASSWORD = "APP_PASSWORD"
 SECRET_INVENTORY_SOURCE = "INVENTORY_SOURCE"
 SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED = "FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED"
 
-# --- secrets に無いときの既定（非機密のデフォルトのみ） ---
+# --- Gemini モデル（コード固定。st.secrets では上書きしない） ---
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_WORKSHEET_NAME = "在庫履歴"
 DEFAULT_GAS_FALLBACK_IMAGE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
@@ -280,6 +276,8 @@ SALES_AI_CONTEXT_MAX_LINES = 2000
 # 棚卸 multiselect: ボタンで値を変えるときウィジェットキーと競合しないよう pending キーに取り直す
 _PENDING_STOCKTAKE_ASSIST_BATCH_MIDS = "_pending_stocktake_assist_batch_mids"
 _PENDING_STOCKTAKE_MULTI_DONE_MIDS = "_pending_stocktake_multi_done_mids"
+# 仕入「近い候補」カード: 入力欄より後に描画されるため、次ランの入力欄より前で field_* に反映する
+_PENDING_PURCHASE_PICK_FROM_CARD = "_pending_purchase_pick_from_card"
 SESSION_KEY_INV_SHEET_CACHE_BUST = "_inv_sheet_cache_bust"
 # 在庫一覧: 棚卸し「今回の対象リスト」を台帳フォルダに JSON で永続化（アプリ終了後も維持）
 STOCKTAKE_WORK_SESSION_FILENAME = "stocktake_work_session.json"
@@ -557,13 +555,12 @@ def _fallback_image_url_when_gas_unconfigured() -> str:
 
 
 def _gemini_model_name() -> str:
-    return _secret_str(SECRET_GEMINI_MODEL_NAME, DEFAULT_GEMINI_MODEL)
+    return DEFAULT_GEMINI_MODEL
 
 
 def _gemini_voucher_model_name() -> str:
-    """証憑画像解析用モデル。専用キーが空なら通常の Gemini モデル名にフォールバック。"""
-    v = _secret_str(SECRET_GEMINI_VOUCHER_MODEL_NAME, "")
-    return v if v else _gemini_model_name()
+    """証憑画像解析用モデル（通常解析と同一の固定モデル）。"""
+    return DEFAULT_GEMINI_MODEL
 
 
 def _load_service_account_info() -> dict[str, Any]:
@@ -5938,6 +5935,32 @@ def _sale_card_hit_from_series(
     }
 
 
+def _apply_pending_purchase_pick_from_card_if_any() -> None:
+    """近い候補カードで選んだ内容を必須入力へ反映（テキスト入力より前に1回だけ実行）。
+
+    カードのボタンは ``field_product_name`` 等の入力欄より後に描画されるため、同一ランで
+    それらのキーを直接代入すると StreamlitAPIException になる。pending に積み、次ランの
+    本ブロック先頭で適用する。
+    """
+    raw = st.session_state.pop(_PENDING_PURCHASE_PICK_FROM_CARD, None)
+    if not isinstance(raw, dict):
+        return
+    st.session_state.field_product_name = str(raw.get("product_name") or "").strip()
+    st.session_state.field_supplier = str(raw.get("supplier") or "").strip()
+    cat = str(raw.get("inventory_category") or "").strip()
+    if cat:
+        st.session_state.field_inventory_category = cat
+    lp = _finite_int(raw.get("line_price_excl"), 0)
+    if lp > 0:
+        st.session_state.field_line_excl_yen = lp
+    ps = _finite_int(raw.get("planned_sale_excl"), 0)
+    if ps > 0:
+        st.session_state.field_planned_sale_excl = ps
+    mid = str(raw.get("management_id") or "").strip()
+    if mid:
+        st.session_state["_gemini_match_management_id"] = mid
+
+
 def _render_mid_pick_candidate_cards(
     hits: list[dict[str, Any]],
     *,
@@ -6057,22 +6080,21 @@ def _render_mid_pick_candidate_cards(
                             _cur_m, key=_management_id_sort_key
                         )
                     elif pick_mode == "purchase":
-                        st.session_state.field_product_name = str(
-                            hit.get("product_name") or ""
-                        ).strip()
-                        st.session_state.field_supplier = str(
-                            hit.get("supplier") or ""
-                        ).strip()
-                        cat = str(hit.get("inventory_category") or "").strip()
-                        if cat:
-                            st.session_state.field_inventory_category = cat
-                        lp = _finite_int(hit.get("line_price_excl"), 0)
-                        if lp > 0:
-                            st.session_state.field_line_excl_yen = lp
-                        ps = _finite_int(hit.get("planned_sale_excl"), 0)
-                        if ps > 0:
-                            st.session_state.field_planned_sale_excl = ps
-                        st.session_state["_gemini_match_management_id"] = mid
+                        _pp: dict[str, Any] = {
+                            "product_name": str(hit.get("product_name") or "").strip(),
+                            "supplier": str(hit.get("supplier") or "").strip(),
+                            "management_id": mid,
+                        }
+                        _cat = str(hit.get("inventory_category") or "").strip()
+                        if _cat:
+                            _pp["inventory_category"] = _cat
+                        _lp = _finite_int(hit.get("line_price_excl"), 0)
+                        if _lp > 0:
+                            _pp["line_price_excl"] = _lp
+                        _ps = _finite_int(hit.get("planned_sale_excl"), 0)
+                        if _ps > 0:
+                            _pp["planned_sale_excl"] = _ps
+                        st.session_state[_PENDING_PURCHASE_PICK_FROM_CARD] = _pp
                     elif sale_merge_selection:
                         _cur_s = set(
                             _split_management_ids_from_field(
@@ -9037,6 +9059,7 @@ def main():
                 st.session_state.sale_pick_source_id = LEDGER_PICK_PLACEHOLDER
                 st.session_state.pop("ledger_quick_candidates", None)
                 st.session_state.pop("_gemini_match_management_id", None)
+                st.session_state.pop(_PENDING_PURCHASE_PICK_FROM_CARD, None)
                 st.session_state.pop("_sale_link_management_id", None)
                 st.session_state.pop("_sale_link_warn", None)
                 st.rerun()
@@ -9125,6 +9148,8 @@ def main():
             and (_uses_local_inventory_csv() or _secret_str(SECRET_GOOGLE_SPREADSHEET_ID))
         ):
             st.caption("台帳が空か読み込めないため、入力補助の候補は表示できません。")
+
+        _apply_pending_purchase_pick_from_card_if_any()
     
         st.markdown("##### 必須入力項目")
         st.caption(
