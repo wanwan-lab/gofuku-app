@@ -23,7 +23,7 @@ st.secrets に以下を設定してください（例は .streamlit/secrets.toml
   APP_PASSWORD               … アプリ画面の簡易ログイン用（平文。GitHub には secrets.toml をコミットしないこと）
   INVENTORY_SOURCE           … ``csv`` | ``sheet`` 。未指定時は **GOOGLE_SPREADSHEET_ID があるとき sheet**、無いとき **csv**（リポジトリ直下 ``inventory.csv`` または環境変数 ``GOFUKU_INVENTORY_CSV``）。
 
-※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（既定は flash 系プレビュー）。
+※ 画像の Gemini 解析は **google-generativeai** を使用します。モデル名は ``GEMINI_MODEL_NAME``（未設定時は ``gemini-3.1-flash-lite``）。
 ※ **登録（インプット）** ページの証憑取込で、納品書・請求書・領収書を画像・PDF・Excel・Word から解析し入庫（購入）として台帳に追記できます（確定前に表で編集可能）。
 ※ PDF/Excel/Word 取込には ``pypdf`` / ``pymupdf`` / ``openpyxl`` / ``python-docx`` を使用します（requirements.txt）。
 ※ アップロード画像は任意。商品写真は Pillow で長辺最大1280px・JPEG品質80に変換してから解析・ドライブ保存します。
@@ -242,7 +242,7 @@ SECRET_INVENTORY_SOURCE = "INVENTORY_SOURCE"
 SECRET_FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED = "FALLBACK_IMAGE_URL_WHEN_GAS_UNCONFIGURED"
 
 # --- secrets に無いときの既定（非機密のデフォルトのみ） ---
-DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_WORKSHEET_NAME = "在庫履歴"
 DEFAULT_GAS_FALLBACK_IMAGE_URL = "https://example.com/?gofuku-app=skipped-no-gas-secrets"
 DEFAULT_GAS_UPLOAD_TIMEOUT_SECONDS = 300
